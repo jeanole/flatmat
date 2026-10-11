@@ -48,19 +48,20 @@ def write_dxf(
     version: str = "R2010",
     text_height: float | None = None,
     deterministic: bool = False,
+    dfm=None,
 ) -> None:
     """Write the flat pattern as DXF with exact LINE/ARC/CIRCLE/SPLINE entities."""
     layers = layers or LayerMap()
     if deterministic:  # must be set before ezdxf.new(): it stamps the creation time
         ezdxf.options.write_fixed_meta_data_for_testing = True
     try:
-        _write_dxf(pattern, path, layers, labels, version, text_height)
+        _write_dxf(pattern, path, layers, labels, version, text_height, dfm)
     finally:
         if deterministic:
             ezdxf.options.write_fixed_meta_data_for_testing = False
 
 
-def _write_dxf(pattern, path, layers, labels, version, text_height) -> None:
+def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) -> None:
     doc = ezdxf.new(version, setup=True)
     doc.header["$INSUNITS"] = 4  # mm
     for name, color in (
@@ -107,6 +108,18 @@ def _write_dxf(pattern, path, layers, labels, version, text_height) -> None:
             msp.add_text(txt, dxfattribs={"layer": layers.text, "height": th * 0.6}).set_placement(
                 (x + f.through_diameter / 2 + th * 0.3, y)
             )
+    if dfm is not None and dfm.findings:
+        # a marker per finding on its own layer, so the shop can switch it off
+        if "DFM" not in doc.layers:
+            doc.layers.add("DFM", color=6)
+        for d in dfm.findings:
+            at = d.data.get("at")
+            if at is None:
+                continue
+            msp.add_circle(at, th * 1.5, dxfattribs={"layer": "DFM"})
+            msp.add_text(
+                d.code.value.removeprefix("DFM_"), dxfattribs={"layer": "DFM", "height": th * 0.6}
+            ).set_placement((at[0] + th * 1.8, at[1]))
     doc.saveas(os.fspath(path))
 
 
@@ -185,10 +198,15 @@ def bend_table(pattern: FlatPattern) -> dict:
     }
 
 
-def write_bend_table(pattern: FlatPattern, path: str | os.PathLike) -> None:
-    """JSON (``.json``) or CSV (``.csv``, one row per bend line segment)."""
+def write_bend_table(pattern: FlatPattern, path: str | os.PathLike, *, dfm=None) -> None:
+    """JSON (``.json``) or CSV (``.csv``, one row per bend line segment).
+
+    With a :class:`~flatmat.dfm.DfmReport` the JSON gets a ``dfm`` section.
+    """
     path = os.fspath(path)
     table = bend_table(pattern)
+    if dfm is not None:
+        table["dfm"] = dfm.to_dict()
     if path.lower().endswith(".csv"):
         cols = ["bend", "segment", "direction", "angle_deg", "r_in", "k", "ba", "bd", "x0", "y0", "x1", "y1", "length"]
         with open(path, "w", newline="") as fh:

@@ -32,6 +32,11 @@ def _parser() -> argparse.ArgumentParser:
     u.add_argument("--solid", type=int, help="index of the solid if the file has several")
     u.add_argument("--heal", choices=["fast", "full"], default="fast")
     u.add_argument("--labels", choices=["delem", "plain", "none"], default="delem")
+    u.add_argument("--check", action="store_true", help="manufacturability checks (laser + press brake)")
+    u.add_argument("--material", default="steel", help="material for --check (steel, galvanised, stainless, ...)")
+    u.add_argument("--die-v", type=float, help="die opening V in mm for --check (default: Amada rule)")
+    u.add_argument("--rolling-direction", type=float, help="rolling direction in the flat, degrees from +X")
+    u.add_argument("--max-force", type=float, help="press brake capacity in kN for --check")
     return p
 
 
@@ -53,10 +58,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {f.kind} {f.side}: through Ø{f.through_diameter:g}, outer Ø{f.outer_diameter:g}")
     for d in pat.diagnostics:
         print(f"  {d.severity.value}: {d.code.value}: {d.message}", file=sys.stderr)
+    report = None
+    if a.check:
+        from .dfm import check
+
+        report = check(pat, material=a.material, die_v=a.die_v, rolling_direction_deg=a.rolling_direction,
+                       machine_max_force_kn=a.max_force)  # fmt: skip
+        print(f"  check ({report.material.name}, V={report.die_v:g}): "
+              f"{len(report.problems)} problems, {len(report.findings) - len(report.problems)} notes")  # fmt: skip
+        for d in report.findings:
+            print(f"    {d.severity.value:7} {d.code.value}: {d.message}")
     if a.dxf:
-        write_dxf(pat, a.dxf, labels=None if a.labels == "none" else a.labels)
+        write_dxf(pat, a.dxf, labels=None if a.labels == "none" else a.labels, dfm=report)
     if a.table:
-        write_bend_table(pat, a.table)
+        write_bend_table(pat, a.table, dfm=report)
     if a.svg:
         write_svg(pat, a.svg)
     return 0

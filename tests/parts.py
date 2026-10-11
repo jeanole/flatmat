@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
-from OCP.BRepPrimAPI import BRepPrimAPI_MakeCone, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCone, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism
 from OCP.GC import GC_MakeArcOfCircle, GC_MakeSegment
 from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt, gp_Vec
 from OCP.IFSelect import IFSelect_RetDone
@@ -44,6 +44,7 @@ class Part:
     # ("flat", index, fraction along, z, diameter) or ("bend", index, 0.5, z, diameter)
     sharp_outer: tuple[int, ...] = ()
     features: list[tuple] = field(default_factory=list)
+    cuts: list[tuple] = field(default_factory=list)  # boxes ((x0, y0, z0), (x1, y1, z1)) in profile coords
 
     def flat_length(self, k: float) -> float:
         return sum(self.flats) + sum(math.radians(abs(a)) * (r + k * self.t) for a, r in self.bends)
@@ -134,6 +135,9 @@ def make_solid(part: Part):
     face = BRepBuilderAPI_MakeFace(wire.Wire()).Face()
     solid = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, part.width)).Shape()
 
+    for lo, hi in part.cuts:
+        tool = BRepPrimAPI_MakeBox(gp_Pnt(*lo), gp_Pnt(*hi)).Shape()
+        solid = BRepAlgoAPI_Cut(solid, tool).Shape()
     if part.holes or part.features:
         tools = TopTools_ListOfShape()
         for kind, idx, frac, z, d, big, side, *rest in part.features:
@@ -217,6 +221,40 @@ def feature_cases() -> list[Part]:
             bends=[(90, 2.0)],
             features=[("cbore", 0, 0.4, 20.0, 5.0, 9.0, +1, 2.0), ("cbore", 1, 0.5, 60.0, 5.0, 9.0, -1, 2.0)],
         ),
+    ]
+
+
+def dfm_cases() -> list[Part]:
+    """Parts with one deliberate manufacturability problem each (t = 2, r = 2, V = 12).
+
+    Profile coordinates: the base runs along +x at y in [-1, 1]; the first bend (left,
+    90°, r = 2) has its tangent line at x = 50 and the flange rises at x in [52, 54].
+    """
+    L = dict(t=2.0, width=100, bends=[(90, 2.0)])
+    return [
+        Part("dfm_ok", flats=[50, 40], **L),
+        Part("dfm_short_flange", flats=[50, 3], **L),
+        Part("dfm_hole_near_bend", flats=[50, 40], holes=[("flat", 0, 0.92, 50.0, 4.0)], **L),
+        Part("dfm_small_hole", flats=[50, 40], holes=[("flat", 0, 0.4, 50.0, 1.2)], **L),
+        Part("dfm_hole_near_edge", flats=[50, 40], holes=[("flat", 0, 0.4, 3.5, 4.0)], **L),
+        Part(
+            "dfm_holes_close",
+            flats=[50, 40],
+            holes=[("flat", 0, 0.4, 40.0, 6.0), ("flat", 0, 0.4, 47.0, 6.0)],
+            **L,
+        ),
+        # flange and bend removed for z > 60: the bend ends inside the base, no relief
+        Part("dfm_no_relief", flats=[50, 40], cuts=[((50.0, -2.0, 60.0), (60.0, 50.0, 101.0))], **L),
+        # the same with a relief slot 2.5 wide, 4.5 deep into the base
+        Part(
+            "dfm_relief",
+            flats=[50, 40],
+            cuts=[((50.0, -2.0, 60.0), (60.0, 50.0, 101.0)), ((45.5, -2.0, 57.5), (50.5, 2.0, 62.5))],
+            **L,
+        ),
+        # a 1 mm slot through the base, 20 mm long
+        Part("dfm_narrow_slot", flats=[50, 40], cuts=[((10.0, -2.0, 40.0), (30.0, 2.0, 41.0))], **L),
+        Part("dfm_short_hem", t=1.0, width=60, flats=[40, 1.5], bends=[(180, 1.0)]),
     ]
 
 

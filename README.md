@@ -43,6 +43,7 @@ pip install -e .            # needs Python >= 3.11; pulls cadquery-ocp-novtk
 flatmat unfold part.step -k 0.44 -o part.dxf --table part.json --svg part.svg
 flatmat unfold part.step --din  # K per bend from DIN 6935
 flatmat unfold part.step --sharp-radius 1.6   # radius the die gives on sharp (r = 0) bends
+flatmat unfold part.step --check --material stainless -o part.dxf   # DFM findings, marked in the DXF
 ```
 
 ```python
@@ -53,6 +54,10 @@ pat = fm.unfold(sheet, k=fm.KTable.from_rows([(1, 0.38), (3, 0.43), (99, 0.5)]))
 print(pat.size, [(b.direction, b.angle_deg, b.r_in, b.ba) for b in pat.bends])
 fm.write_dxf(pat, "part.dxf")          # exact LINE / ARC / CIRCLE / SPLINE, bend lines, Delem-style labels
 fm.write_bend_table(pat, "part.json")  # or .csv
+
+report = fm.check(pat, material="steel", die_v=16)  # manufacturability
+for d in report.problems:
+    print(d.code, d.message, d.data["at"])
 ```
 
 A part flatmat cannot handle raises `fm.FlatmatError`. Its `.diagnostic` has a
@@ -87,7 +92,8 @@ today:
 - **v0.2 (in progress):** sharp bends (r = 0, inside or both sides, with an
   optional tooling radius) — done; countersinks and counterbores — done;
   B-spline faces and edges that are really planes, cylinders, cones, lines
-  or circles — done; manufacturability checks.
+  or circles — done; manufacturability checks (flange, radius, holes, reliefs,
+  slots, hems, U channels, tonnage) — done.
 - **Later:** cones, other formed features, tubes, assemblies, bend-sequence
   feasibility.
 

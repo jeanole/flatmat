@@ -765,7 +765,48 @@ listed.
 - Output metadata records the flatmat, OCP and OCCT versions, the healing
   mode and the tolerances. Golden-file tests run per pinned OCP version.
 
-## 7. Manufacturability checks (`flatmat/dfm.py`, v0.2)
+## 7. Manufacturability checks (`flatmat/dfm.py`, implemented except §7.4)
+
+**As built** (`fm.check(pattern, material=, die_v=, rolling_direction_deg=,
+machine_max_force_kn=, rules=DfmRules(...), strict=)`, the CLI `--check`):
+
+- Everything is checked on the flat pattern (2D, shapely) and the bend data.
+- **Every finding** is a `Diagnostic` with its location in the flat
+  (`data["at"]`). It can be drawn as a marker on layer `DFM` in the DXF and
+  goes into the bend table JSON (`dfm`).
+- **Severity:** findings are warnings, or errors with `strict`. The
+  air-bend radius mismatch is only `info`; `report.ok` ignores infos.
+- **Changes against the plan below**, all from running the rules on real
+  parts (the user's SolidWorks parts and the BenDFM samples):
+  - *Unknown rolling direction* uses the normal minimum radius. The
+    along-the-grain minimum applies only when a direction is given; anything
+    else flagged every SolidWorks default part.
+  - *Minimum radii follow practice:* steel 0.5t, stainless 1t. Xometry's
+    0.8t and 2t flagged every CAD default bend.
+  - *Bend ends at another bend* (box corners) are not judged as end
+    reliefs. They need a corner rule (3D, still to do), and every corner of
+    the SolidWorks box sheets was flagged otherwise. Narrow slots near bend
+    ends are reliefs, not `FEATURE_TOO_SMALL`.
+  - *The relief check fills a band per side:* width `relief_width_t·t`
+    (default 0.5t, as in SendCutSend and SolidWorks), reaching `r + t` past
+    the tangent line. It reports only when material fills more than half of
+    it, so an outline that merely flares out at an angle from the end is not
+    flagged.
+  - *Narrow slots* need a morphological closing; the opening only finds
+    narrow webs. `DFM_HOLE_TOO_SMALL` is for true circles only, with the
+    exact diameter.
+  - Duplicates are suppressed: a narrow web next to a hole already reported
+    near an edge or another hole is not reported again, and there is one
+    `CUT_IN_BEND_ZONE` per hole and bend.
+- **Tests:** 10 parts with exactly one deliberate problem each (or none);
+  the expected values (flange OML, required minimum, force, air radius);
+  `strict`, configurable and disabled rules; grain; tonnage; hem material;
+  exports.
+- **On real parts:** the 4 SolidWorks parts give no problems except the 8
+  holes of the bracket, which sit 3.3–3.6 mm from the tangent line where
+  2.5t + r = 4.75 mm is required. BenDFM gives 1 U channel and 2 reliefs.
+
+**Original plan:**
 
 Research: [`research.md` §10](research.md#10-manufacturability-rules-for-laser--press-brake).
 Sources disagree, so **every threshold is a parameter**. The defaults below
