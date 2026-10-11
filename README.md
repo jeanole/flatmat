@@ -86,7 +86,8 @@ today:
   a scalar, an r/t table or DIN 6935; exact DXF and bend table.
 - **v0.2 (in progress):** sharp bends (r = 0, inside or both sides, with an
   optional tooling radius) — done; countersinks and counterbores — done;
-  recognising B-spline faces as cylinders or planes; manufacturability checks.
+  B-spline faces and edges that are really planes, cylinders, cones, lines
+  or circles — done; manufacturability checks.
 - **Later:** cones, other formed features, tubes, assemblies, bend-sequence
   feasibility.
 

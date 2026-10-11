@@ -523,7 +523,37 @@ All of these become `SheetPart.features` (type, faces, parameters, side).
 Unrecognised formed regions give `FORMED_FEATURE` (an error by default, a
 warning with `partial=True`).
 
-### 5.5 B-spline faces (canonical recognition, v0.2)
+### 5.5 B-spline faces (canonical recognition, implemented)
+
+**As built** (`src/flatmat/canonical.py`, called from `recognize()`; switch off
+with `canonical=False`):
+
+- **Edges:** freeform edges are tested with
+  `ShapeAnalysis_CanonicalRecognition(edge).IsLine` / `.IsCircle`; these
+  fill a mutable `gp_Lin` / `gp_Circ`. They are replaced by
+  `Geom_Line` / `Geom_Circle` with the original parameter direction (the
+  circle's axis is flipped if needed), `Range` is set from the vertices,
+  and the edge's pcurves are dropped. `GeomConvert_CurveToAnaCurve` was
+  not usable from Python: it returns the new curve and range through
+  `Handle&` / `double&` out-parameters, and OCP does not hand those back.
+- **Faces:** `GeomConvert_SurfToAnaSurf` per face, with the face's UV bounds
+  first. *Spike finding:* with bounds the conversion sometimes fails on
+  NURBS cylinders, so it retries without them. The target is a plane,
+  cylinder or cone. The new surface is `UReverse()`d if its normal
+  disagrees with the old one, so the wire orientation stays valid. The
+  face is updated in place with `BRep_Builder.UpdateFace`, and the pcurves
+  of its edges are removed (`UpdateEdge(e, None, f, tol)` works from OCP).
+- **pcurves** are then rebuilt by `ShapeFix_Wire.FixEdgeCurves`.
+- It always works on a `BRepBuilderAPI_Copy`, never on the input. A single
+  `SURFACE_CONVERTED` warning reports the counts and the largest deviation.
+- **Tests:** all 20 test parts (round bends, sharp bends, countersinks and
+  counterbores), written as pure NURBS with `BRepBuilderAPI_NurbsConvert`
+  and round-tripped through STEP, unfold to the same exact areas (≤ 1e-14).
+  Their outlines come back as `LINE` / `ARC`. The user's SolidWorks parts
+  are unaffected: their B-spline relief walls are not analytic, stay as
+  they are, and are thickness faces.
+
+**Original plan:**
 
 - Recognition is **per face** with `GeomConvert_SurfToAnaSurf(surface)`,
   calling `ConvertToAnalytical(tol, *BRepTools.UVBounds_s(face))` and then
@@ -831,6 +861,10 @@ involved, so a UI can draw it.
   cylinders, made with PythonOCC. Confirmed by the spike reproducing their
   flat areas.
 - ~~OCP 7.8 vs 8.0~~: resolved (see the pitfalls above and `spike/README.md`).
+- B-spline recognition is tested only on exact (rational) NURBS from
+  `BRepBuilderAPI_NurbsConvert`. Exporters that *approximate* cylinders with
+  polynomial splines (deviations ~1e-6 to 1e-3) are untested; the
+  tolerance is `Tolerances.linear` (1e-4 mm).
 - ~~Fast healing on 7.8~~: resolved via `$CSF_STEPDefaults` (§6.1).
 - Is OCCT 8.0's STEP reader thread-safe? (Irrelevant while we use one
   process per part.)

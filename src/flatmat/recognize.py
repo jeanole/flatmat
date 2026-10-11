@@ -26,6 +26,7 @@ from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_REVERSED, Top
 from OCP.TopExp import TopExp
 
 from ._occ import EdgeFaceMap, ShapeMap, as_edge, as_face
+from .canonical import canonicalize
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .io import StepModel
 from .model import Bend, BendSegment, FaceInfo, Feature, Flange, SheetPart, Tolerances
@@ -438,10 +439,13 @@ def recognize(
     thickness: float | None = None,
     solid: int | None = None,
     tol: Tolerances | None = None,
+    canonical: bool = True,
 ) -> SheetPart:
     """Recognise a solid as sheet metal: thickness, skins, bends, flanges, hole features.
 
-    ``model`` is a :class:`~flatmat.io.StepModel` or an OCP solid.
+    ``model`` is a :class:`~flatmat.io.StepModel` or an OCP solid. With ``canonical``
+    (default), B-spline faces and edges that are really planes, cylinders, cones, lines
+    or circles are converted first (on a copy).
     """
     tol = tol or Tolerances()
     diags: list[Diagnostic] = []
@@ -452,6 +456,11 @@ def recognize(
         shape = model.solids[solid] if solid is not None else model.solid
     else:
         shape = model
+
+    if canonical:
+        shape, converted = canonicalize(shape, tol.linear)
+        if converted is not None:
+            diags.append(converted)
 
     fmap, faces = _face_table(shape)
     edges = _edge_table(shape, fmap)
