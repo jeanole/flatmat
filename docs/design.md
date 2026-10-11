@@ -383,8 +383,7 @@ matrix); ruff, mypy, pytest.
   (§5.4); warn-and-skip instead
   of abort; DFM checks (§7) with the corner rule, tooling (§7.5), tool
   collisions and a bend order (§7.4).
-- **later**: cones; formed lances and louvres with curved slits; tubes with a
-  user-chosen seam; assemblies.
+- **later**: cones; tubes with a user-chosen seam; assemblies.
 
 ## 5. Hard geometry
 
@@ -551,75 +550,85 @@ the outer virtual-sharp line L.
   down, collars up, down and two on one part, a collar too tall for a
   pre-hole. All are exact in area and round-trip through STEP.
 
-**Louvres, bridges and lances: implemented.**
+**Louvres, bridges and lances: implemented**, bent or formed, with straight or
+curved slits.
 
 - **Detection** (`_formed_regions`, `_classify`): the opening's inner wire on
   the host face is walked in order (`BRepTools_WireExplorer`). Each edge is
   *attached* (to the region) or *cut* (to a thickness face); runs of each are
   counted.
-  - A formed region (seeded, as for embosses) cut along one run that stays
-    within t of its chord (a straight slit or narrow slot) is a **louvre**
-    (Kieme); along two such runs, a **bridge** (Brücke).
-  - Without seeds, a region of planes and cylinders that hangs in an inner
-    wire of a plane face and touches nothing else is a **lance** (Lasche) if
-    held on one side: a tab bent out of an opening. If held on two sides it
-    is a **bridge** whose ramps are bent (its development would not close).
-  - Anything else (a formed lance with tori, cuts inside the region, cuts
-    that are not straight) → `FORMED_FEATURE`.
+  - **Formed** (seeded, as for embosses: tori, spheres, freeform faces):
+    - held on one side and cut along one run: a **louvre** (Kieme) if the
+      cut is a straight slit (within t of its chord) or takes at most half the
+      rim, else a **lance** (Lasche: a tongue cut free around most of its
+      rim);
+    - held on two sides and cut along two runs: a **bridge** (Brücke).
+  - **Bent** (planes and cylinders only, hanging in an inner wire of a plane
+    face and touching nothing else):
+    - held on one side: a **lance**, developed like any flange;
+    - held on two sides: a **bridge** with bent ramps (its development
+      would not close).
+  - Anything else (held on more sides, cuts inside the region) →
+    `FORMED_FEATURE`.
+- **Slit width** (`_slit_width`):
+  - the region's own cut edges (its edges along thickness faces) are
+    projected onto the host plane;
+  - the median distance to the sheet's cut edges is the width. The ends,
+    where both meet, do not count;
+  - in 3D the two sides only lie in one plane where the slit leaves the
+    sheet, so a plain 3D distance would give 0.
 - **Flat output:**
-  - louvre, bridge: as an emboss, the region is not developed. Its rim is a
-    marking (`Feature.outline`, layer `FORM`) and the inside is material.
-  - Each cut run is closed by the chord between its ends. With width, that is
-    a slot, cut as a hole: exact when the region's free edge is straight, as
-    it is in the flat. Without width, it is a cut line in `FlatPattern.slits`
-    (layer `INNER`); the fold model and the checks treat it as a cut.
-  - lance: the tab is developed like any flange (`Feature.bend_id`); the
-    opening around it is cut as it is.
+  - a formed louvre, bridge or lance is not developed, as for an emboss.
+    Its rim is a marking (`Feature.outline`, layer `FORM`) and the inside is
+    material.
+  - **Slits with width:** each slit is the sheet's cut edge (exact: lines
+    and arcs of the rim) closed by the region's cut edge projected onto the
+    sheet.
+    - Projected edges that are lines or circles (a cut face normal to the
+      sheet) become exact `Line`/`Arc` segments; others stay a polyline
+      within 1e-4 mm.
+    - If no projected edge joins a run's ends, the rim and the projected
+      edges are polygonized, and the faces along the run are the slits.
+    - The projection is where the region's edge lies once formed; for a cut
+      face normal to the sheet, that is also where the blank is cut.
+  - **Slits without width:** cut lines in `FlatPattern.slits` (layer
+    `INNER`); the fold model and the checks treat them as cuts.
+  - **Bent lance:** the tab is developed like any flange
+    (`Feature.bend_id`), and the opening around it is cut as it is.
   - `Feature.holes` lists the holes each feature cuts (also pre-holes and
-    countersinks). `orientation_deg` is the direction of the slits or of the
-    lance's bend line, `size` the extent along and across it. DXF text:
-    `LOUVRE 20x10.5 A0 H5 TOP`.
+    countersinks). `orientation_deg` is the direction of a bent lance's bend
+    line, otherwise of the chord of the longest slit. `size` is the extent
+    along and across it. DXF text: `LOUVRE 20x10.5 A0 H5 TOP`.
 - **Checks:**
   - their holes are judged with the feature, not as holes or narrow slots:
-    rim (a lance: its opening) to the outline ≥ 3t, to other bends ≥ 4t + r;
-  - a lance's flange is measured to its opening;
+    rim (a bent lance: its opening) to the outline ≥ 3t, to other bends
+    ≥ 4t + r;
+  - a bent lance's flange is measured to its opening;
   - lances are formed with the blank in a punching tool, not on the press
-    brake. Their bend gets no press-brake rules (flange to V, air radius,
-    tooling, tonnage, U channel), and the bend order treats them like hems
-    (made first, `BendPlan.unchecked`). Air-bending a tab inside a frame
-    would push the frame into the die, and the simulation shows exactly
-    that.
-- **Tests** (`tests/test_cut_forms.py`):
-  - a raised half pad open along its diameter (louvre, up and down);
-  - a strip raised by two joggles at each end (bridge);
-  - tabs bent 30° and 90° out of openings as long as their flat (lance);
-  - all slits 0.5 mm wide, round-tripped through STEP;
-  - flat areas exact to 1e-9; sizes, directions and heights as built;
+    brake. A bent lance's bend gets no press-brake rules (flange to V, air
+    radius, tooling, tonnage, U channel), and the bend order treats it like
+    a hem (made first, `BendPlan.unchecked`). Air-bending a tab inside a
+    frame would push the frame into the die, and the simulation shows
+    exactly that.
+- **Tests** (`tests/test_cut_forms.py`), all slits 0.5 mm wide and
+  round-tripped through STEP:
+  - a raised half pad open along its diameter (straight louvre, up and
+    down);
+  - the hood of a raised round pad outside a circle, slit along it (curved
+    louvre; the slot is four exact arcs);
+  - a tongue and a strip cut from a raised round pad (formed lance, formed
+    bridge);
+  - a strip raised by two joggles at each end (bent bridge);
+  - tabs bent 30° and 90° out of openings as long as their flat (bent
+    lance);
+  - flat areas exact to 1e-9 for straight cuts and to 1e-5 for curved ones
+    against a polygonised reference;
+  - widths, sizes, directions and heights as built;
   - a synthetic slit without width through DXF, the fold model and the
     checks.
-- **Not supported:** cuts inside a formed region, lances formed with
-  stretched (toroidal) ends, louvres whose slit is not straight. Real CAD
-  slits of zero width cannot form a valid solid where both sides start flat,
-  so models have a width there or touch only at a vertex.
-
-**Original plan:**
-
-For each inner wire of a planar skin face, classify the faces across its
-edges:
-
-| Pattern | Feature | Flat output |
-|---|---|---|
-| one through-cylinder | hole | the circle (exact) |
-| coaxial cone (half-angle 41–60°) + cylinder | countersink | through-diameter as the cut, annotation (diameter, angle, side), `COUNTERSINK_PROJECTED` |
-| cone through the full thickness | knife-edge countersink | the smaller circle, warning |
-| cylinder + annular plane + cylinder | counterbore | through-diameter, annotation |
-| tangent torus → coaxial cylinder pair with ΔR ≈ t ending in a free edge | extruded hole | pre-hole diameter from a material/tool table (published formulas disagree), else `FORMED_FEATURE` |
-| tangent faces returning to a parallel plane at offset h, no thickness faces | emboss, dimple, bead | marking-layer outline plus tool id, no cut |
-| thickness faces inside a formed region | louvre, lance, bridge | slit lines plus marker plus tool id |
-
-All of these become `SheetPart.features` (type, faces, parameters, side).
-Unrecognised formed regions give `FORMED_FEATURE` (an error by default, a
-warning with `partial=True`).
+- **Not supported:** cuts inside a formed region; regions held on more than
+  two sides of their opening. The material a formed feature stretches is
+  not accounted for: inside its rim the blank is flat.
 
 ### 5.5 B-spline faces (canonical recognition, implemented)
 

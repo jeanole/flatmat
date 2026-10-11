@@ -249,6 +249,22 @@ def _formed_tools(kind: str, t: float, *a):
         half = BRepAlgoAPI_Common(cylinder(rim), prism(-rim - 1, rim + 1, 0.0, rim + 1)).Shape()
         hole = BRepAlgoAPI_Fuse(half, prism(-rim, rim, -gap, 0.0)).Shape()
         return hole, revolve(_emboss_profile(t, rim, height, a1, a2), math.pi)
+    if kind == "louvre_arc":
+        # the part of a raised round pad outside a circle (radius rc, centre at x = -cx) is the hood;
+        # the sheet comes back inside that circle, `gap` short of it: a slit along an arc
+        rim, height, a1, a2, cx, rc, gap = a
+        pad = revolve(_emboss_profile(t, rim, height, a1, a2), 2 * math.pi)
+        hood = BRepAlgoAPI_Cut(pad, _cyl_at(-cx, rc, deep)).Shape()
+        hole = BRepAlgoAPI_Cut(cylinder(rim), _cyl_at(-cx, rc - gap, deep)).Shape()
+        return hole, hood
+    if kind in ("lance_formed", "bridge_formed"):
+        # a tongue cut from a raised round pad: |y| < width/2, x < tip; held only at the pad's rim at -x;
+        # slits `gap` wide on the other three sides. Without a tip (tip >= rim): a strip held at both ends
+        rim, height, a1, a2, width, tip, gap = a
+        pad = revolve(_emboss_profile(t, rim, height, a1, a2), 2 * math.pi)
+        tongue = BRepAlgoAPI_Common(pad, prism(-rim - 1, tip, -width / 2, width / 2)).Shape()
+        hole = BRepAlgoAPI_Common(cylinder(rim), prism(-rim - 1, tip + gap, -width / 2 - gap, width / 2 + gap)).Shape()
+        return hole, tongue
     if kind == "bridge":
         # a strip `width` wide raised by two 30° joggles at each end; slits `gap` wide along both sides
         span, width, height, r, gap = a
@@ -282,6 +298,10 @@ def _formed_tools(kind: str, t: float, *a):
             _place_profile(make_solid(tab), dx, width, t),
         )
     raise ValueError(kind)
+
+
+def _cyl_at(x: float, r: float, deep):
+    return BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, 0, deep[0]), gp_Dir(0, 0, 1)), r, deep[1] - deep[0]).Shape()
 
 
 def _place_profile(solid, dx: float, width: float, t: float):
@@ -411,6 +431,11 @@ def cut_formed_cases() -> list[Part]:
     half pad open along its straight edge; ("bridge", flat, frac, z, span, width, height, r,
     gap, side): a strip raised by two joggles, slit along both sides; ("lance", flat, frac,
     z, length, width, angle, r, gap, side): a tab bent out of an opening as long as its flat.
+    Cut from a raised round pad (rim, height, fillet_in, fillet_top): ("louvre_arc", ...,
+    cx, rc, gap, side): the hood outside a circle of radius rc centred cx before the pad's
+    centre, slit along that circle; ("lance_formed" / "bridge_formed", ..., width, tip, gap,
+    side): the pad's strip |y| < width/2 up to x = tip, held at the rim at -x (a tongue), or
+    at both ends if tip >= rim.
     """
     L = dict(t=2.0, width=100, flats=[60, 40], bends=[(90, 2.0)])
     return [
@@ -419,6 +444,10 @@ def cut_formed_cases() -> list[Part]:
         Part("bridge", formed=[("bridge", 0, 0.5, 50.0, 30.0, 10.0, 4.0, 2.0, 0.5, +1)], **L),
         Part("lance", formed=[("lance", 0, 0.5, 50.0, 25.0, 12.0, 30.0, 2.0, 0.5, +1)], **L),
         Part("lance_90", formed=[("lance", 0, 0.4, 30.0, 20.0, 10.0, 90.0, 2.0, 0.5, -1)], **L),
+        # cut from a raised round pad (rim 12, 5 high, fillets 1): stretched, not developable
+        Part("louvre_arc", formed=[("louvre_arc", 0, 0.5, 50.0, 12.0, 5.0, 1.0, 1.0, 20.0, 25.0, 0.5, +1)], **L),
+        Part("lance_formed", formed=[("lance_formed", 0, 0.5, 50.0, 12.0, 5.0, 1.0, 1.0, 10.0, 6.0, 0.5, -1)], **L),
+        Part("bridge_formed", formed=[("bridge_formed", 0, 0.5, 50.0, 12.0, 5.0, 1.0, 1.0, 8.0, 13.0, 0.5, +1)], **L),
     ]
 
 

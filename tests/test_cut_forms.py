@@ -8,6 +8,7 @@ import ezdxf
 import pytest
 from conftest import write_and_load
 from parts import cut_formed_cases
+from shapely.geometry import Point, box
 
 import flatmat as fm
 from flatmat.fold import FoldModel
@@ -28,6 +29,16 @@ def flats(step_dir):
 
 def _cut_area(spec) -> float:
     kind, *_, gap, _side = spec
+    if kind in ("louvre_arc", "lance_formed", "bridge_formed"):
+        rim = spec[4]
+        disc = Point(0, 0).buffer(rim, quad_segs=4096)
+        if kind == "louvre_arc":
+            cx, rc = spec[8], spec[9]
+            ring = Point(-cx, 0).buffer(rc, quad_segs=4096).difference(Point(-cx, 0).buffer(rc - gap, quad_segs=4096))
+            return disc.intersection(ring).area
+        width, tip = spec[8], spec[9]
+        opening = disc.intersection(box(-rim - 1, -width / 2 - gap, tip + gap, width / 2 + gap))
+        return opening.difference(disc.intersection(box(-rim - 1, -width / 2, tip, width / 2))).area
     if kind == "louvre":
         return 2 * spec[4] * gap  # the slit along the diameter
     if kind == "bridge":
@@ -46,12 +57,13 @@ def test_recognised_and_area_exact(flats, name):
     part, sheet, pat = flats[name]
     (spec,) = part.formed
     (f,) = pat.features
-    assert f.kind == spec[0]
+    assert f.kind == spec[0].split("_")[0]
     assert sheet.thickness == pytest.approx(part.t, abs=1e-6)
-    assert pat.area == pytest.approx(part.width * part.flat_length(K) - _cut_area(spec), rel=1e-9)
+    exact = 1e-9 if spec[0] in ("louvre", "bridge", "lance") else 1e-5  # curved: through STEP, against polygons
+    assert pat.area == pytest.approx(part.width * part.flat_length(K) - _cut_area(spec), rel=exact)
     assert pat.meta["area_rel_err"] < 1e-9
     assert f.holes and all(i < len(pat.holes) for i in f.holes)
-    assert sum(abs(pat.holes[i].area()) for i in f.holes) == pytest.approx(_cut_area(spec), rel=1e-9)
+    assert sum(abs(pat.holes[i].area()) for i in f.holes) == pytest.approx(_cut_area(spec), rel=exact)
     assert len(pat.holes) == len(f.holes)  # nothing else is cut
     assert fm.check(pat).ok  # slits and openings are not judged as holes or slots
 
@@ -100,6 +112,30 @@ def test_lance_is_developed(flats, name):
     assert plan.feasible and tab.id in plan.unchecked and tab.id not in plan.order
 
 
+def test_curved_louvre(flats):
+    _, sheet, pat = flats["louvre_arc"]
+    (f,) = pat.features
+    assert f.kind == "louvre" and f.height == pytest.approx(5.0)
+    assert sheet._ctx.feature_gap[f.id] == pytest.approx(0.5, abs=1e-6)
+    (slot,) = (pat.holes[i] for i in f.holes)
+    arcs = [s for s in slot.segments if isinstance(s, Arc)]
+    # the sheet's edge (r 24.5), the hood's edge projected (r 25), and the rim between them: exact arcs
+    assert len(arcs) == len(slot.segments)
+    assert sorted({round(a.radius, 6) for a in arcs}) == pytest.approx([12.0, 24.5, 25.0])
+
+
+@pytest.mark.parametrize("name", ["lance_formed", "bridge_formed"])
+def test_formed_lance_and_bridge(flats, name):
+    _, sheet, pat = flats[name]
+    (f,) = pat.features
+    assert f.kind == name.split("_")[0] and f.bend_id is None and f.outline is not None
+    assert {fr.role for fr in sheet.faces if fr.id in f.face_ids} == {"formed"}  # not developed
+    assert len(f.holes) == (1 if f.kind == "lance" else 2)
+    assert [b.angle_deg for b in pat.bends] == pytest.approx([90.0])
+    # along the chord of the slits: across the tongue (width 10 + two slits), or the pad's length
+    assert f.size[0] == pytest.approx(11.0 if f.kind == "lance" else 24.0, abs=0.05)
+
+
 def test_sides(flats):
     for name in ("louvre_up", "louvre_down"):
         part, sheet, pat = flats[name]
@@ -117,7 +153,7 @@ def test_exports(flats, tmp_path):
         texts = [e.dxf.text for e in doc.modelspace().query("TEXT")]
         assert any(t.startswith(name.split("_")[0].upper()) for t in texts)
         form = doc.modelspace().query("*[layer=='FORM']")
-        assert bool(form) == (name != "lance")  # a lance is developed: no rim to mark
+        assert bool(form) == (name != "lance")  # a bent lance is developed: no rim to mark
         fm.write_bend_table(pat, tmp_path / f"{name}.json")
         (f,) = json.loads((tmp_path / f"{name}.json").read_text())["features"]
         assert f["kind"] == name.split("_")[0] and f["orientation_deg"] is not None and f["holes"]

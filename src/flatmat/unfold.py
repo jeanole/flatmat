@@ -239,17 +239,18 @@ def unfold(
 def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | None):
     """Louvres, bridges, lances: where they point and how big they are in the flat.
 
-    The direction is that of the slits (louvre, bridge) or of the bend line (lance).
+    The direction is that of the bend line (a bent lance) or of the chord of the longest
+    slit (the others; for a formed lance, the side it is held on).
     """
     if f.kind not in ("louvre", "bridge", "lance"):
         return f
-    if f.kind == "lance":
+    if f.outline is not None:
+        pts = f.outline.polyline(0.01)
+    else:  # a bent lance: its opening, along its bend line
         pts = [p for i in f.holes for p in holes[i].polyline(0.01)]
         bl = next((b for b in lines if b.bend_id == f.bend_id), None)
         if bl is not None:
             angle = math.atan2(bl.p1[1] - bl.p0[1], bl.p1[0] - bl.p0[0])
-    else:
-        pts = f.outline.polyline(0.01) if f.outline is not None else []
     if not pts or angle is None:
         return f
     deg = math.degrees(angle) % 180.0
@@ -451,10 +452,10 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
             out.append((L, None))
             continue
         kind = ctx.feature_kind.get(fid)
-        if kind == "lance":
+        if kind == "lance" and fid in ctx.developed:
             out.append((L, fid))
             continue
-        if kind in ("louvre", "bridge"):
+        if kind in ("louvre", "bridge", "lance"):
             rim = L if L.area() > 0 else _reverse_loop(L)
             outlines[fid] = rim
             cut_area = 0.0
@@ -462,12 +463,12 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
             if runs:
                 c = max(runs, key=lambda ch: math.dist(ch[0].start, ch[-1].end))
                 orient[fid] = math.atan2(c[-1].end[1] - c[0].start[1], c[-1].end[0] - c[0].start[0])
-            for chain in runs:
-                closing = Line(chain[-1].end, chain[0].start, chain[0].source_edge)
-                slot = Loop2D((*chain, closing))
-                if abs(slot.area()) <= 1e-9 * max(1.0, closing.length()) ** 2:
-                    slits.append((Loop2D(tuple(chain)), fid))  # no width: a cut line
-                else:
+            host, free = ctx.feature_free.get(fid, (0, []))
+            if ctx.feature_gap.get(fid, 0.0) <= 1e-6 or not free:
+                slits.extend((Loop2D(tuple(chain)), fid) for chain in runs)  # no width: cut lines
+            else:
+                edge_pts = [_on_host(ctx, devs, place, host, ctx.edges[ei][0]) for ei in free]
+                for slot in _slots(rim, runs, edge_pts):
                     out.append((slot, fid))
                     cut_area += abs(slot.area())
             centers[fid] = (_centroid(rim), rim.area() - cut_area)
@@ -506,6 +507,148 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
     holes = [_reverse_loop(h) if h.area() > 0 else h for h, _ in out[1:]]
     hole_fid = [f for _, f in out[1:]]
     return outer, holes, centers, outlines, hole_fid, slits, orient
+
+
+def _on_host(ctx: Context, devs, place, host: int, e) -> list:
+    """An edge of a formed region projected onto its host plane, in the flat."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GCPnts import GCPnts_QuasiUniformDeflection
+
+    f = ctx.faces[host - 1]
+    pos = f.ad.Plane().Position()
+    o, xd, yd = pos.Location(), pos.XDirection(), pos.YDirection()
+    c = BRepAdaptor_Curve(e)
+    sampler = GCPnts_QuasiUniformDeflection(c, 1e-4)
+    params = [sampler.Parameter(i) for i in range(1, sampler.NbPoints() + 1)] if sampler.IsDone() else []
+    if len(params) < 2:
+        params = [c.FirstParameter(), c.LastParameter()]
+    out = []
+    for u in params:
+        p = c.Value(u)
+        d = (p.X() - o.X(), p.Y() - o.Y(), p.Z() - o.Z())
+        uv = (
+            d[0] * xd.X() + d[1] * xd.Y() + d[2] * xd.Z(),
+            d[0] * yd.X() + d[1] * yd.Y() + d[2] * yd.Z(),
+        )
+        out.append(_apply(place[host], devs[host](*uv)))
+    return _fit(out)
+
+
+def _fit(pts: list[Point], tol: float = 1e-7) -> list:
+    """A projected edge as one Line or Arc if it is one (a cut face normal to the sheet), else a polyline."""
+    if len(pts) < 2 or math.dist(pts[0], pts[-1]) < 1e-12 and len(pts) < 3:
+        return []
+    a, m, b = pts[0], pts[len(pts) // 2], pts[-1]
+    ab = math.dist(a, b)
+    if ab > 1e-12 and all(abs((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / ab <= tol for p in pts):
+        return [Line(a, b)]
+    den = 2 * (a[0] * (m[1] - b[1]) + m[0] * (b[1] - a[1]) + b[0] * (a[1] - m[1]))
+    if abs(den) > 1e-12:
+        ux = ((a[0] ** 2 + a[1] ** 2) * (m[1] - b[1]) + (m[0] ** 2 + m[1] ** 2) * (b[1] - a[1])
+              + (b[0] ** 2 + b[1] ** 2) * (a[1] - m[1])) / den  # fmt: skip
+        uy = ((a[0] ** 2 + a[1] ** 2) * (b[0] - m[0]) + (m[0] ** 2 + m[1] ** 2) * (a[0] - b[0])
+              + (b[0] ** 2 + b[1] ** 2) * (m[0] - a[0])) / den  # fmt: skip
+        c = (ux, uy)
+        r = math.dist(c, a)
+        if all(abs(math.dist(c, p) - r) <= tol for p in pts):
+            a0 = math.atan2(a[1] - c[1], a[0] - c[0])
+            angles = [math.atan2(p[1] - c[1], p[0] - c[0]) for p in pts]
+            sweep = 0.0
+            for u, v in zip(angles, angles[1:], strict=False):
+                sweep += (v - u + math.pi) % (2 * math.pi) - math.pi
+            return [Arc(c, r, a0, a0 + sweep, sweep > 0)]
+    return [Line(p, q) for p, q in zip(pts, pts[1:], strict=False) if math.dist(p, q) > 1e-12]
+
+
+def _slots(rim: Loop2D, runs: list[list], free: list[list]) -> list[Loop2D]:
+    """The slits of a formed region, with their width: between the sheet's cut edge (a run of
+    the rim) and the region's own cut edge projected onto the sheet (``free``: per edge, its
+    segments).
+
+    Each run is closed by the region's edge that joins its two ends. Where none does, the
+    rim and the projected edges are polygonized and the faces along a run are the slits.
+    """
+    chains = _join([p for p in free if p])
+    out = []
+    for run in runs:
+        a, b = run[0].start, run[-1].end
+        best = None
+        for ch in chains:
+            for segs in (ch, [s.reversed() for s in reversed(ch)]):
+                err = max(math.dist(segs[0].start, b), math.dist(segs[-1].end, a))
+                if best is None or err < best[0]:
+                    best = (err, segs)
+        if best is not None and best[0] <= 2e-3:
+            segs = list(run) + best[1]
+            loop = []
+            for prev, cur in zip(segs[-1:] + segs[:-1], segs, strict=True):
+                if math.dist(prev.end, cur.start) > 1e-9:  # the region's edge meets the rim within 2e-3
+                    loop.append(Line(prev.end, cur.start, cur.source_edge))
+                loop.append(cur)
+            out.append(_merge_collinear(Loop2D(tuple(loop))))
+        else:
+            pts = [[sg.start for sg in p] + [p[-1].end] for p in free if p]
+            out.extend(_slots_by_faces(rim, [run], pts))
+    return out
+
+
+def _join(pieces: list[list], tol: float = 1e-6) -> list[list]:
+    """Segment chains joined end to end where their ends meet."""
+
+    def rev(segs):
+        return [s.reversed() for s in reversed(segs)]
+
+    todo = [list(p) for p in pieces]
+    chains: list[list] = []
+    while todo:
+        cur = todo.pop()
+        grown = True
+        while grown:
+            grown = False
+            for i, p in enumerate(todo):
+                if math.dist(cur[-1].end, p[0].start) <= tol:
+                    cur = cur + p
+                elif math.dist(cur[-1].end, p[-1].end) <= tol:
+                    cur = cur + rev(p)
+                elif math.dist(cur[0].start, p[-1].end) <= tol:
+                    cur = p + cur
+                elif math.dist(cur[0].start, p[0].start) <= tol:
+                    cur = rev(p) + cur
+                else:
+                    continue
+                todo.pop(i)
+                grown = True
+                break
+        chains.append(cur)
+    return chains
+
+
+def _slots_by_faces(rim: Loop2D, runs: list[list], free: list[list[Point]]) -> list[Loop2D]:
+    """Fallback: the faces cut from the rim by the projected region edges that lie along a run."""
+    from shapely import set_precision, snap
+    from shapely.geometry import LineString
+    from shapely.ops import polygonize, unary_union
+
+    rim_pts = rim.polyline(1e-4)
+    rim_line = LineString([*rim_pts, rim_pts[0]])
+    # the region's edges end on the rim (a polyline within 1e-4 of it) and on each other
+    # (projected from different edges): snap to the rim and to a 1e-6 grid so they meet
+    lines = [rim_line] + [snap(LineString(p), rim_line, 2e-4) for p in free if len(p) > 1]
+    lines = [set_precision(g, 1e-6) for g in lines]
+    cut_lines = []
+    for chain in runs:
+        pts: list[Point] = []
+        for sg in chain:
+            sp = sg.sample(1e-4)
+            pts.extend(sp if not pts else sp[1:])
+        cut_lines.append(LineString(pts))
+    out = []
+    for face in polygonize(unary_union(lines)):
+        if any(face.exterior.intersection(cl.buffer(1e-5)).length > 1e-3 for cl in cut_lines):
+            ring = list(face.exterior.coords)[:-1]
+            loop = Loop2D(tuple(Line(p, q) for p, q in zip(ring, ring[1:] + ring[:1], strict=True)))
+            out.append(_merge_collinear(loop, 1e-9))
+    return out
 
 
 def _cut_runs(L: Loop2D, cut_edges: set[int]) -> list[list]:

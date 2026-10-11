@@ -107,12 +107,13 @@ today:
   B-spline faces and edges that are really planes, cylinders, cones, lines
   or circles — done; manufacturability checks (flange, radius, holes, reliefs,
   slots, hems, U channels, tonnage) — done; embosses and extruded holes
-  (pre-hole from the neutral fibre or your table) — done; louvres and bridges
-  (slits cut, rim marked) and lances (tab developed, opening cut) — done;
+  (pre-hole from the neutral fibre or your table) — done; louvres, bridges
+  and lances, bent or formed, with straight or curved slits (slits cut, rim
+  marked; a bent lance's tab developed) — done;
   corner rule (corner
   relief, gap between folded flanges) — done; punch and die data, tool
   collisions and a bend order — done.
-- **Later:** cones, formed lances and curved louvres, tubes, assemblies.
+- **Later:** cones, tubes, assemblies.
 
 ## Stack
 

@@ -111,6 +111,9 @@ class Context:
     feature_kind: dict[int, str] = field(default_factory=dict)
     feature_edges: dict[int, set[int]] = field(default_factory=dict)  # edges of a formed feature's opening
     feature_cuts: dict[int, list[list[int]]] = field(default_factory=dict)  # its slits, as runs of edges
+    feature_gap: dict[int, float] = field(default_factory=dict)  # their width
+    developed: set[int] = field(default_factory=set)  # lances laid flat by bending
+    feature_free: dict[int, tuple[int, list[int]]] = field(default_factory=dict)  # host face, free edges
     tol: Tolerances = field(default_factory=Tolerances)
 
 
@@ -479,6 +482,9 @@ class _Formed:
     reason: str = ""
     wire: list[int] = field(default_factory=list)  # edge indices of that inner wire
     cuts: list[list[int]] = field(default_factory=list)  # runs of the wire along cuts (slits), in wire order
+    developed: bool = False  # a lance bent from planes and cylinders: laid flat like any flange
+    gap: float = 0.0  # width of the slits, seen on the sheet
+    free: list[int] = field(default_factory=list)  # the region's edges along thickness faces (its cut edge)
 
 
 _FORM_KINDS = ("torus", "sphere", "cone", "other")
@@ -562,13 +568,15 @@ def _classify(reg: _Formed, faces: list[_Face], edges, nb_all, in_skin, t: float
     n_att = len(_runs(attached))
     reg.cuts = [[reg.wire[i] for i in run] for run in _runs(cut)] if any(cut) else []
     thin = [_thin(c, edges, t) for c in reg.cuts]
+    reg.gap = _slit_width(reg, faces, edges, in_skin)
     if not seeded:  # planes and cylinders only
         if n_att == 1:
             reg.kind = "lance"  # a tab bent out of an opening: developed like any flange
-        elif len(reg.cuts) == 2 and all(thin):
+            reg.developed = True
+        elif n_att == 2 and len(reg.cuts) == 2:
             reg.kind = "bridge"
         else:
-            reg.reason = "a region bent out of an opening and held on several sides is not supported"
+            reg.reason = "a region bent out of an opening and held on more than two sides is not supported"
         return
     if not reg.cuts:
         cut_inside = any(n not in in_skin for i in reg.faces for n in nb_all[i])
@@ -578,12 +586,65 @@ def _classify(reg: _Formed, faces: list[_Face], edges, nb_all, in_skin, t: float
             reg.kind = "extruded_hole"
         else:
             reg.reason = "a formed feature with cuts inside it is not supported"
-    elif len(reg.cuts) == 1 and thin[0]:
-        reg.kind = "louvre"
-    elif len(reg.cuts) == 2 and all(thin):
+    elif n_att == 1 and len(reg.cuts) == 1:
+        # held on one side: a louvre is cut along a slit (straight or curved), a formed lance
+        # (a tongue) is cut free around most of its rim
+        cut_len = sum(_edge_length(edges[ei][0]) for ei in reg.cuts[0])
+        rim_len = sum(_edge_length(edges[ei][0]) for ei in reg.wire)
+        reg.kind = "louvre" if thin[0] or cut_len <= 0.5 * rim_len else "lance"
+    elif n_att == 2 and len(reg.cuts) == 2:
         reg.kind = "bridge"
     else:
-        reg.reason = "a formed feature cut along more than a straight slit (a formed lance?) is not supported"
+        reg.reason = "a formed feature held on more than two sides of its opening is not supported"
+
+
+def _edge_length(e) -> float:
+    g = GProp_GProps()
+    BRepGProp.LinearProperties_s(e, g)
+    return g.Mass()
+
+
+def _slit_width(reg: _Formed, faces: list[_Face], edges, in_skin) -> float:
+    """Width of the slits, seen on the sheet: the region's free edges projected onto the host
+    plane, and their distance from the sheet's cut edges (the median, so the ends where the two
+    meet do not count).
+    """
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.TopoDS import TopoDS_Compound
+
+    cut = [ei for c in reg.cuts for ei in c]
+    free = [  # the region's edges along thickness faces
+        ei
+        for ei, (_, fi) in enumerate(edges)
+        if len(fi) == 2 and len(set(fi) & reg.faces) == 1 and next(iter(set(fi) - reg.faces)) not in in_skin
+    ]
+    reg.free = free
+    if not cut or not free or reg.host is None:
+        return 0.0
+    bb = BRep_Builder()
+    comp = TopoDS_Compound()
+    bb.MakeCompound(comp)
+    for ei in cut:
+        bb.Add(comp, edges[ei][0])
+    h = faces[reg.host - 1]
+    n = h.normal.Normalized()
+    o = h.ad.Plane().Location()
+    ds = []
+    for ei in free:
+        c = BRepAdaptor_Curve(edges[ei][0])
+        a, b = c.FirstParameter(), c.LastParameter()
+        for k in range(1, 8):
+            p = c.Value(a + (b - a) * k / 8)
+            q = gp_Pnt(p.XYZ() - n.XYZ() * gp_Vec(o, p).Dot(n))
+            d = BRepExtrema_DistShapeShape(BRepBuilderAPI_MakeVertex(q).Vertex(), comp)
+            if d.IsDone():
+                ds.append(d.Value())
+    if not ds:
+        return 0.0
+    ds.sort()
+    return ds[len(ds) // 2]
 
 
 def _formed_regions(
@@ -864,7 +925,7 @@ def recognize(
     for reg in regions:
         if reg.kind is None:
             raise refuse(Code.FORMED_FEATURE, reg.reason, faces=sorted(reg.faces))
-    formed = {i for reg in regions if reg.kind != "lance" for i in reg.faces}
+    formed = {i for reg in regions if not reg.developed for i in reg.faces}
     for sk in skins:
         bad = [i for i in sk if faces[i - 1].kind in _FORM_KINDS and i not in formed]
         if bad:
@@ -1015,13 +1076,19 @@ def recognize(
 
     feat_edges: dict[int, set[int]] = {}
     feat_cuts: dict[int, list[list[int]]] = {}
+    feat_gap: dict[int, float] = {}
+    feat_free: dict[int, tuple[int, list[int]]] = {}
+    developed: set[int] = set()
     for reg in (r for r in regions if r.skin == a_side):
         fid = len(features) + 1
         feat = _formed_feature(fid, reg, faces, edges, t, diags)
-        if reg.kind == "lance":
+        feat_gap[fid] = reg.gap
+        feat_free[fid] = (reg.host, reg.free)  # type: ignore[assignment]
+        if reg.developed:
             hinge = next((b for b in bends for sg in b.segments if sg.face_id in reg.faces
                           and reg.host in smooth_nb[sg.face_id]), None)  # fmt: skip
             feat = replace(feat, bend_id=hinge.id if hinge else None)
+            developed.add(fid)
         else:
             feat_faces[fid] = tuple(sorted(reg.faces))
             feat_r[fid] = feat.through_diameter / 2
@@ -1054,6 +1121,7 @@ def recognize(
     ctx.features, ctx.feature_through_r, ctx.feature_on_a = feat_faces, feat_r, feat_a
     ctx.feature_kind = {f.id: f.kind for f in features}
     ctx.feature_edges, ctx.feature_cuts = feat_edges, feat_cuts
+    ctx.feature_gap, ctx.developed, ctx.feature_free = feat_gap, developed, feat_free
     return SheetPart(
         thickness=t,
         thickness_confidence=conf,

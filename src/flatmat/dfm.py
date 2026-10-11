@@ -461,12 +461,10 @@ def _formed(pattern: FlatPattern, outer: Polygon, holes, all_lines, bends, rules
     for f in pattern.features:
         if f.kind not in _FORM_NAMES or f.center is None:
             continue
-        if f.kind == "lance":
-            if not f.holes:
-                continue
-            rim = unary_union([holes[i] for i in f.holes]).convex_hull
-        elif f.outline is not None:
+        if f.outline is not None:
             rim = Polygon(f.outline.polyline(0.01))
+        elif f.kind == "lance" and f.holes:  # a bent lance: its opening
+            rim = unary_union([holes[i] for i in f.holes]).convex_hull
         else:
             continue
         name = _FORM_NAMES[f.kind]
