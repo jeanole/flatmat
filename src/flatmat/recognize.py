@@ -18,7 +18,15 @@ from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Curve2d, BRepAdaptor_
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepLProp import BRepLProp_SLProps
 from OCP.BRepTools import BRepTools
-from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Line, GeomAbs_Plane
+from OCP.GeomAbs import (
+    GeomAbs_Circle,
+    GeomAbs_Cone,
+    GeomAbs_Cylinder,
+    GeomAbs_Line,
+    GeomAbs_Plane,
+    GeomAbs_Sphere,
+    GeomAbs_Torus,
+)
 from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec
 from OCP.GProp import GProp_GProps
 from OCP.IntTools import IntTools_FClass2d
@@ -26,6 +34,7 @@ from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_REVERSED, Top
 from OCP.TopExp import TopExp
 
 from ._occ import EdgeFaceMap, ShapeMap, as_edge, as_face
+from .bendmodel import extruded_hole_prehole
 from .canonical import canonicalize
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .io import StepModel
@@ -48,6 +57,7 @@ class _Face:
     axis_p: Any = None  # gp_Pnt for cylinders
     axis_d: Any = None  # gp_Vec for cylinders and cones
     semi_angle: float = 0.0  # cones
+    minor: float = 0.0  # tori
     _cls: Any = None
 
     def inside(self, u: float, v: float) -> bool:
@@ -98,6 +108,7 @@ class Context:
     features: dict[int, tuple[int, ...]] = field(default_factory=dict)  # feature id -> faces
     feature_through_r: dict[int, float] = field(default_factory=dict)
     feature_on_a: dict[int, bool] = field(default_factory=dict)
+    feature_kind: dict[int, str] = field(default_factory=dict)
     tol: Tolerances = field(default_factory=Tolerances)
 
 
@@ -131,7 +142,13 @@ def _face_table(solid) -> tuple[Any, list[_Face]]:
         n, mirror = _props(f, ad, (u0 + u1) / 2, (v0 + v1) / 2)
         g = GProp_GProps()
         BRepGProp.SurfaceProperties_s(f, g)
-        kind = {GeomAbs_Plane: "plane", GeomAbs_Cylinder: "cylinder", GeomAbs_Cone: "cone"}.get(ad.GetType(), "other")
+        kind = {
+            GeomAbs_Plane: "plane",
+            GeomAbs_Cylinder: "cylinder",
+            GeomAbs_Cone: "cone",
+            GeomAbs_Torus: "torus",
+            GeomAbs_Sphere: "sphere",
+        }.get(ad.GetType(), "other")
         rec = _Face(i, f, kind, g.Mass(), n, mirror, (u0, u1, v0, v1), ad)
         if kind == "cylinder":
             c = ad.Cylinder()
@@ -144,6 +161,16 @@ def _face_table(solid) -> tuple[Any, list[_Face]]:
             rec.axis_p = k.Location()
             rec.axis_d = gp_Vec(k.Axis().Direction())
             rec.semi_angle = k.SemiAngle()
+        elif kind == "torus":
+            tor = ad.Torus()
+            rec.radius = tor.MajorRadius()
+            rec.minor = tor.MinorRadius()
+            rec.axis_p = tor.Location()
+            rec.axis_d = gp_Vec(tor.Axis().Direction())
+        elif kind == "sphere":
+            sph = ad.Sphere()
+            rec.radius = sph.Radius()
+            rec.axis_p = sph.Location()
         faces.append(rec)
     return fmap, faces
 
@@ -398,7 +425,7 @@ def _circle_radii(face: _Face) -> list[tuple[float, Any]]:
     return out
 
 
-def _hole_feature(group: list[int], faces: list[_Face], tol: Tolerances):
+def _hole_feature(group: list[int], faces: list[_Face], tol: Tolerances, t: float = math.inf):
     """A coaxial stack of cylinders, cones and annular planes -> (kind, through_r, outer_r, angle, depth)."""
     fs = [faces[i - 1] for i in group]
     axial = [f for f in fs if f.kind in ("cylinder", "cone")]
@@ -426,8 +453,191 @@ def _hole_feature(group: list[int], faces: list[_Face], tol: Tolerances):
     if len(cyl_r) >= 2:
         big = [p for r, p in circles if abs(r - rmax) < 1e-6]
         depth = max((big[i].Distance(big[j]) for i in range(len(big)) for j in range(i + 1, len(big))), default=None)
+        if depth is not None and depth > t * (1 + tol.thickness_rel):
+            return None  # deeper than the sheet: a sharp-edged collar, not a counterbore
         return "counterbore", rmin, rmax, None, depth
     return None
+
+
+# ------------------------------------------------------------------------------ formed features
+
+
+@dataclass
+class _Formed:
+    """A formed region of one skin (docs/design.md §5.4): an emboss or an extruded hole."""
+
+    skin: int
+    faces: set[int]
+    host: int | None = None  # the plane face whose inner wire bounds the region
+    kind: str | None = None  # "emboss" | "extruded_hole" | None (not supported)
+    reason: str = ""
+
+
+_FORM_KINDS = ("torus", "sphere", "cone", "other")
+
+
+def _formed_regions(faces: list[_Face], skin: set[int], s: int, smooth_nb, nb_all, edges, in_skin) -> list[_Formed]:
+    """Formed regions of one skin: curved faces that are no bends, plus what they enclose.
+
+    Seeds are the skin's tori, spheres, cones and freeform faces, grown over cylinders
+    tangent to them. Removing the seeds leaves the main sheet (the largest part) and
+    the faces the seeds enclose (an emboss's raised top). A region is valid only if it
+    meets the main sheet along inner wires of a single plane face.
+    """
+    seeds = {i for i in skin if faces[i - 1].kind in _FORM_KINDS}
+    if not any(faces[i - 1].kind in ("torus", "sphere", "other") for i in seeds):
+        return []  # cones alone: conical bends, not formed features (still unsupported)
+    grow = True
+    while grow:
+        grow = False
+        for i in skin:
+            if i not in seeds and faces[i - 1].kind == "cylinder" and smooth_nb[i] & seeds:
+                seeds.add(i)
+                grow = True
+    rest = skin - seeds
+    rest_comps = _components(len(faces), [(a, b) for a in rest for b in smooth_nb[a] if b in rest and a < b])
+    rest_comps = [c for c in rest_comps if c[0] in rest]
+    if not rest_comps:
+        return []
+    main = set(max(rest_comps, key=lambda c: sum(faces[i - 1].area for i in c)))
+    formed = skin - main
+    comps = _components(len(faces), [(a, b) for a in formed for b in smooth_nb[a] if b in formed and a < b])
+    out = []
+    for c in comps:
+        if c[0] not in formed:
+            continue
+        reg = _Formed(s, set(c))
+        hosts = {b for a in c for b in smooth_nb[a] if b in main}
+        if len(hosts) != 1 or faces[next(iter(hosts)) - 1].kind != "plane":
+            reg.reason = "a formed region must lie inside one flat face"
+            out.append(reg)
+            continue
+        host = next(iter(hosts))
+        reg.host = host
+        outer = BRepTools.OuterWire_s(faces[host - 1].shape)
+        from OCP.TopExp import TopExp_Explorer
+
+        outer_edges = []
+        ex = TopExp_Explorer(outer, TopAbs_EDGE)
+        while ex.More():
+            outer_edges.append(ex.Current())
+            ex.Next()
+        bound = [e for e, fi in edges if len(fi) == 2 and host in fi and (set(fi) - {host}) <= reg.faces]
+        if any(e.IsSame(o) for e in bound for o in outer_edges):
+            reg.reason = "a formed region reaches the outline of its face"
+            out.append(reg)
+            continue
+        cut = any(n not in in_skin for i in c for n in nb_all[i])
+        if not cut:
+            reg.kind = "emboss"
+        elif _collar(reg, faces) is not None:
+            reg.kind = "extruded_hole"
+        else:
+            reg.reason = "a formed feature with cuts (louvre, lance, bridge?) is not supported"
+        out.append(reg)
+    return out
+
+
+def _collar(reg: _Formed, faces: list[_Face]):
+    """(cylinder, tori) if the region is a coaxial collar on an axis normal to its host."""
+    fs = [faces[i - 1] for i in reg.faces]
+    if any(f.kind not in ("cylinder", "torus") for f in fs) or reg.host is None:
+        return None
+    cyls = [f for f in fs if f.kind == "cylinder"]
+    tori = [f for f in fs if f.kind == "torus"]
+    if not cyls or len({round(f.radius, 6) for f in cyls}) != 1:
+        return None
+    n = faces[reg.host - 1].normal.Normalized()
+    key = _axis_key(cyls[0])
+    for f in fs:
+        k = _axis_key(f)
+        if k[:3] != key[:3] or max(abs(x - y) for x, y in zip(k[3:], key[3:], strict=True)) > 1e-2:
+            return None
+    if abs(abs(cyls[0].axis_d.Normalized().Dot(n)) - 1) > 1e-6:
+        return None
+    return cyls, tori
+
+
+def _region_extent(reg: _Formed, faces: list[_Face]) -> tuple[float, float]:
+    """Smallest and largest signed distance of the region from its host plane (along its normal)."""
+    assert reg.host is not None
+    h = faces[reg.host - 1]
+    n = h.normal.Normalized()
+    o = h.ad.Plane().Location()
+    from OCP.TopExp import TopExp_Explorer
+
+    from ._occ import as_vertex
+
+    pts = []
+    for i in reg.faces:
+        f = faces[i - 1]
+        ex = TopExp_Explorer(f.shape, TopAbs_VERTEX)
+        while ex.More():
+            pts.append(BRep_Tool.Pnt_s(as_vertex(ex.Current())))
+            ex.Next()
+        u0, u1, v0, v1 = f.uv
+        for a in range(1, 8):
+            for b in range(1, 8):
+                u, v = u0 + (u1 - u0) * a / 8, v0 + (v1 - v0) * b / 8
+                if f.inside(u, v):
+                    pts.append(f.ad.Value(u, v))
+    ds = [gp_Vec(o, p).Dot(n) for p in pts] or [0.0]
+    return min(0.0, *ds), max(0.0, *ds)
+
+
+def _host_circle(reg: _Formed, faces: list[_Face], edges) -> tuple[float, Any] | None:
+    """Radius and centre of the region's boundary on its host, if it is a circle."""
+    out = None
+    for e, fi in edges:
+        if len(fi) == 2 and reg.host in fi and (set(fi) - {reg.host}) <= reg.faces:
+            c = BRepAdaptor_Curve(e)
+            if c.GetType() != GeomAbs_Circle:
+                return None
+            circ = c.Circle()
+            if out is not None and abs(out[0] - circ.Radius()) > 1e-6:
+                return None
+            out = (circ.Radius(), circ.Location())
+    return out
+
+
+def _formed_feature(fid: int, reg: _Formed, faces: list[_Face], edges, t: float, diags: list) -> Feature:
+    """A Feature for a formed region of the reference skin."""
+    lo, hi = _region_extent(reg, faces)
+    up = hi >= -lo  # displaced towards the reference skin's outside: towards the viewer of the flat
+    h = hi if up else -lo
+    side: Literal["top", "bottom"] = "top" if up else "bottom"
+    circ = _host_circle(reg, faces, edges)
+    if reg.kind == "emboss":
+        size = 2 * circ[0] if circ else 0.0
+        return Feature(fid, "emboss", 0.0, size, side, face_ids=tuple(sorted(reg.faces)), height=h)
+    cyls, tori = _collar(reg, faces)  # type: ignore[misc]
+    if circ is None:
+        raise refuse(Code.FORMED_FEATURE, "an extruded hole whose rim is not a circle", faces=sorted(reg.faces))
+    rho = circ[0]
+    r_cyl = cyls[0].radius
+    straight = max(f.uv[3] - f.uv[2] for f in cyls)  # v runs along the axis
+    if tori:
+        tor = tori[0]
+        sweep = max(f.uv[3] - f.uv[2] for f in tori)
+        r_in = tor.minor if up else tor.minor - t  # the reference skin is the inside of the fillet if up
+    else:
+        sweep, r_in = 0.0, 0.0
+    bore = r_cyl - t if up else r_cyl
+    height = h + t if up else h  # outside height, from the far side of the sheet to the rim
+    d_pre = extruded_hole_prehole(rho, r_in, sweep, straight, t)
+    if d_pre <= 0:
+        diags.append(warn(Code.PRE_HOLE, f"extruded hole ⌀{2 * bore:g}: no material for a pre-hole; pierced",
+                          faces=sorted(reg.faces)))  # fmt: skip
+    return Feature(
+        fid,
+        "extruded_hole",
+        max(0.0, d_pre),
+        2 * bore,
+        side,
+        face_ids=tuple(sorted(reg.faces)),
+        height=height,
+        radius=r_in,
+    )
 
 
 # ------------------------------------------------------------------------------ public
@@ -500,8 +710,16 @@ def recognize(
     if len(comps) < 3:
         raise refuse(Code.NOT_TWO_SKINS, f"{len(comps)} face groups; a sheet has two skins and edge faces")
     skins = [set(comps[0]), set(comps[1])]
+    in_skin = skins[0] | skins[1]
+    regions: list[_Formed] = []
+    for s, sk in enumerate(skins):
+        regions += _formed_regions(faces, sk, s, smooth_nb, nb_all, edges, in_skin)
+    for reg in regions:
+        if reg.kind is None:
+            raise refuse(Code.FORMED_FEATURE, reg.reason, faces=sorted(reg.faces))
+    formed = {i for reg in regions for i in reg.faces}
     for sk in skins:
-        bad = [i for i in sk if faces[i - 1].kind in ("other", "cone")]
+        bad = [i for i in sk if faces[i - 1].kind in _FORM_KINDS and i not in formed]
         if bad:
             raise refuse(Code.UNSUPPORTED_SURFACE, "skin faces must be planes or cylinders", faces=bad)
 
@@ -516,7 +734,6 @@ def recognize(
         )
 
     # faces between the skins: hole features (coaxial stacks) or edge faces touching both skins
-    in_skin = skins[0] | skins[1]
     between = [i for i in range(1, len(faces) + 1) if i not in in_skin]
     groups = _components(len(faces), [(a, b) for a in between for b in nb_all[a] if b not in in_skin and a < b])
     groups = [g for g in groups if g[0] not in in_skin]
@@ -524,7 +741,7 @@ def recognize(
     featured: set[int] = set()
     for g in groups:
         touches = {s for s in (0, 1) if any(n in skins[s] for i in g for n in nb_all[i])}
-        hf = _hole_feature(g, faces, tol) if touches == {0, 1} else None
+        hf = _hole_feature(g, faces, tol, t) if touches == {0, 1} else None
         if hf is not None:
             feature_groups.append((g, hf))
             featured |= set(g)
@@ -539,12 +756,12 @@ def recognize(
                 faces=comp,
             )
 
-    planes = [f for f in faces if f.kind == "plane" and f.idx in in_skin]
+    planes = [f for f in faces if f.kind == "plane" and f.idx in in_skin and f.idx not in formed]
     if not planes:
         raise refuse(Code.UNSUPPORTED_SURFACE, "no planar skin face to start from")
     root = max(planes, key=lambda f: (f.area, -f.idx))
     a_side = 0 if root.idx in skins[0] else 1
-    skin_a = skins[a_side]
+    skin_a = skins[a_side] - formed
 
     # bends: cylinders of the reference skin, grouped by axis line, radius and angle
     groups_b: dict[tuple, list] = defaultdict(list)
@@ -649,6 +866,14 @@ def recognize(
         if fkind == "countersink" and on_a:
             diags.append(warn(Code.COUNTERSINK_PROJECTED, f"countersink ⌀{2 * rmax:g} cut as ⌀{2 * rmin:g}", faces=g))
 
+    for reg in (r for r in regions if r.skin == a_side):
+        fid = len(features) + 1
+        feat = _formed_feature(fid, reg, faces, edges, t, diags)
+        features.append(feat)
+        feat_faces[fid] = tuple(sorted(reg.faces))
+        feat_r[fid] = feat.through_diameter / 2
+        feat_a[fid] = True
+
     adj: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for a, b, ei in smooth:
         adj[a].append((b, ei))
@@ -658,19 +883,20 @@ def recognize(
             adj[a].append((b, ei))
             adj[b].append((a, ei))
 
-    role = {i: "skin_a" for i in skin_a} | {i: "skin_b" for i in skins[1 - a_side]}
+    role = {i: "skin_a" for i in skin_a} | {i: "skin_b" for i in skins[1 - a_side]} | {i: "formed" for i in formed}
     face_infos = tuple(
         FaceInfo(
             f.idx,
-            cast(Literal["plane", "cylinder", "other"], f.kind if f.kind != "cone" else "other"),
+            cast(Literal["plane", "cylinder", "other"], f.kind if f.kind in ("plane", "cylinder") else "other"),
             f.area,
-            cast(Literal["skin_a", "skin_b", "thickness"], role.get(f.idx, "thickness")),
+            cast(Literal["skin_a", "skin_b", "thickness", "formed"], role.get(f.idx, "thickness")),
         )
         for f in faces
     )
     ctx = Context(shape, fmap, vmap, faces, edges, adj, skin_a, root.idx, t, bend_faces, tol=tol)
     ctx.sharp_edges = sharp_edges
     ctx.features, ctx.feature_through_r, ctx.feature_on_a = feat_faces, feat_r, feat_a
+    ctx.feature_kind = {f.id: f.kind for f in features}
     return SheetPart(
         thickness=t,
         thickness_confidence=conf,

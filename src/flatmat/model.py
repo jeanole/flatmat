@@ -202,7 +202,7 @@ class FaceInfo:
     id: int
     kind: Literal["plane", "cylinder", "other"]
     area: float
-    role: Literal["skin_a", "skin_b", "thickness"]
+    role: Literal["skin_a", "skin_b", "thickness", "formed"]
 
 
 @dataclass(frozen=True)
@@ -245,14 +245,23 @@ class Flange:
 
 @dataclass(frozen=True)
 class Feature:
-    """A hole feature the flat pattern cannot show: countersink or counterbore.
+    """A feature the flat outline cannot show: countersink, counterbore, emboss or extruded hole.
 
-    The flat pattern cuts the through diameter; the feature is reported here (and in
-    the bend table / DXF annotations) for the process that makes it.
+    The flat pattern cuts ``through_diameter`` (the through hole, or the pre-hole of an
+    extruded hole; nothing for an emboss); the feature is reported here (and in the
+    bend table / DXF annotations) for the process that makes it.
+
+    - countersink / counterbore: ``outer_diameter`` is the large rim.
+    - extruded_hole (Durchzug): ``outer_diameter`` is the finished bore, ``height`` the
+      outside height from the far side of the sheet to the rim, ``radius`` the inner
+      radius of the fillet; ``side`` is the side the collar stands out on.
+    - emboss (Prägung: dimple, bead, raised pad): ``height`` is the displacement,
+      ``outer_diameter`` the rim diameter if the rim is a circle (else 0), ``side`` the
+      side it stands out on; ``outline`` is its rim in the flat (a marking, not a cut).
     """
 
     id: int
-    kind: Literal["countersink", "counterbore"]
+    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole"]
     through_diameter: float
     outer_diameter: float
     side: Literal["top", "bottom"]  # top = the reference skin, facing the viewer of the flat
@@ -260,6 +269,9 @@ class Feature:
     depth: float | None = None  # counterbore depth
     face_ids: tuple[int, ...] = ()
     center: tuple[float, float] | None = None  # in the flat pattern, set by unfold()
+    height: float | None = None  # emboss, extruded hole
+    radius: float | None = None  # extruded hole: fillet inner radius
+    outline: Loop2D | None = None  # in the flat pattern, set by unfold(): rim of the formed region
 
 
 @dataclass(frozen=True)

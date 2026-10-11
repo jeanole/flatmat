@@ -12,6 +12,7 @@ from .diagnostics import FlatmatError
 from .export import write_bend_table, write_dxf, write_svg
 from .io import load_step
 from .recognize import recognize
+from .tooling import DIES, PUNCHES, Tooling
 from .unfold import unfold
 
 
@@ -37,14 +38,36 @@ def _parser() -> argparse.ArgumentParser:
     u.add_argument("--die-v", type=float, help="die opening V in mm for --check (default: Amada rule)")
     u.add_argument("--rolling-direction", type=float, help="rolling direction in the flat, degrees from +X")
     u.add_argument("--max-force", type=float, help="press brake capacity in kN for --check")
+    u.add_argument("--tooling", help="punch and die as JSON (see flatmat.tooling) for --check")
+    u.add_argument("--punch", help="built-in punch for --check: " + ", ".join(PUNCHES))
+    u.add_argument("--die", help="built-in die for --check: " + ", ".join(DIES) + " or V<opening>")
+    u.add_argument(
+        "--sequence",
+        nargs="?",
+        const="search",
+        metavar="ORDER",
+        help="with --check: find a collision-free bend order, or check ORDER (bend ids, e.g. 3,1,2)",
+    )
+    u.add_argument("--pre-hole", type=float, help="pre-hole diameter for extruded holes (default: neutral fibre)")
     return p
+
+
+def _tooling(a, t: float):
+    if a.tooling:
+        return Tooling.load(a.tooling)
+    if a.punch or a.die:
+        default = Tooling.default(t)
+        punch = a.punch or default.punch.name
+        die = a.die or default.die.name
+        return Tooling.named(punch, die)
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
     try:
         sheet = recognize(load_step(a.step, heal=a.heal), solid=a.solid, thickness=a.thickness)
-        pat = unfold(sheet, k=KDin6935() if a.din else a.k_factor, sharp_radius=a.sharp_radius)
+        pat = unfold(sheet, k=KDin6935() if a.din else a.k_factor, sharp_radius=a.sharp_radius, pre_hole=a.pre_hole)
     except FlatmatError as e:
         print(json.dumps(e.diagnostic.to_dict()), file=sys.stderr)
         return 2
@@ -55,19 +78,46 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  bend {b.id}: {b.direction:4} {b.angle_deg:7.2f}°  r_in {b.r_in:g}  K {b.k:.4f}  BA {b.ba:.4f}"
               f"  segments {len(b.segments)}")  # fmt: skip
     for f in pat.features:
-        print(f"  {f.kind} {f.side}: through Ø{f.through_diameter:g}, outer Ø{f.outer_diameter:g}")
+        if f.kind == "emboss":
+            print(f"  emboss {f.side}: height {f.height:g}")
+        elif f.kind == "extruded_hole":
+            print(f"  extruded hole {f.side}: bore Ø{f.outer_diameter:g}, height {f.height:g}, "
+                  f"pre-hole Ø{f.through_diameter:.3f}")  # fmt: skip
+        else:
+            print(f"  {f.kind} {f.side}: through Ø{f.through_diameter:g}, outer Ø{f.outer_diameter:g}")
     for d in pat.diagnostics:
         print(f"  {d.severity.value}: {d.code.value}: {d.message}", file=sys.stderr)
     report = None
     if a.check:
         from .dfm import check
 
-        report = check(pat, material=a.material, die_v=a.die_v, rolling_direction_deg=a.rolling_direction,
-                       machine_max_force_kn=a.max_force)  # fmt: skip
-        print(f"  check ({report.material.name}, V={report.die_v:g}): "
+        try:
+            tooling = _tooling(a, pat.thickness)
+        except (KeyError, ValueError, OSError) as e:
+            print(f"flatmat: bad tooling: {e}", file=sys.stderr)
+            return 2
+        seq: bool | list[int] = False
+        if a.sequence == "search":
+            seq = True
+        elif a.sequence:
+            seq = [int(x) for x in a.sequence.split(",")]
+        report = check(pat, material=a.material, die_v=a.die_v, tooling=tooling, sequence=seq,
+                       rolling_direction_deg=a.rolling_direction, machine_max_force_kn=a.max_force)  # fmt: skip
+        tools = f", {tooling.punch.name} / {tooling.die.name}" if tooling else ""
+        print(f"  check ({report.material.name}, V={report.die_v:g}{tools}): "
               f"{len(report.problems)} problems, {len(report.findings) - len(report.problems)} notes")  # fmt: skip
         for d in report.findings:
             print(f"    {d.severity.value:7} {d.code.value}: {d.message}")
+        plan = report.sequence
+        if plan is not None:
+            if plan.feasible:
+                steps = ", ".join(f"{s.bend_id}" + (" (flip)" if s.flip else "") + (" (turned)" if s.turned else "")
+                                  for s in plan.steps)  # fmt: skip
+                print(f"  bend order: {steps}")
+            else:
+                print("  bend order: none found" + (f"; longest tail {plan.order}" if plan.order else ""))
+            if plan.unchecked:
+                print(f"  not simulated: bends {', '.join(map(str, plan.unchecked))} (hems, or not separable)")
     if a.dxf:
         write_dxf(pat, a.dxf, labels=None if a.labels == "none" else a.labels, dfm=report)
     if a.table:

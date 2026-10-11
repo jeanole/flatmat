@@ -72,7 +72,9 @@ def _vertex_uv(v, e, f) -> tuple[float, float]:
     return p.X(), p.Y()
 
 
-def unfold(sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap: bool = True) -> FlatPattern:
+def unfold(
+    sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap: bool = True, pre_hole=None
+) -> FlatPattern:
     """Develop the recognised sheet into a flat pattern with bend lines.
 
     ``k`` is a K-factor (float), a :class:`~flatmat.bendmodel.KTable`,
@@ -80,6 +82,10 @@ def unfold(sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap
 
     ``sharp_radius`` is the inner radius the shop actually gets where the model has a
     sharp bend (r = 0), e.g. from the die: air bending gives ~16 % of V on mild steel.
+
+    ``pre_hole`` sets the pre-hole of extruded holes: a diameter, or a callable
+    ``(Feature) -> diameter`` (e.g. a lookup in the tool maker's table). By default it
+    comes from the neutral fibre (:func:`~flatmat.bendmodel.extruded_hole_prehole`).
     """
     ctx: Context = sheet._ctx  # type: ignore[assignment]
     if ctx is None:
@@ -130,7 +136,17 @@ def unfold(sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap
 
     place, sharp_geo = _place(ctx, devs, shifts)
     sharp_v = {v: shifts[ei] for ei, se in ctx.sharp_edges.items() for v in se.vertices}
-    outer, holes, feature_centers = _outline(ctx, devs, place, sharp_v, diags)
+    sheet_features = list(sheet.features)
+    if pre_hole is not None:
+        diags = [d for d in diags if d.code != Code.PRE_HOLE]  # the recognised pre-hole is replaced
+        sheet_features = [
+            _with(f, through_diameter=float(pre_hole(f) if callable(pre_hole) else pre_hole))
+            if f.kind == "extruded_hole"
+            else f
+            for f in sheet_features
+        ]
+    pre_r = {f.id: f.through_diameter / 2 for f in sheet_features if f.kind == "extruded_hole"}
+    outer, holes, feature_centers, outlines = _outline(ctx, devs, place, sharp_v, diags, pre_r)
 
     # self-checks
     area = outer.area() - sum(-h.area() for h in holes)
@@ -183,8 +199,12 @@ def unfold(sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap
     holes = [_move_loop(h, shift) for h in holes]
     lines = [_with(bl, p0=_apply(shift, bl.p0), p1=_apply(shift, bl.p1)) for bl in lines]
     features = tuple(
-        _with(f, center=_apply(shift, feature_centers[f.id][0]) if f.id in feature_centers else None)
-        for f in sheet.features
+        _with(
+            f,
+            center=_apply(shift, feature_centers[f.id][0]) if f.id in feature_centers else None,
+            outline=_move_loop(outlines[f.id], shift) if f.id in outlines else None,
+        )
+        for f in sheet_features
     )
 
     return FlatPattern(
@@ -196,7 +216,14 @@ def unfold(sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap
         k_model=kmodel.describe(),
         area=area,
         diagnostics=tuple(diags),
-        meta={"source": sheet.source, "ocp": OCP_VERSION, "area_rel_err": rel, "sharp_radius": sharp_radius},
+        meta={
+            "source": sheet.source,
+            "ocp": OCP_VERSION,
+            "area_rel_err": rel,
+            "sharp_radius": sharp_radius,
+            "root_face": ctx.root,
+            "root_offset": (dx, dy),  # flat = root face (u, v) developed + this
+        },
         features=features,
     )
 
@@ -339,7 +366,7 @@ def _circle_ccw(m, c2, a, b, cen) -> bool:
     return cross > 0
 
 
-def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list):
+def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, pre_r: dict[int, float]):
     faces = ctx.faces
     feature_of_face = {i: fid for fid, fs in ctx.features.items() for i in fs}
     feature_of_edge: dict[int, int] = {}
@@ -365,14 +392,33 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list):
     loops = [_merge_collinear(_close(segs, jv, sharp_v, ctx.tol.flat)) for segs, jv in _chain(pieces)]
 
     # hole features: report the centre; where the large rim is on the reference skin,
-    # cut the through hole instead (the countersink / counterbore is made afterwards)
+    # cut the through hole instead (the countersink / counterbore is made afterwards).
+    # Formed features: an emboss's rim is a marking, not a cut (the area inside it is
+    # material); an extruded hole cuts its pre-hole.
     centers: dict[int, tuple[Point, float]] = {}
+    outlines: dict[int, Loop2D] = {}
     out = []
     for L in loops:
         fids = {feature_of_edge.get(s.source_edge) for s in L.segments}
         fid = next(iter(fids)) if len(fids) == 1 else None
         if fid is None:
             out.append(L)
+            continue
+        kind = ctx.feature_kind.get(fid)
+        if kind == "emboss":
+            rim = L if L.area() > 0 else _reverse_loop(L)
+            outlines[fid] = rim
+            centers[fid] = (_centroid(rim), rim.area())
+            continue
+        if kind == "extruded_hole":
+            seg = L.segments[0]
+            if len(L.segments) != 1 or not isinstance(seg, Arc) or not seg.is_circle:
+                raise refuse(Code.FORMED_FEATURE, "the rim of an extruded hole is not a circle in the flat")
+            outlines[fid] = Loop2D((Arc(seg.center, seg.radius, 0.0, 2 * math.pi, True, seg.source_edge),))
+            r = pre_r.get(fid, 0.0)
+            centers[fid] = (seg.center, math.pi * (seg.radius**2 - r**2))
+            if r > 0:
+                out.append(Loop2D((Arc(seg.center, r, 0.0, -2 * math.pi, False, seg.source_edge),)))
             continue
         if len(L.segments) != 1 or not isinstance(L.segments[0], Arc) or not L.segments[0].is_circle:
             diags.append(warn(Code.FEATURE_NOT_CIRCULAR, "a hole feature is not a circle in the flat; kept as is"))
@@ -392,7 +438,18 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list):
     if outer.area() < 0:
         outer = _reverse_loop(outer)
     holes = [_reverse_loop(h) if h.area() > 0 else h for h in holes]
-    return outer, holes, centers
+    return outer, holes, centers, outlines
+
+
+def _centroid(L: Loop2D) -> Point:
+    pts = L.polyline(0.001)
+    a = cx = cy = 0.0
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1], strict=True):
+        c = x0 * y1 - x1 * y0
+        a += c
+        cx += (x0 + x1) * c
+        cy += (y0 + y1) * c
+    return (cx / (3 * a), cy / (3 * a))
 
 
 def _chain(pieces) -> list[tuple[list, list[int]]]:

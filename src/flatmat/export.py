@@ -25,6 +25,7 @@ class LayerMap:
     bend_up: str = "BEND_UP"
     bend_down: str = "BEND_DOWN"
     text: str = "TEXT"
+    form: str = "FORM"  # rims of embosses and extruded holes: markings, not cuts
 
     @classmethod
     def default(cls) -> LayerMap:
@@ -70,6 +71,7 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
         (layers.bend_up, 1),
         (layers.bend_down, 5),
         (layers.text, 2),
+        (layers.form, 4),
     ):
         if name not in doc.layers:
             doc.layers.add(name, color=color)
@@ -77,6 +79,9 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
     _add_loop(msp, pattern.outer, layers.outer)
     for h in pattern.holes:
         _add_loop(msp, h, layers.inner)
+    for f in pattern.features:
+        if f.outline is not None:
+            _add_loop(msp, f.outline, layers.form)
     w, h = pattern.size
     th = text_height or max(1.0, min(5.0, 0.02 * max(w, h)))
     for bl in pattern.bend_lines:
@@ -94,19 +99,15 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
             if ang > 90 or ang <= -90:
                 ang -= 180 if ang > 0 else -180
             msp.add_text(
-                _label(b, labels), dxfattribs={"layer": layers.text, "height": th, "rotation": ang}
+                _step_prefix(dfm, b.id) + _label(b, labels),
+                dxfattribs={"layer": layers.text, "height": th, "rotation": ang},
             ).set_placement(mid)
         for f in pattern.features:
             if f.center is None:
                 continue
-            if f.kind == "countersink":
-                txt = f"CSK {f.angle_deg:.0f}° Ø{f.outer_diameter:g} {f.side.upper()}"
-            else:
-                depth = f" T{f.depth:g}" if f.depth else ""
-                txt = f"CBORE Ø{f.outer_diameter:g}{depth} {f.side.upper()}"
             x, y = f.center
-            msp.add_text(txt, dxfattribs={"layer": layers.text, "height": th * 0.6}).set_placement(
-                (x + f.through_diameter / 2 + th * 0.3, y)
+            msp.add_text(_feature_label(f), dxfattribs={"layer": layers.text, "height": th * 0.6}).set_placement(
+                (x + max(f.through_diameter, f.outer_diameter) / 2 + th * 0.3, y)
             )
     if dfm is not None and dfm.findings:
         # a marker per finding on its own layer, so the shop can switch it off
@@ -121,6 +122,31 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
                 d.code.value.removeprefix("DFM_"), dxfattribs={"layer": "DFM", "height": th * 0.6}
             ).set_placement((at[0] + th * 1.8, at[1]))
     doc.saveas(os.fspath(path))
+
+
+def _steps(dfm) -> dict[int, int]:
+    """Bend id -> its step in the report's bend order, if the order is feasible."""
+    plan = getattr(dfm, "sequence", None)
+    if plan is None or not plan.feasible:
+        return {}
+    return {b: i + 1 for i, b in enumerate(plan.order)}
+
+
+def _step_prefix(dfm, bend_id: int) -> str:
+    n = _steps(dfm).get(bend_id)
+    return f"({n}) " if n is not None else ""
+
+
+def _feature_label(f) -> str:
+    side = f.side.upper()
+    if f.kind == "countersink":
+        return f"CSK {f.angle_deg:.0f}° Ø{f.outer_diameter:g} {side}"
+    if f.kind == "counterbore":
+        depth = f" T{f.depth:g}" if f.depth else ""
+        return f"CBORE Ø{f.outer_diameter:g}{depth} {side}"
+    if f.kind == "extruded_hole":
+        return f"EXTR Ø{f.outer_diameter:.4g} H{f.height:.4g} {side} (PRE Ø{f.through_diameter:.3f})"
+    return f"EMBOSS H{f.height:.4g} {side}"
 
 
 def _add_loop(msp, loop: Loop2D, layer: str) -> None:
@@ -181,6 +207,9 @@ def bend_table(pattern: FlatPattern) -> dict:
             "outer_diameter": f.outer_diameter,
             "angle_deg": f.angle_deg,
             "depth": f.depth,
+            "height": f.height,
+            "radius": f.radius,
+            "rim": [list(p) for p in f.outline.polyline(0.01)] if f.outline is not None else None,
         }
         for f in pattern.features
     ]
@@ -201,14 +230,19 @@ def bend_table(pattern: FlatPattern) -> dict:
 def write_bend_table(pattern: FlatPattern, path: str | os.PathLike, *, dfm=None) -> None:
     """JSON (``.json``) or CSV (``.csv``, one row per bend line segment).
 
-    With a :class:`~flatmat.dfm.DfmReport` the JSON gets a ``dfm`` section.
+    With a :class:`~flatmat.dfm.DfmReport` the JSON gets a ``dfm`` section, and if the
+    report has a feasible bend order, every bend its ``step`` (CSV: a ``step`` column).
     """
     path = os.fspath(path)
     table = bend_table(pattern)
+    steps = _steps(dfm)
     if dfm is not None:
         table["dfm"] = dfm.to_dict()
+        for b in table["bends"]:
+            b["step"] = steps.get(b["id"])
     if path.lower().endswith(".csv"):
         cols = ["bend", "segment", "direction", "angle_deg", "r_in", "k", "ba", "bd", "x0", "y0", "x1", "y1", "length"]
+        cols += ["step"] if steps else []
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(cols)
@@ -230,7 +264,8 @@ def write_bend_table(pattern: FlatPattern, path: str | os.PathLike, *, dfm=None)
                             x1,
                             y1,
                             s["length"],
-                        ]  # fmt: skip
+                        ]
+                        + ([steps.get(b["id"])] if steps else [])  # fmt: skip
                     )
     else:
         with open(path, "w") as fh:
@@ -257,6 +292,9 @@ def write_svg(pattern: FlatPattern, path: str | os.PathLike, *, margin: float = 
     ]
     for hole in pattern.holes:
         out.append(f'<polygon points="{pts(hole)}" fill="white" stroke="#2a7" stroke-width="{sw:.4f}"/>')
+    for f in pattern.features:
+        if f.outline is not None:
+            out.append(f'<polygon points="{pts(f.outline)}" fill="none" stroke="#a6a" stroke-width="{sw:.4f}"/>')
     for bl in pattern.bend_lines:
         col = "#d22" if bl.direction == "up" else "#22d"
         (x0, y0), (x1, y1) = bl.p0, bl.p1

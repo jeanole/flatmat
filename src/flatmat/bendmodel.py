@@ -34,6 +34,23 @@ def bend_deduction(angle_rad: float, r_in: float, t: float, k: float) -> float |
     return None if ossb is None else 2 * ossb - bend_allowance(angle_rad, r_in, t, k)
 
 
+def extruded_hole_prehole(rho: float, r_in: float, sweep: float, straight: float, t: float, k: float = 0.5) -> float:
+    """Pre-hole diameter of an extruded hole (collar), by the length of the neutral fibre.
+
+    In a cross-section through the axis, the sheet runs from the rim of the formed
+    region (radius ``rho`` in the flat face) through a fillet (inner radius ``r_in``,
+    angle ``sweep``) and a straight wall of length ``straight`` to the collar's end.
+    Laid flat, that neutral length ends at the pre-hole:
+    ``d = 2·(rho - sweep·(r_in + k·t) - straight)``.
+
+    For a 90° fillet and ``k = 0.5`` this is the published rule
+    ``d = D - 2·(H - 0.43·r - 0.72·t)`` (D the collar's mean diameter, H its outside
+    height). The collar's rim stretches round the circumference and thins, which this
+    ignores; check the result against the tool maker's table.
+    """
+    return 2.0 * (rho - abs(sweep) * (r_in + k * t) - straight)
+
+
 # ------------------------------------------------------------------------------- DIN 6935
 
 

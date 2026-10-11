@@ -15,6 +15,13 @@ same formula with r = 0 (inner legs plus the neutral fibre through the corner).
 ``features`` adds countersinks and counterbores to flats:
 ("csk", flat, frac, z, d_through, d_top, side) with a 90° cone, or
 ("cbore", flat, frac, z, d_through, d_bore, side, depth); side +1 = left skin.
+
+``formed`` adds formed features to flats, made by revolving their cross-section:
+("emboss", flat, frac, z, rim_radius, height, fillet_in, fillet_top, side): a round
+pad raised by ``height`` with a vertical wall; ("collar", flat, frac, z, rim_radius,
+height, fillet, side): an extruded hole whose outside height (from the far skin) is
+``height``. ``side`` +1 = it stands out on the left skin's side; ``fillet`` radii are
+inner radii.
 """
 
 from __future__ import annotations
@@ -22,12 +29,24 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
-from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCone, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_MakeEdge,
+    BRepBuilderAPI_MakeFace,
+    BRepBuilderAPI_MakeWire,
+    BRepBuilderAPI_Transform,
+)
+from OCP.BRepPrimAPI import (
+    BRepPrimAPI_MakeBox,
+    BRepPrimAPI_MakeCone,
+    BRepPrimAPI_MakeCylinder,
+    BRepPrimAPI_MakePrism,
+    BRepPrimAPI_MakeRevol,
+)
 from OCP.GC import GC_MakeArcOfCircle, GC_MakeSegment
-from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt, gp_Vec
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
 from OCP.IFSelect import IFSelect_RetDone
+from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
 
 from flatmat._occ import ShapeList as TopTools_ListOfShape
@@ -45,6 +64,8 @@ class Part:
     sharp_outer: tuple[int, ...] = ()
     features: list[tuple] = field(default_factory=list)
     cuts: list[tuple] = field(default_factory=list)  # boxes ((x0, y0, z0), (x1, y1, z1)) in profile coords
+    formed: list[tuple] = field(default_factory=list)
+    adds: list[tuple] = field(default_factory=list)  # boxes fused on after the cuts
 
     def flat_length(self, k: float) -> float:
         return sum(self.flats) + sum(math.radians(abs(a)) * (r + k * self.t) for a, r in self.bends)
@@ -175,7 +196,83 @@ def make_solid(part: Part):
         cut.SetTools(tools)
         cut.Build()
         solid = cut.Shape()
+    for lo, hi in part.adds:
+        solid = BRepAlgoAPI_Fuse(solid, BRepPrimAPI_MakeBox(gp_Pnt(*lo), gp_Pnt(*hi)).Shape()).Shape()
+    for kind, idx, frac, z, rim, height, *rest in part.formed:
+        side = rest[-1]
+        p0, h, length = anchors[("flat", idx)]
+        c = (p0[0] + frac * length * math.cos(h), p0[1] + frac * length * math.sin(h))
+        n = (-math.sin(h), math.cos(h))
+        prof = _emboss_profile(part.t, rim, height, rest[0], rest[1]) if kind == "emboss" else (
+            _collar_profile(part.t, rim, height, rest[0]))  # fmt: skip
+        face = BRepBuilderAPI_MakeFace(_profile_wire(prof)).Face()
+        rev = BRepPrimAPI_MakeRevol(face, gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 2 * math.pi).Shape()
+        # local z = 0 is the far skin, local +z the side the feature stands out on
+        org = gp_Pnt(c[0] - side * n[0] * part.t / 2, c[1] - side * n[1] * part.t / 2, z)
+        tr = gp_Trsf()
+        tr.SetTransformation(gp_Ax3(org, gp_Dir(side * n[0], side * n[1], 0), gp_Dir(math.cos(h), math.sin(h), 0)),
+                             gp_Ax3())  # fmt: skip
+        rev = BRepBuilderAPI_Transform(rev, tr, True).Shape()
+        base = gp_Pnt(c[0] - n[0] * 5 * part.t, c[1] - n[1] * 5 * part.t, z)
+        hole = BRepPrimAPI_MakeCylinder(gp_Ax2(base, gp_Dir(n[0], n[1], 0)), rim, 10 * part.t).Shape()
+        solid = BRepAlgoAPI_Fuse(BRepAlgoAPI_Cut(solid, hole).Shape(), rev).Shape()
+    if part.formed or part.adds:
+        u = ShapeUpgrade_UnifySameDomain(solid, True, True, False)
+        u.Build()
+        solid = u.Shape()
     return solid
+
+
+def _arc3(c, r, a0, a1):
+    def at(a):
+        return (c[0] + r * math.cos(a), c[1] + r * math.sin(a))
+
+    return (at(a0), at((a0 + a1) / 2), at(a1))
+
+
+def _emboss_profile(t, rim, height, a1, a2):
+    """(radius, z) cross-section of a raised round pad; far skin at z = 0, near skin at z = t."""
+    pi = math.pi
+    c1, ra = (rim, t + a1), rim - a1
+    zw = height - a2
+    c2 = (ra - t - a2, zw)
+    return [
+        _arc3(c1, a1, -pi / 2, -pi),
+        ((ra, t + a1), (ra, zw)),
+        _arc3(c2, a2 + t, 0, pi / 2),
+        ((c2[0], t + height), (0, t + height)),
+        ((0, t + height), (0, height)),
+        ((0, height), (c2[0], height)),
+        _arc3(c2, a2, pi / 2, 0),
+        ((ra - t, zw), (ra - t, t + a1)),
+        _arc3(c1, a1 + t, -pi, -pi / 2),
+        ((rim, 0), (rim, t)),
+    ]
+
+
+def _collar_profile(t, rim, height, a1):
+    pi = math.pi
+    c1 = (rim, t + a1)
+    ra, rb = rim - a1, rim - a1 - t
+    return [
+        _arc3(c1, a1, -pi / 2, -pi),
+        ((ra, t + a1), (ra, height)),
+        ((ra, height), (rb, height)),
+        ((rb, height), (rb, t + a1)),
+        _arc3(c1, a1 + t, -pi, -pi / 2),
+        ((rim, 0), (rim, t)),
+    ]
+
+
+def _profile_wire(segs):
+    w = BRepBuilderAPI_MakeWire()
+    for sg in segs:
+        pts = [gp_Pnt(r, 0, zz) for r, zz in sg]
+        if len(pts) == 2:
+            w.Add(BRepBuilderAPI_MakeEdge(GC_MakeSegment(*pts).Value()).Edge())
+        else:
+            w.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(*pts).Value()).Edge())
+    return w.Wire()
 
 
 def _edge(kind, pts):
@@ -220,6 +317,21 @@ def feature_cases() -> list[Part]:
             flats=[60, 40],
             bends=[(90, 2.0)],
             features=[("cbore", 0, 0.4, 20.0, 5.0, 9.0, +1, 2.0), ("cbore", 1, 0.5, 60.0, 5.0, 9.0, -1, 2.0)],
+        ),
+    ]
+
+
+def formed_cases() -> list[Part]:
+    """t = 2, an L with r = 2; the base is the left skin's flat 0 (50 long), 100 wide."""
+    L = dict(t=2.0, width=100, flats=[50, 40], bends=[(90, 2.0)])
+    return [
+        Part("emboss_up", formed=[("emboss", 0, 0.5, 50.0, 10.0, 5.0, 1.0, 1.0, +1)], **L),
+        Part("emboss_down", formed=[("emboss", 0, 0.5, 50.0, 10.0, 5.0, 1.0, 1.0, -1)], **L),
+        Part("collar_up", formed=[("collar", 0, 0.5, 50.0, 6.0, 4.5, 1.0, +1)], **L),
+        Part(
+            "collar_down_two",
+            formed=[("collar", 0, 0.4, 30.0, 8.0, 8.0, 1.0, -1), ("collar", 1, 0.5, 70.0, 7.0, 6.0, 1.5, +1)],
+            **L,
         ),
     ]
 
@@ -281,3 +393,45 @@ def cases() -> list[Part]:
             "L_hole_in_bend", t=2.0, width=100, flats=[50, 40], bends=[(90, 5.0)], holes=[("bend", 0, 0.5, 50.0, 6.0)]
         ),
     ]
+
+
+def box_solid(length: float, width: float, height: float, t: float, r: float, gap: float, corner_gap=None,
+              relief=None):  # fmt: skip
+    """An open box: a base length x width, four walls of height ``height`` bent up with radius r.
+
+    Two U profiles share the base. The long walls run the full width; the short walls
+    stop ``gap`` short of the long walls' bend tangent lines, which leaves a corner
+    relief. With ``corner_gap`` the short walls get tabs that reach to within that
+    distance of the long walls' inner faces (a closed corner).
+    The base's mid-plane is x = height + r + t/2; the walls stand towards -x.
+    """
+    rc = r + t / 2
+    u1 = make_solid(Part("box_u1", t=t, width=width, flats=[height, length, height], bends=[(90, r), (90, r)]))
+    u2 = make_solid(
+        Part("box_u2", t=t, width=length - 2 * gap, flats=[height, width, height], bends=[(90, r), (90, r)])
+    )
+    tr = gp_Trsf()
+    # local x -> x, local y (along the base) -> z, local z (extrusion) -> -y; a rotation
+    tr.SetValues(1, 0, 0, 0, 0, 0, -1, rc + length - gap, 0, 1, 0, -rc)
+    u2 = BRepBuilderAPI_Transform(u2, tr, True).Shape()
+    solid = BRepAlgoAPI_Fuse(u1, u2).Shape()
+    if corner_gap is not None:
+        tabs = []
+        for yc in (0.0, length + 2 * rc):  # the long walls cover the short walls' ends
+            tabs.append(((0, yc - t / 2, -rc - t / 2), (height, yc + t / 2, 0)))
+            tabs.append(((0, yc - t / 2, width), (height, yc + t / 2, width + rc + t / 2)))
+        for zc in (-rc, width + rc):  # the short walls reach to within corner_gap of them
+            for y0, y1 in ((t / 2 + corner_gap, rc + gap), (rc + length - gap, length + 2 * rc - t / 2 - corner_gap)):
+                tabs.append(((0, y0, zc - t / 2), (height, y1, zc + t / 2)))
+        for lo, hi in tabs:
+            solid = BRepAlgoAPI_Fuse(solid, BRepPrimAPI_MakeBox(gp_Pnt(*lo), gp_Pnt(*hi)).Shape()).Shape()
+    if relief:
+        x = height + rc
+        for y0, y1 in ((rc, rc + gap + relief), (rc + length - gap - relief, rc + length)):
+            for z0, z1 in ((0, relief), (width - relief, width)):
+                solid = BRepAlgoAPI_Cut(
+                    solid, BRepPrimAPI_MakeBox(gp_Pnt(x - t, y0, z0), gp_Pnt(x + t, y1, z1)).Shape()
+                ).Shape()
+    u = ShapeUpgrade_UnifySameDomain(solid, True, True, False)
+    u.Build()
+    return u.Shape()

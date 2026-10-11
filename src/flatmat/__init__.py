@@ -14,9 +14,12 @@ from .bendmodel import KDin6935, KScalar, KTable, bend_allowance, bend_deduction
 from .dfm import MATERIALS, DfmReport, DfmRules, Material, check
 from .diagnostics import Code, Diagnostic, FlatmatError, Severity
 from .export import LayerMap, bend_table, write_bend_table, write_dxf, write_svg
+from .fold import FoldModel
 from .io import StepModel, load_step
 from .model import Arc, Bend, BendLine, Feature, FlatPattern, Line, Loop2D, SheetPart, Spline, Tolerances
 from .recognize import recognize
+from .sequence import BendPlan, BendStep, Collision, plan_bends
+from .tooling import DIES, PUNCHES, Die, Punch, Tooling
 from .unfold import unfold
 
 
@@ -31,26 +34,35 @@ __all__ = [
     "Arc",
     "Bend",
     "BendLine",
+    "BendPlan",
+    "BendStep",
+    "Collision",
     "Code",
+    "DIES",
     "DfmReport",
     "DfmRules",
     "MATERIALS",
     "Material",
     "Diagnostic",
+    "Die",
     "Feature",
     "FlatPattern",
     "FlatmatError",
+    "FoldModel",
     "KDin6935",
     "KScalar",
     "KTable",
     "LayerMap",
     "Line",
     "Loop2D",
+    "PUNCHES",
+    "Punch",
     "Severity",
     "SheetPart",
     "Spline",
     "StepModel",
     "Tolerances",
+    "Tooling",
     "bend_allowance",
     "bend_deduction",
     "bend_table",
@@ -58,6 +70,7 @@ __all__ = [
     "din6935_k",
     "din6935_v",
     "load_step",
+    "plan_bends",
     "recognize",
     "unfold",
     "unfold_step",
