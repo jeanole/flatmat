@@ -127,6 +127,29 @@ planes, 38 cylinders), 2 mm thick, 15 holes.
 - The regression set (11 generated parts, 6 BenDFM samples) still passes on
   both versions.
 
+### Three more SolidWorks 2026 exports, user-provided
+
+These files are not committed either. No code changes were needed. OCP 7.8
+and 8.0 give identical results.
+
+| Part | Faces | t | Bends | Holes | Flat at K = 0.44 | Area identity | Read + unfold (8.0) |
+|---|---|---|---|---|---|---|---|
+| bracket ("winkel") | 34 | 1.5 | 1 × 90° r 1 | 8 | 56.000 × 21.608 | 1.1e-5 | 66 + 71 ms |
+| box sheet 01 | 154 | 2.0 | 6 × 90° r 1 (Z edges on both sides, end tabs; the two end-tab bends are interrupted by cut-outs into 3 segments each) | 22 | 419.812 × 1067.926 | 2.1e-7 | 100 + 169 ms |
+| box sheet 02 (wide) | 154 | 2.0 | the same | 22 | 520.812 × 1067.926 | 1.7e-7 | 78 + 177 ms |
+
+- **B-spline faces in SolidWorks exports:** the box sheets contain 4
+  `B_SPLINE_SURFACE_WITH_KNOTS` faces of 8.78 mm² each. Each is its own
+  component of the adjacency graph and touches both the inner and the outer
+  cylinder of a bend. So they are **thickness faces**: the side walls where a
+  relief cuts across the end of a bend zone. They are not formed features.
+  `GeomConvert_SurfToAnaSurf` cannot convert them (they are ruled
+  non-analytic walls), and nothing needs to: thickness faces are never
+  developed. The library still has to classify such faces explicitly instead
+  of ignoring them, so that a real formed feature on the other skin cannot
+  slip through (design §1.3: every thickness component must touch both
+  skins).
+
 ## Not covered by the spike
 
 - Exact `Line`/`Arc`/`Spline` output (the spike writes sampled polylines into
