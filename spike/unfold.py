@@ -19,7 +19,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
-from occ_compat import EdgeFaceMap, ShapeMap, as_edge, as_face, as_solid, as_vertex
+from occ_compat import EdgeFaceMap, ShapeMap, as_edge, as_face, as_solid, as_vertex, as_wire
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Curve2d, BRepAdaptor_Surface
 from OCP.BRepGProp import BRepGProp
@@ -30,8 +30,9 @@ from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec
 from OCP.GProp import GProp_GProps
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.IntTools import IntTools_FClass2d
+from OCP.ShapeFix import ShapeFix_Wire
 from OCP.STEPControl import STEPControl_Reader
-from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_REVERSED, TopAbs_SOLID, TopAbs_VERTEX
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_REVERSED, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_WIRE
 from OCP.TopExp import TopExp, TopExp_Explorer
 
 SMOOTH_DEG = 0.1  # design §6.2: smooth < 0.1°, sharp > 1°
@@ -132,6 +133,43 @@ def _apply_fast(reader):
     reader.SetShapeFixParameters(params)
 
 
+def _add_missing_pcurves(solid) -> int:
+    """Add pcurves that the file lacks, in place. Returns how many wires were fixed.
+
+    SolidWorks writes no pcurves for cylindrical faces at all (all 152 edge uses on a
+    real 2023 export). The reader's healing would add them, but switching off
+    FixShellMode also skips every face and wire fix below the shell, so the fast
+    path must do it itself. ShapeFix_Wire.FixEdgeCurves updates the edges in place
+    (4 ms for that part). Without this, BRepAdaptor_Curve2d raises on 7.8 and
+    segfaults on 8.0.
+    """
+    fixed = 0
+    fe = TopExp_Explorer(solid, TopAbs_FACE)
+    while fe.More():
+        f = as_face(fe.Current())
+        we = TopExp_Explorer(f, TopAbs_WIRE)
+        while we.More():
+            w = as_wire(we.Current())
+            ee = TopExp_Explorer(w, TopAbs_EDGE)
+            lacking = False
+            while ee.More() and not lacking:
+                lacking = BRep_Tool.CurveOnSurface_s(as_edge(ee.Current()), f, 0.0, 0.0) is None
+                ee.Next()
+            if lacking:
+                ShapeFix_Wire(w, f, 1e-7).FixEdgeCurves()
+                fixed += 1
+            we.Next()
+        fe.Next()
+    return fixed
+
+
+def _pcurve(e, f):
+    """BRepAdaptor_Curve2d, but refuse instead of crashing when the pcurve is missing."""
+    if BRep_Tool.CurveOnSurface_s(e, f, 0.0, 0.0) is None:
+        raise Refused("MISSING_PCURVE")
+    return BRepAdaptor_Curve2d(e, f)
+
+
 def read_step(path: str, heal: str = "fast"):
     r = STEPControl_Reader()
     if r.ReadFile(path) != IFSelect_RetDone:
@@ -151,6 +189,7 @@ def read_step(path: str, heal: str = "fast"):
         raise Refused(f"MULTIPLE_SOLIDS: {len(solids)}")
     solid = solids[0]
     if heal == "fast":
+        _add_missing_pcurves(solid)
         # No BRepCheck_Analyzer here: on a face with 1000 holes it costs 1.3 s (OCP 8.0)
         # and 13 s (7.8) even topology-only. Our own self-checks (area identity, closed
         # outline, cycle consistency) catch what matters; BRepCheck is for diagnostics.
@@ -219,7 +258,7 @@ def classify_edge(e, f1: Face, f2: Face) -> bool:
     tm = 0.5 * (c.FirstParameter() + c.LastParameter())
     normals = []
     for f in (f1, f2):
-        c2 = BRepAdaptor_Curve2d(e, f.shape)
+        c2 = _pcurve(e, f.shape)
         uv = c2.Value(tm)
         n, _ = _props(f.shape, f.ad, uv.X(), uv.Y())
         normals.append(n)
@@ -370,12 +409,12 @@ def edge_vertices(e):
 
 def vertex_uv(v, e, f):
     t = BRep_Tool.Parameter_s(v, e, f)
-    p = BRepAdaptor_Curve2d(e, f).Value(t)
+    p = _pcurve(e, f).Value(t)
     return p.X(), p.Y()
 
 
 def sample_edge(e, f, n):
-    c2 = BRepAdaptor_Curve2d(e, f)
+    c2 = _pcurve(e, f)
     a, b = c2.FirstParameter(), c2.LastParameter()
     return [(lambda p: (p.X(), p.Y()))(c2.Value(a + (b - a) * i / n)) for i in range(n + 1)], c2
 

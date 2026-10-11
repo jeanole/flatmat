@@ -561,6 +561,15 @@ read ─▶ (heal: full | fast | off) ─▶ validate ─▶ canonicalize ─▶
    - `full`: the reader's default healing. On 7.8 that needs a process
      without the resource override, so the worker pool keeps one 7.8
      process per mode.
+   - **`FixShellMode = 0` also skips all face- and wire-level fixes**
+     (*spike*, on a real SolidWorks file). So `fast` must add missing
+     pcurves itself: `ShapeFix_Wire(w, f, tol).FixEdgeCurves()` on every
+     wire with an edge whose `BRep_Tool.CurveOnSurface` is null. It works
+     in place and took a few ms. SolidWorks 2023 writes **no pcurves for
+     cylindrical faces at all**.
+   - Before touching any pcurve, check it exists: `BRepAdaptor_Curve2d` on
+     a missing pcurve raises on 7.8 but **segfaults on 8.0**, which would
+     take down the worker process.
    - Fallback: if any later stage fails on a `fast` import (outline not
      closed, area identity broken), re-import with `full` once.
 3. **Validate**:
@@ -755,7 +764,8 @@ involved, so a UI can draw it.
 - Is OCCT 8.0's STEP reader thread-safe? (Irrelevant while we use one
   process per part.)
 - Hem allowance and extruded-hole pre-hole tables: no open data found.
-- Real STEP exports from SolidWorks, Inventor, Fusion and Onshape have not
-  been tried yet. That is the next corpus to collect.
+- Real STEP exports: one SolidWorks 2023 part tried (missing cylinder
+  pcurves, now handled). Inventor, Fusion, Onshape, Creo and Solid Edge are
+  still to collect.
 - `ShapeUpgrade_UnifySameDomain` with `KeepShapes` and canonical recognition
   are untested.

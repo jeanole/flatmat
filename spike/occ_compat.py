@@ -36,5 +36,6 @@ as_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
 as_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
 as_vertex = getattr(TopoDS, "Vertex_s", None) or TopoDS.Vertex
 as_solid = getattr(TopoDS, "Solid_s", None) or TopoDS.Solid
+as_wire = getattr(TopoDS, "Wire_s", None) or TopoDS.Wire
 
-__all__ = ["EdgeFaceMap", "ShapeMap", "ShapeList", "as_face", "as_edge", "as_vertex", "as_solid"]
+__all__ = ["EdgeFaceMap", "ShapeMap", "ShapeList", "as_face", "as_edge", "as_vertex", "as_solid", "as_wire"]

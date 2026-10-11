@@ -101,6 +101,32 @@ General OCP pitfall: C++ `double&` out-parameters do not come back to Python
 (for example the `First`/`Last` of `BRep_Tool.CurveOnSurface`). Use
 `BRepAdaptor_Curve2d`, which exposes the parameter range.
 
+### First real CAD export: SolidWorks 2023 (AP214), user-provided
+
+The file is not committed. It is a U-shaped holder: one solid, 56 faces (18
+planes, 38 cylinders), 2 mm thick, 15 holes.
+
+- **SolidWorks writes no pcurves for cylindrical faces**: all 152 edge uses on
+  cylinders lacked them. Planes are fine, because OCCT computes their pcurves
+  on the fly.
+- The reader's full healing adds the missing pcurves, but the fast mode
+  above skipped them: **`FixShellMode = 0` also skips every face- and
+  wire-level fix below the shell.** So the fast path now calls
+  `ShapeFix_Wire.FixEdgeCurves()` itself on every wire that has an edge
+  without a pcurve. This runs in place and took 4 ms (8.0) / 6 ms (7.8).
+- Without that fix, `BRepAdaptor_Curve2d` on a missing pcurve **raises
+  `Standard_NullObject` on 7.8 and segfaults the interpreter on 8.0**. The
+  spike now checks `BRep_Tool.CurveOnSurface` first and refuses with
+  `MISSING_PCURVE` instead of crashing.
+- After the fix, OCP 7.8 and 8.0 give identical results:
+  - thickness 2.000 (confidence 1.0)
+  - two 90° bends, r_in 1.0, both bending the same way
+  - flat 250.000 × 241.906 mm at K = 0.44
+  - area identity 1.1e-5 (sampled circles)
+  - read 27 ms + unfold 79 ms on 8.0
+- The regression set (11 generated parts, 6 BenDFM samples) still passes on
+  both versions.
+
 ## Not covered by the spike
 
 - Exact `Line`/`Arc`/`Spline` output (the spike writes sampled polylines into
