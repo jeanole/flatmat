@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uvx ruff@0.6.9 check src tests
+      - run: uvx ruff@0.6.9 format --check src tests
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }}, OCP ${{ matrix.ocp }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # OCP 8.0: Python 3.11-3.14; OCP 7.8: Python 3.10-3.13
+          - { os: ubuntu-latest, python: "3.11", ocp: "8.0.1.1.0" }
+          - { os: ubuntu-latest, python: "3.14", ocp: "8.0.1.1.0" }
+          - { os: ubuntu-latest, python: "3.11", ocp: "7.8.1.1.post1" }
+          - { os: ubuntu-latest, python: "3.13", ocp: "7.8.1.1.post1" }
+          - { os: macos-latest, python: "3.13", ocp: "8.0.1.1.0" }
+          - { os: windows-latest, python: "3.13", ocp: "8.0.1.1.0" }
+          - { os: windows-latest, python: "3.12", ocp: "7.8.1.1.post1" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[test]" "cadquery-ocp-novtk==${{ matrix.ocp }}" mypy
+      - name: Type check
+        run: uv run --no-sync mypy
+      - name: Fetch BenDFM samples (MIT repository; data not committed here)
+        shell: bash
+        run: |
+          mkdir -p bendfm && cd bendfm
+          for i in 0 1 2 3 4 5; do
+            for f in $i.stp ${i}_unfolded.stp ${i}_sequence.json; do
+              curl -sSfLO "https://raw.githubusercontent.com/UGent-CVAMO/bendfm/main/example_files/$f" || true
+            done
+          done
+      - name: Test
+        shell: bash
+        env:
+          FLATMAT_BENDFM_DIR: ${{ github.workspace }}/bendfm
+        run: uv run --no-sync pytest -q

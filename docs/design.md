@@ -351,10 +351,21 @@ matrix); ruff, mypy, pytest.
    - OCP 7.8 and 8.0 give identical results.
    - Typical parts take 10–90 ms including STEP read. 1000 holes take 1.5 s,
      linear after six hotspot fixes.
-2. Repo skeleton: `pyproject.toml` (Apache-2.0), CI, ruff/mypy, fixture
-   generator.
-3. `recognize` → `bendmodel` → `unfold` → `flat2d` → `export` → `cli`, each
-   with tests.
+2. ~~Repo skeleton~~ **done**: `pyproject.toml` (Apache-2.0), CI matrix
+   (Linux/macOS/Windows × OCP 7.8/8.0), ruff, mypy, the fixture generator.
+3. ~~`recognize` → `bendmodel` → `unfold` → `export` → `cli`~~ **done for
+   v0.1**, in `src/flatmat/`. Changes against the plan above:
+   - the 2D outline lives in `unfold.py` (no separate `flat2d.py`);
+   - loop areas are exact (Green's theorem per line and arc);
+   - collinear lines and co-circular arcs are joined (SolidWorks splits
+     circles into halves);
+   - periodic B-spline pcurves are clamped with `SetNotPeriodic()` before
+     export (DXF needs a clamped knot vector);
+   - bend-line end points are found by bisection on the face classifier
+     (to ~1e-9 of the bend length).
+
+   Tests: 77 in total, including hypothesis profiles, the BenDFM samples
+   and private parts via environment variables.
 4. Benchmark and BenDFM evaluation; v0.1 on PyPI (check the name is free).
 5. v0.2: canonical recognition, sharp bends, countersinks, DFM checks.
 6. Consumers: Snest calls flatmat from its STEP worker where it currently

@@ -21,23 +21,50 @@ diagnostic that names the faces involved, never silently unfolded wrong.
 
 ## Status
 
-**Design phase.** There is no library code yet, only a phase-0 spike that
-runs the core algorithm end to end and checks it:
+**v0.1 in development.** The package works end to end for planes and
+cylindrical bends. Tested on:
 
-- 11 generated parts come out exact to ≤ 3.5e-14.
-- The BenDFM samples match their own unfolds.
-- OCP 7.8 and 8.0 give identical results.
-- Typical parts take 10–90 ms; a part with 1000 holes takes 1.5 s, and the
-  time grows linearly.
+- generated parts and random profiles (hypothesis): exact to 1e-9;
+- 6 BenDFM samples: they match BenDFM's own unfolds;
+- 4 real SolidWorks 2023/2026 exports.
 
-See [`spike/README.md`](spike/README.md).
+Results are identical on OCP 7.8 and 8.0.
 
-- [`docs/design.md`](docs/design.md): algorithm, API and data model, test and
-  benchmark plan, scope per version.
-- [`docs/research.md`](docs/research.md): the research behind it, with sources:
-  existing tools, how the build123d, FreeCAD and Analysis Situs unfolders
-  work, Python vs C++ vs Rust, licensing, test data, K-factor standards, DXF
-  conventions, hard geometry, robustness and manufacturing rules.
+| | |
+|---|---|
+| [`docs/design.md`](docs/design.md) | algorithm, API, diagnostics, tests, hard cases, robustness, manufacturing checks, roadmap |
+| [`docs/research.md`](docs/research.md) | the research behind it, with sources |
+| [`spike/`](spike/README.md) | the phase-0 prototype and its measurements |
+
+### Usage
+
+```sh
+pip install -e .            # needs Python >= 3.11; pulls cadquery-ocp-novtk
+flatmat unfold part.step -k 0.44 -o part.dxf --table part.json --svg part.svg
+flatmat unfold part.step --din  # K per bend from DIN 6935
+```
+
+```python
+import flatmat as fm
+
+sheet = fm.recognize(fm.load_step("part.step"))      # thickness, bends, flanges
+pat = fm.unfold(sheet, k=fm.KTable.from_rows([(1, 0.38), (3, 0.43), (99, 0.5)]))
+print(pat.size, [(b.direction, b.angle_deg, b.r_in, b.ba) for b in pat.bends])
+fm.write_dxf(pat, "part.dxf")          # exact LINE / ARC / CIRCLE / SPLINE, bend lines, Delem-style labels
+fm.write_bend_table(pat, "part.json")  # or .csv
+```
+
+A part flatmat cannot handle raises `fm.FlatmatError`. Its `.diagnostic` has a
+code (`VARIABLE_THICKNESS`, `EDGE_FEATURE`, `UNSUPPORTED_SURFACE`,
+`CYCLE_INCONSISTENT`, …) and names the faces involved.
+
+### Tests
+
+```sh
+pip install -e ".[test]" && pytest
+FLATMAT_BENDFM_DIR=/path/to/bendfm/example_files pytest tests/test_external.py
+FLATMAT_PARTS_DIR=/path/to/private/step/files pytest tests/test_external.py   # never committed
+```
 
 ## Why another unfolder
 
@@ -53,9 +80,9 @@ today:
 
 ## Planned scope
 
-- **v0.1:** flat faces and cylindrical bends; one solid of constant
-  thickness; bends whose face is split in two; holes and cut-outs across
-  bends; hems; DXF and bend table.
+- **v0.1 (implemented, not released yet):** flat faces and cylindrical bends;
+  one solid of constant thickness; holes and cut-outs across bends; hems; K as
+  a scalar, an r/t table or DIN 6935; exact DXF and bend table.
 - **v0.2:** recognising B-spline faces as cylinders or planes; sharp bends;
   countersinks and counterbores; manufacturability checks.
 - **Later:** cones, other formed features, tubes, assemblies, bend-sequence

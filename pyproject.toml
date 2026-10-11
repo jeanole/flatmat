@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flatmat"
+version = "0.1.0.dev0"
+description = "Sheet metal recognition and unfolding for STEP files, on OpenCascade"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "flatmat contributors" }]
+keywords = ["sheet metal", "unfold", "flat pattern", "STEP", "DXF", "OpenCascade", "CAD", "CAM"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Manufacturing",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  # OCCT bindings. 7.8 and 8.0 are both supported; see src/flatmat/_occ.py.
+  "cadquery-ocp-novtk>=7.8.1,<8.1",
+  "ezdxf>=1.1,<2",
+  "shapely>=2.0,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "hypothesis>=6.100"]
+dev = ["flatmat[test]", "ruff>=0.6", "mypy>=1.10"]
+
+[project.scripts]
+flatmat = "flatmat.cli:main"
+
+[project.urls]
+Source = "https://github.com/jeanole/flatmat"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flatmat"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["spike"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+files = ["src/flatmat"]
