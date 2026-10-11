@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
 from OCP.BRep import BRep_Tool
@@ -109,6 +109,8 @@ class Context:
     feature_through_r: dict[int, float] = field(default_factory=dict)
     feature_on_a: dict[int, bool] = field(default_factory=dict)
     feature_kind: dict[int, str] = field(default_factory=dict)
+    feature_edges: dict[int, set[int]] = field(default_factory=dict)  # edges of a formed feature's opening
+    feature_cuts: dict[int, list[list[int]]] = field(default_factory=dict)  # its slits, as runs of edges
     tol: Tolerances = field(default_factory=Tolerances)
 
 
@@ -464,78 +466,220 @@ def _hole_feature(group: list[int], faces: list[_Face], tol: Tolerances, t: floa
 
 @dataclass
 class _Formed:
-    """A formed region of one skin (docs/design.md §5.4): an emboss or an extruded hole."""
+    """A region of one skin that is not laid flat by bending (docs/design.md §5.4).
+
+    Formed regions (emboss, extruded hole, louvre, bridge) are left out of the
+    development; a lance is a tab bent out of an opening, developed like any flange.
+    """
 
     skin: int
     faces: set[int]
     host: int | None = None  # the plane face whose inner wire bounds the region
-    kind: str | None = None  # "emboss" | "extruded_hole" | None (not supported)
+    kind: str | None = None  # "emboss" | "extruded_hole" | "louvre" | "bridge" | "lance" | None (not supported)
     reason: str = ""
+    wire: list[int] = field(default_factory=list)  # edge indices of that inner wire
+    cuts: list[list[int]] = field(default_factory=list)  # runs of the wire along cuts (slits), in wire order
 
 
 _FORM_KINDS = ("torus", "sphere", "cone", "other")
 
 
-def _formed_regions(faces: list[_Face], skin: set[int], s: int, smooth_nb, nb_all, edges, in_skin) -> list[_Formed]:
-    """Formed regions of one skin: curved faces that are no bends, plus what they enclose.
+def _wires(face: _Face):
+    """(outer wire, [inner wires]) of a face."""
+    from OCP.TopAbs import TopAbs_WIRE
+    from OCP.TopExp import TopExp_Explorer
 
-    Seeds are the skin's tori, spheres, cones and freeform faces, grown over cylinders
-    tangent to them. Removing the seeds leaves the main sheet (the largest part) and
-    the faces the seeds enclose (an emboss's raised top). A region is valid only if it
-    meets the main sheet along inner wires of a single plane face.
-    """
-    seeds = {i for i in skin if faces[i - 1].kind in _FORM_KINDS}
-    if not any(faces[i - 1].kind in ("torus", "sphere", "other") for i in seeds):
-        return []  # cones alone: conical bends, not formed features (still unsupported)
-    grow = True
-    while grow:
-        grow = False
-        for i in skin:
-            if i not in seeds and faces[i - 1].kind == "cylinder" and smooth_nb[i] & seeds:
-                seeds.add(i)
-                grow = True
-    rest = skin - seeds
-    rest_comps = _components(len(faces), [(a, b) for a in rest for b in smooth_nb[a] if b in rest and a < b])
-    rest_comps = [c for c in rest_comps if c[0] in rest]
-    if not rest_comps:
-        return []
-    main = set(max(rest_comps, key=lambda c: sum(faces[i - 1].area for i in c)))
-    formed = skin - main
-    comps = _components(len(faces), [(a, b) for a in formed for b in smooth_nb[a] if b in formed and a < b])
+    outer = BRepTools.OuterWire_s(face.shape)
+    inner = []
+    ex = TopExp_Explorer(face.shape, TopAbs_WIRE)
+    while ex.More():
+        if not ex.Current().IsSame(outer):
+            inner.append(ex.Current())
+        ex.Next()
+    return outer, inner
+
+
+def _wire_edges(wire, face: _Face, host: int, edges) -> list[int]:
+    """Edge indices of a wire, in order along it."""
+    from OCP.BRepTools import BRepTools_WireExplorer
+
+    from ._occ import as_wire
+
+    mine = [(ei, e) for ei, (e, fi) in enumerate(edges) if host in fi]
     out = []
-    for c in comps:
-        if c[0] not in formed:
-            continue
-        reg = _Formed(s, set(c))
-        hosts = {b for a in c for b in smooth_nb[a] if b in main}
-        if len(hosts) != 1 or faces[next(iter(hosts)) - 1].kind != "plane":
-            reg.reason = "a formed region must lie inside one flat face"
-            out.append(reg)
-            continue
-        host = next(iter(hosts))
-        reg.host = host
-        outer = BRepTools.OuterWire_s(faces[host - 1].shape)
-        from OCP.TopExp import TopExp_Explorer
+    ex = BRepTools_WireExplorer(as_wire(wire), face.shape)
+    while ex.More():
+        cur = ex.Current()
+        out += [ei for ei, e in mine if e.IsSame(cur)][:1]
+        ex.Next()
+    return out
 
-        outer_edges = []
-        ex = TopExp_Explorer(outer, TopAbs_EDGE)
-        while ex.More():
-            outer_edges.append(ex.Current())
-            ex.Next()
-        bound = [e for e, fi in edges if len(fi) == 2 and host in fi and (set(fi) - {host}) <= reg.faces]
-        if any(e.IsSame(o) for e in bound for o in outer_edges):
-            reg.reason = "a formed region reaches the outline of its face"
-            out.append(reg)
-            continue
-        cut = any(n not in in_skin for i in c for n in nb_all[i])
-        if not cut:
+
+def _runs(flags: list[bool]) -> list[list[int]]:
+    """Maximal runs of True in a cyclic list, as lists of positions."""
+    n = len(flags)
+    if all(flags):
+        return [list(range(n))]
+    start = next(i for i in range(n) if not flags[i])
+    runs: list[list[int]] = []
+    cur: list[int] = []
+    for k in range(1, n + 1):
+        i = (start + k) % n
+        if flags[i]:
+            cur.append(i)
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _thin(chain: list[int], edges, t: float) -> bool:
+    """Do a cut's edges stay within t of the chord between its ends (a straight slit or slot)?"""
+    pts = []
+    for ei in chain:
+        c = BRepAdaptor_Curve(edges[ei][0])
+        a, b = c.FirstParameter(), c.LastParameter()
+        pts += [c.Value(a + (b - a) * k / 8) for k in range(9)]
+    p, q = max(((p, q) for p in pts for q in pts), key=lambda pq: pq[0].Distance(pq[1]))
+    if p.Distance(q) < 1e-9:
+        return True
+    d = gp_Vec(p, q).Normalized()
+    return max(gp_Vec(p, x).Crossed(d).Magnitude() for x in pts) <= t * 1.01 + 1e-6
+
+
+def _classify(reg: _Formed, faces: list[_Face], edges, nb_all, in_skin, t: float, wire, seeded: bool) -> None:
+    assert reg.host is not None
+    host = faces[reg.host - 1]
+    reg.wire = _wire_edges(wire, host, reg.host, edges)
+    other = [next(iter(set(edges[ei][1]) - {reg.host}), 0) for ei in reg.wire]
+    attached = [o in reg.faces for o in other]
+    cut = [o not in in_skin for o in other]
+    if not all(a or c for a, c in zip(attached, cut, strict=True)):
+        reg.reason = "a formed region meets other skin faces in its opening"
+        return
+    n_att = len(_runs(attached))
+    reg.cuts = [[reg.wire[i] for i in run] for run in _runs(cut)] if any(cut) else []
+    thin = [_thin(c, edges, t) for c in reg.cuts]
+    if not seeded:  # planes and cylinders only
+        if n_att == 1:
+            reg.kind = "lance"  # a tab bent out of an opening: developed like any flange
+        elif len(reg.cuts) == 2 and all(thin):
+            reg.kind = "bridge"
+        else:
+            reg.reason = "a region bent out of an opening and held on several sides is not supported"
+        return
+    if not reg.cuts:
+        cut_inside = any(n not in in_skin for i in reg.faces for n in nb_all[i])
+        if not cut_inside:
             reg.kind = "emboss"
         elif _collar(reg, faces) is not None:
             reg.kind = "extruded_hole"
         else:
-            reg.reason = "a formed feature with cuts (louvre, lance, bridge?) is not supported"
-        out.append(reg)
+            reg.reason = "a formed feature with cuts inside it is not supported"
+    elif len(reg.cuts) == 1 and thin[0]:
+        reg.kind = "louvre"
+    elif len(reg.cuts) == 2 and all(thin):
+        reg.kind = "bridge"
+    else:
+        reg.reason = "a formed feature cut along more than a straight slit (a formed lance?) is not supported"
+
+
+def _formed_regions(
+    faces: list[_Face], skin: set[int], s: int, smooth_nb, nb_all, edges, in_skin, t: float
+) -> list[_Formed]:
+    """Formed regions and lances of one skin.
+
+    Formed regions: seeds are the skin's tori, spheres, cones and freeform faces,
+    grown over cylinders tangent to them. Removing the seeds leaves the main sheet (the
+    largest part) and the faces the seeds enclose (an emboss's raised top). A region is
+    valid only if it meets the main sheet along an inner wire of a single plane face.
+
+    Without seeds, a region of planes and cylinders that hangs in an inner wire of a
+    plane face (it touches nothing else) is a tab bent out of an opening (a lance) if it
+    is held on one side, a bridge if on two.
+    """
+    out: list[_Formed] = []
+    seeds = {i for i in skin if faces[i - 1].kind in _FORM_KINDS}
+    seeded_faces: set[int] = set()
+    if any(faces[i - 1].kind in ("torus", "sphere", "other") for i in seeds):  # cones alone: conical bends
+        grow = True
+        while grow:
+            grow = False
+            for i in skin:
+                if i not in seeds and faces[i - 1].kind == "cylinder" and smooth_nb[i] & seeds:
+                    seeds.add(i)
+                    grow = True
+        rest = skin - seeds
+        rest_comps = [
+            c
+            for c in _components(len(faces), [(a, b) for a in rest for b in smooth_nb[a] if b in rest and a < b])
+            if c[0] in rest
+        ]
+        main = set(max(rest_comps, key=lambda c: sum(faces[i - 1].area for i in c))) if rest_comps else set()
+        formed = skin - main if main else set()  # nothing flat left: unsupported surfaces, not formed features
+        comps = _components(len(faces), [(a, b) for a in formed for b in smooth_nb[a] if b in formed and a < b])
+        for c in comps:
+            if c[0] not in formed:
+                continue
+            reg = _Formed(s, set(c))
+            out.append(reg)
+            seeded_faces |= reg.faces
+            hosts = {b for a in c for b in smooth_nb[a] if b in main}
+            if len(hosts) != 1 or faces[next(iter(hosts)) - 1].kind != "plane":
+                reg.reason = "a formed region must lie inside one flat face"
+                continue
+            reg.host = next(iter(hosts))
+            outer, inner = _wires(faces[reg.host - 1])
+            bound = [e for e, fi in edges if len(fi) == 2 and reg.host in fi and (set(fi) - {reg.host}) <= reg.faces]
+            if any(_has_edge(outer, e) for e in bound):
+                reg.reason = "a formed region reaches the outline of its face"
+                continue
+            wire = next((w for w in inner if any(_has_edge(w, e) for e in bound)), None)
+            _classify(reg, faces, edges, nb_all, in_skin, t, wire, seeded=True)
+
+    # regions of planes and cylinders hanging in an inner wire: lances and bridges
+    largest = max((i for i in skin if faces[i - 1].kind == "plane"), key=lambda i: faces[i - 1].area, default=None)
+    for h in sorted(skin - seeded_faces):
+        fh = faces[h - 1]
+        if fh.kind != "plane":
+            continue
+        _, inner = _wires(fh)
+        for w in inner:
+            start = {
+                o
+                for ei in _wire_edges(w, fh, h, edges)
+                for o in edges[ei][1]
+                if o != h and o in skin and o in smooth_nb[h] and o not in seeded_faces
+            }
+            if not start:
+                continue
+            region, todo = set(start), list(start)
+            while todo:
+                a = todo.pop()
+                for b in smooth_nb[a]:
+                    if b != h and b in skin and b not in region:
+                        region.add(b)
+                        todo.append(b)
+            touches = {b for a in region for b in smooth_nb[a] if b not in region}
+            if touches != {h} or largest in region or region & seeded_faces:
+                continue
+            reg = _Formed(s, region, host=h)
+            _classify(reg, faces, edges, nb_all, in_skin, t, w, seeded=False)
+            out.append(reg)
     return out
+
+
+def _has_edge(wire, e) -> bool:
+    from OCP.TopExp import TopExp_Explorer
+
+    ex = TopExp_Explorer(wire, TopAbs_EDGE)
+    while ex.More():
+        if ex.Current().IsSame(e):
+            return True
+        ex.Next()
+    return False
 
 
 def _collar(reg: _Formed, faces: list[_Face]):
@@ -606,6 +750,8 @@ def _formed_feature(fid: int, reg: _Formed, faces: list[_Face], edges, t: float,
     up = hi >= -lo  # displaced towards the reference skin's outside: towards the viewer of the flat
     h = hi if up else -lo
     side: Literal["top", "bottom"] = "top" if up else "bottom"
+    if reg.kind in ("louvre", "bridge", "lance"):
+        return Feature(fid, reg.kind, 0.0, 0.0, side, face_ids=tuple(sorted(reg.faces)), height=h)  # type: ignore[arg-type]
     circ = _host_circle(reg, faces, edges)
     if reg.kind == "emboss":
         size = 2 * circ[0] if circ else 0.0
@@ -712,12 +858,13 @@ def recognize(
     skins = [set(comps[0]), set(comps[1])]
     in_skin = skins[0] | skins[1]
     regions: list[_Formed] = []
+    t_guess = thickness or t_est or 1.0  # to tell a slit from an opening; refined below
     for s, sk in enumerate(skins):
-        regions += _formed_regions(faces, sk, s, smooth_nb, nb_all, edges, in_skin)
+        regions += _formed_regions(faces, sk, s, smooth_nb, nb_all, edges, in_skin, t_guess)
     for reg in regions:
         if reg.kind is None:
             raise refuse(Code.FORMED_FEATURE, reg.reason, faces=sorted(reg.faces))
-    formed = {i for reg in regions for i in reg.faces}
+    formed = {i for reg in regions if reg.kind != "lance" for i in reg.faces}
     for sk in skins:
         bad = [i for i in sk if faces[i - 1].kind in _FORM_KINDS and i not in formed]
         if bad:
@@ -866,13 +1013,22 @@ def recognize(
         if fkind == "countersink" and on_a:
             diags.append(warn(Code.COUNTERSINK_PROJECTED, f"countersink ⌀{2 * rmax:g} cut as ⌀{2 * rmin:g}", faces=g))
 
+    feat_edges: dict[int, set[int]] = {}
+    feat_cuts: dict[int, list[list[int]]] = {}
     for reg in (r for r in regions if r.skin == a_side):
         fid = len(features) + 1
         feat = _formed_feature(fid, reg, faces, edges, t, diags)
+        if reg.kind == "lance":
+            hinge = next((b for b in bends for sg in b.segments if sg.face_id in reg.faces
+                          and reg.host in smooth_nb[sg.face_id]), None)  # fmt: skip
+            feat = replace(feat, bend_id=hinge.id if hinge else None)
+        else:
+            feat_faces[fid] = tuple(sorted(reg.faces))
+            feat_r[fid] = feat.through_diameter / 2
+            feat_a[fid] = True
         features.append(feat)
-        feat_faces[fid] = tuple(sorted(reg.faces))
-        feat_r[fid] = feat.through_diameter / 2
-        feat_a[fid] = True
+        feat_edges[fid] = set(reg.wire)
+        feat_cuts[fid] = reg.cuts
 
     adj: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for a, b, ei in smooth:
@@ -897,6 +1053,7 @@ def recognize(
     ctx.sharp_edges = sharp_edges
     ctx.features, ctx.feature_through_r, ctx.feature_on_a = feat_faces, feat_r, feat_a
     ctx.feature_kind = {f.id: f.kind for f in features}
+    ctx.feature_edges, ctx.feature_cuts = feat_edges, feat_cuts
     return SheetPart(
         thickness=t,
         thickness_confidence=conf,

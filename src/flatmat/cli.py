@@ -80,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     for f in pat.features:
         if f.kind == "emboss":
             print(f"  emboss {f.side}: height {f.height:g}")
+        elif f.kind in ("louvre", "bridge", "lance"):
+            print(f"  {f.kind} {f.side}: {f.size[0]:g} x {f.size[1]:g} at {f.orientation_deg:g}°, "
+                  f"height {f.height:g}" if f.size else f"  {f.kind} {f.side}")  # fmt: skip
         elif f.kind == "extruded_hole":
             print(f"  extruded hole {f.side}: bore Ø{f.outer_diameter:g}, height {f.height:g}, "
                   f"pre-hole Ø{f.through_diameter:.3f}")  # fmt: skip
@@ -117,7 +120,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("  bend order: none found" + (f"; longest tail {plan.order}" if plan.order else ""))
             if plan.unchecked:
-                print(f"  not simulated: bends {', '.join(map(str, plan.unchecked))} (hems, or not separable)")
+                ids = ", ".join(map(str, plan.unchecked))
+                print(f"  not simulated: bends {ids} (hems and lances, made with their own tools; or not separable)")
     if a.dxf:
         write_dxf(pat, a.dxf, labels=None if a.labels == "none" else a.labels, dfm=report)
     if a.table:

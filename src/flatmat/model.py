@@ -258,10 +258,19 @@ class Feature:
     - emboss (Prägung: dimple, bead, raised pad): ``height`` is the displacement,
       ``outer_diameter`` the rim diameter if the rim is a circle (else 0), ``side`` the
       side it stands out on; ``outline`` is its rim in the flat (a marking, not a cut).
+    - louvre (Kieme) and bridge (Brücke): formed out of the sheet and cut along one or
+      two straight slits; ``outline`` is the rim (a marking), the slits are cut (as
+      narrow holes, or as ``FlatPattern.slits`` if they have no width).
+    - lance (Lasche): a tab bent out of an opening; it is developed like any flange
+      (``bend_id``), the opening around it is cut.
+
+    For the last three, ``orientation_deg`` is the direction of the slits (louvre,
+    bridge) or of the bend line (lance) in the flat, ``size`` the extent along and
+    across it. ``holes`` are the indices of ``FlatPattern.holes`` the feature cuts.
     """
 
     id: int
-    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole"]
+    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance"]
     through_diameter: float
     outer_diameter: float
     side: Literal["top", "bottom"]  # top = the reference skin, facing the viewer of the flat
@@ -272,6 +281,10 @@ class Feature:
     height: float | None = None  # emboss, extruded hole
     radius: float | None = None  # extruded hole: fillet inner radius
     outline: Loop2D | None = None  # in the flat pattern, set by unfold(): rim of the formed region
+    orientation_deg: float | None = None  # louvre, bridge, lance; set by unfold()
+    size: tuple[float, float] | None = None  # louvre, bridge, lance; set by unfold()
+    holes: tuple[int, ...] = ()  # set by unfold()
+    bend_id: int | None = None  # lance
 
 
 @dataclass(frozen=True)
@@ -321,6 +334,7 @@ class FlatPattern:
     diagnostics: tuple[Diagnostic, ...] = ()
     meta: dict = field(default_factory=dict)
     features: tuple[Feature, ...] = ()
+    slits: tuple[Loop2D, ...] = ()  # open cut paths with no width (slits of louvres, bridges)
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:

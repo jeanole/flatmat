@@ -146,7 +146,7 @@ def unfold(
             for f in sheet_features
         ]
     pre_r = {f.id: f.through_diameter / 2 for f in sheet_features if f.kind == "extruded_hole"}
-    outer, holes, feature_centers, outlines = _outline(ctx, devs, place, sharp_v, diags, pre_r)
+    outer, holes, feature_centers, outlines, hole_fid, slits, orient = _outline(ctx, devs, place, sharp_v, diags, pre_r)
 
     # self-checks
     area = outer.area() - sum(-h.area() for h in holes)
@@ -198,11 +198,18 @@ def unfold(
     outer = _move_loop(outer, shift)
     holes = [_move_loop(h, shift) for h in holes]
     lines = [_with(bl, p0=_apply(shift, bl.p0), p1=_apply(shift, bl.p1)) for bl in lines]
+    slit_loops = [(_move_loop(L, shift), fid) for L, fid in slits]
     features = tuple(
-        _with(
-            f,
-            center=_apply(shift, feature_centers[f.id][0]) if f.id in feature_centers else None,
-            outline=_move_loop(outlines[f.id], shift) if f.id in outlines else None,
+        _cut_feature(
+            _with(
+                f,
+                center=_apply(shift, feature_centers[f.id][0]) if f.id in feature_centers else None,
+                outline=_move_loop(outlines[f.id], shift) if f.id in outlines else None,
+                holes=tuple(i for i, fid in enumerate(hole_fid) if fid == f.id),
+            ),
+            holes,
+            lines,
+            orient.get(f.id),
         )
         for f in sheet_features
     )
@@ -225,7 +232,37 @@ def unfold(
             "root_offset": (dx, dy),  # flat = root face (u, v) developed + this
         },
         features=features,
+        slits=tuple(L for L, _ in slit_loops),
     )
+
+
+def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | None):
+    """Louvres, bridges, lances: where they point and how big they are in the flat.
+
+    The direction is that of the slits (louvre, bridge) or of the bend line (lance).
+    """
+    if f.kind not in ("louvre", "bridge", "lance"):
+        return f
+    if f.kind == "lance":
+        pts = [p for i in f.holes for p in holes[i].polyline(0.01)]
+        bl = next((b for b in lines if b.bend_id == f.bend_id), None)
+        if bl is not None:
+            angle = math.atan2(bl.p1[1] - bl.p0[1], bl.p1[0] - bl.p0[0])
+    else:
+        pts = f.outline.polyline(0.01) if f.outline is not None else []
+    if not pts or angle is None:
+        return f
+    deg = math.degrees(angle) % 180.0
+    if deg > 180.0 - 1e-9:
+        deg = 0.0
+    a = math.radians(deg)
+    u, v = (math.cos(a), math.sin(a)), (-math.sin(a), math.cos(a))
+    pa = [x * u[0] + y * u[1] for x, y in pts]
+    pb = [x * v[0] + y * v[1] for x, y in pts]
+    if f.center is None:  # a lance: the middle of its opening
+        ca, cb = (max(pa) + min(pa)) / 2, (max(pb) + min(pb)) / 2
+        f = _with(f, center=(ca * u[0] + cb * v[0], ca * u[1] + cb * v[1]))
+    return _with(f, orientation_deg=deg, size=(max(pa) - min(pa), max(pb) - min(pb)))
 
 
 def _with(obj, **kw):
@@ -389,22 +426,52 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
         if va != vb and math.dist(seg.start, pa) > math.dist(seg.end, pa):
             seg = seg.reversed()
         pieces.append((va, vb, seg))
-    loops = [_merge_collinear(_close(segs, jv, sharp_v, ctx.tol.flat)) for segs, jv in _chain(pieces)]
+    for opening, es in ctx.feature_edges.items():  # openings of louvres, bridges, lances
+        for ei in es:
+            feature_of_edge.setdefault(ei, opening)
+    cut_edges = {ei for chains in ctx.feature_cuts.values() for c in chains for ei in c}
+    loops = [
+        _merge_collinear(_close(segs, jv, sharp_v, ctx.tol.flat), keep_apart=cut_edges) for segs, jv in _chain(pieces)
+    ]
 
     # hole features: report the centre; where the large rim is on the reference skin,
     # cut the through hole instead (the countersink / counterbore is made afterwards).
     # Formed features: an emboss's rim is a marking, not a cut (the area inside it is
-    # material); an extruded hole cuts its pre-hole.
+    # material); an extruded hole cuts its pre-hole; a louvre or bridge cuts its slits,
+    # the rest of its rim is a marking; a lance's opening is cut as it is.
     centers: dict[int, tuple[Point, float]] = {}
     outlines: dict[int, Loop2D] = {}
-    out = []
+    slits: list[tuple[Loop2D, int]] = []
+    orient: dict[int, float] = {}  # louvres, bridges: direction of the slits
+    out: list[tuple[Loop2D, int | None]] = []
     for L in loops:
-        fids = {feature_of_edge.get(s.source_edge) for s in L.segments}
-        fid = next(iter(fids)) if len(fids) == 1 else None
+        fids = {feature_of_edge[s.source_edge] for s in L.segments if s.source_edge in feature_of_edge}
+        fid: int | None = next(iter(fids)) if len(fids) == 1 else None
         if fid is None:
-            out.append(L)
+            out.append((L, None))
             continue
         kind = ctx.feature_kind.get(fid)
+        if kind == "lance":
+            out.append((L, fid))
+            continue
+        if kind in ("louvre", "bridge"):
+            rim = L if L.area() > 0 else _reverse_loop(L)
+            outlines[fid] = rim
+            cut_area = 0.0
+            runs = _cut_runs(rim, cut_edges)
+            if runs:
+                c = max(runs, key=lambda ch: math.dist(ch[0].start, ch[-1].end))
+                orient[fid] = math.atan2(c[-1].end[1] - c[0].start[1], c[-1].end[0] - c[0].start[0])
+            for chain in runs:
+                closing = Line(chain[-1].end, chain[0].start, chain[0].source_edge)
+                slot = Loop2D((*chain, closing))
+                if abs(slot.area()) <= 1e-9 * max(1.0, closing.length()) ** 2:
+                    slits.append((Loop2D(tuple(chain)), fid))  # no width: a cut line
+                else:
+                    out.append((slot, fid))
+                    cut_area += abs(slot.area())
+            centers[fid] = (_centroid(rim), rim.area() - cut_area)
+            continue
         if kind == "emboss":
             rim = L if L.area() > 0 else _reverse_loop(L)
             outlines[fid] = rim
@@ -418,27 +485,48 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
             r = pre_r.get(fid, 0.0)
             centers[fid] = (seg.center, math.pi * (seg.radius**2 - r**2))
             if r > 0:
-                out.append(Loop2D((Arc(seg.center, r, 0.0, -2 * math.pi, False, seg.source_edge),)))
+                out.append((Loop2D((Arc(seg.center, r, 0.0, -2 * math.pi, False, seg.source_edge),)), fid))
             continue
         if len(L.segments) != 1 or not isinstance(L.segments[0], Arc) or not L.segments[0].is_circle:
             diags.append(warn(Code.FEATURE_NOT_CIRCULAR, "a hole feature is not a circle in the flat; kept as is"))
-            out.append(L)
+            out.append((L, fid))
             continue
         arc = L.segments[0]
         if ctx.feature_on_a.get(fid):
             r = ctx.feature_through_r[fid]
             centers[fid] = (arc.center, math.pi * (arc.radius**2 - r**2))
-            out.append(Loop2D((Arc(arc.center, r, arc.a0, arc.a1, arc.ccw, arc.source_edge),)))
+            out.append((Loop2D((Arc(arc.center, r, arc.a0, arc.a1, arc.ccw, arc.source_edge),)), fid))
         else:
             centers[fid] = (arc.center, 0.0)
-            out.append(L)
-    loops = out
-    loops.sort(key=lambda L: -abs(L.area()))
-    outer, holes = loops[0], loops[1:]
+            out.append((L, fid))
+    out.sort(key=lambda lf: -abs(lf[0].area()))
+    outer = out[0][0]
     if outer.area() < 0:
         outer = _reverse_loop(outer)
-    holes = [_reverse_loop(h) if h.area() > 0 else h for h in holes]
-    return outer, holes, centers, outlines
+    holes = [_reverse_loop(h) if h.area() > 0 else h for h, _ in out[1:]]
+    hole_fid = [f for _, f in out[1:]]
+    return outer, holes, centers, outlines, hole_fid, slits, orient
+
+
+def _cut_runs(L: Loop2D, cut_edges: set[int]) -> list[list]:
+    """Runs of consecutive segments of a closed loop that come from cut edges."""
+    segs = list(L.segments)
+    flags = [s.source_edge in cut_edges for s in segs]
+    if all(flags) or not any(flags):
+        return [segs] if all(flags) else []
+    k = flags.index(False)
+    segs, flags = segs[k:] + segs[:k], flags[k:] + flags[:k]
+    runs: list[list] = []
+    cur: list = []
+    for sg, f in zip(segs, flags, strict=True):
+        if f:
+            cur.append(sg)
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    return runs
 
 
 def _centroid(L: Loop2D) -> Point:
@@ -541,13 +629,19 @@ def _intersect(a: Line, b: Line) -> Point | None:
     return (a.p0[0] + u * d1[0], a.p0[1] + u * d1[1])
 
 
-def _merge_collinear(L: Loop2D, tol: float = 1e-9) -> Loop2D:
-    """Join consecutive collinear lines and co-circular arcs (split at bend tangents, circle halves)."""
+def _merge_collinear(L: Loop2D, tol: float = 1e-9, keep_apart: set[int] | None = None) -> Loop2D:
+    """Join consecutive collinear lines and co-circular arcs (split at bend tangents, circle halves).
+
+    Segments from ``keep_apart`` edges (slits) are not joined with others.
+    """
     segs = list(L.segments)
     if len(segs) < 2:
         return L
+    apart = keep_apart or set()
 
     def joinable(a, b) -> bool:
+        if (a.source_edge in apart) != (b.source_edge in apart):
+            return False
         if isinstance(a, Line) and isinstance(b, Line):
             (x0, y0), (x1, y1), (x2, y2) = a.p0, a.p1, b.p1
             cross = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)

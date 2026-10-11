@@ -209,18 +209,27 @@ def check(
     outer = Polygon(pattern.outer.polyline(0.01))
     holes = [Polygon(h.polyline(0.01)) for h in pattern.holes]
     part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes])
+    for sl in pattern.slits:
+        stop = LineString(sl.polyline(0.01))
+        part = part.difference(stop.buffer(1e-3))
     bends = {b.id: b for b in pattern.bends}
     lines_by_bend: dict[int, list] = {}
     for bl in pattern.bend_lines:
         lines_by_bend.setdefault(bl.bend_id, []).append(bl)
     all_lines = [(bl, LineString([bl.p0, bl.p1])) for bl in pattern.bend_lines]
+    # holes cut by formed features (pre-holes, slits, the openings of lances): judged with the feature
+    feature_holes = {i for f in pattern.features if f.kind in _CUT_FORMS for i in f.holes}
+    stops = [holes[i].exterior for f in pattern.features if f.kind == "lance" for i in f.holes]
 
     # ---- per bend: flanges, radius, angle, hem, tonnage
+    # (lances are formed in a punching tool, not on the press brake: no press-brake rules)
+    lance_bends = {f.bend_id for f in pattern.features if f.kind == "lance"}
     checks: list[BendCheck] = []
     for bid, b in bends.items():
         bls = lines_by_bend.get(bid, [])
         if not bls:
             continue
+        brake = bid not in lance_bends
         ba = b.ba or 0.0
         need = max(rules.min_flange_v * v, rules.min_flange_t * t + b.r_in)
         legs: list[list[float]] = [[], []]
@@ -232,7 +241,7 @@ def check(
                 s = 0.05 + 0.9 * k / 10
                 p = (bl.p0[0] + s * length * u[0], bl.p0[1] + s * length * u[1])
                 for side, sg in ((0, 1.0), (1, -1.0)):
-                    leg = _leg(p, (sg * n[0], sg * n[1]), outer, all_lines, bl, bends, ba, b, t)
+                    leg = _leg(p, (sg * n[0], sg * n[1]), outer, all_lines, bl, bends, ba, b, t, stops)
                     legs[side].append(leg)
                     if leg < worst[side][0]:
                         worst[side] = (leg, p)
@@ -241,7 +250,7 @@ def check(
             if b.kind == "hem" and med[side] <= med[1 - side]:
                 continue  # the return of a hem has its own rule
             ok = sum(1 for x in legs[side] if x >= need - 1e-9) / len(legs[side])
-            if ok < rules.flange_fraction:
+            if ok < rules.flange_fraction and brake:
                 add(
                     Code.DFM_FLANGE_TOO_SHORT,
                     f"bend {bid}: flange {med[side]:.2f} mm < {need:.2f} mm (V={v:g})",
@@ -270,25 +279,25 @@ def check(
         r_air = mat.air_radius_pct * v
         if tooling is not None:
             r_air = max(r_air, tooling.punch.tip_radius)  # a large punch radius forms the bend itself
-        if b.kind != "hem" and abs(b.r_in - r_air) > rules.radius_tolerance * max(r_air, t):
+        if brake and b.kind != "hem" and abs(b.r_in - r_air) > rules.radius_tolerance * max(r_air, t):
             add(Code.DFM_RADIUS_NOT_AIR_BENDABLE, f"bend {bid}: model r={b.r_in:g}, air bending in V{v:g} gives "
                 f"~{r_air:.2f} mm; the flat size will differ", bls[0].p0, bid, info=True, air_radius=r_air)  # fmt: skip
-        if rules.max_bend_angle is not None and b.kind != "hem" and b.angle_deg > rules.max_bend_angle:
+        if brake and rules.max_bend_angle is not None and b.kind != "hem" and b.angle_deg > rules.max_bend_angle:
             add(Code.DFM_BEND_ANGLE, f"bend {bid}: {b.angle_deg:.1f}° > {rules.max_bend_angle:g}°", bls[0].p0, bid)
         total_len = sum(math.dist(bl.p0, bl.p1) for bl in bls)
-        if tooling is not None and b.kind != "hem":
+        if tooling is not None and b.kind != "hem" and brake:
             _tool_limits(b, bls, tooling, rules, add)
         force = bending_force_kn(mat.rm_mpa, t, total_len, v)
-        if machine_max_force_kn is not None and force > machine_max_force_kn:
+        if brake and machine_max_force_kn is not None and force > machine_max_force_kn:
             add(Code.DFM_TONNAGE, f"bend {bid}: {force:.0f} kN > machine {machine_max_force_kn:g} kN",
                 bls[0].p0, bid, force_kn=force)  # fmt: skip
         checks.append(BendCheck(bid, v, r_air, force, need, (med[0], med[1])))
 
     # ---- U channels: two parallel bends of the same direction, base < ratio * flange
-    _u_channels(pattern, bends, checks, rules, add)
+    _u_channels(pattern, bends, checks, rules, add, skip=lance_bends)
 
     # ---- formed features: rims to bends and to the outline
-    pre_holes = _formed(pattern, outer, all_lines, bends, rules, t, add)
+    _formed(pattern, outer, holes, all_lines, bends, rules, t, add)
 
     # ---- holes: size, edge, each other, bends
     tree = STRtree(holes) if holes else None
@@ -296,8 +305,8 @@ def check(
     for i, h in enumerate(holes):
         c = h.centroid
         loop = pattern.holes[i]
-        if any(c.distance(Point(p)) < 1e-6 for p in pre_holes):
-            continue  # the pre-hole of an extruded hole: judged by its rim above
+        if i in feature_holes:
+            continue  # cut by a formed feature: judged with it above
         seg0 = loop.segments[0]
         if len(loop.segments) == 1 and isinstance(seg0, Arc) and seg0.is_circle:
             dia = 2 * seg0.radius
@@ -360,8 +369,8 @@ def check(
                 continue
             if near_flagged is not None and piece.within(near_flagged):
                 continue  # the same narrow web as a hole-to-edge / hole-to-hole finding
-            if what == "slot" and any(piece.distance(Point(p)) < 1e-6 for p in pre_holes):
-                continue  # the pre-hole of an extruded hole
+            if what == "slot" and any(piece.intersects(holes[i]) for i in feature_holes):
+                continue  # a pre-hole or slit of a formed feature
             if what == "slot" and near_bend_end(piece, max((b.ba or 0) / 2 + b.r_in + 2 * t for b in bends.values())
                                                 if bends else 0.0):  # fmt: skip
                 continue  # a relief: judged by the relief rule, not as a slot
@@ -439,16 +448,28 @@ def _tool_limits(b: Bend, bls, tooling: Tooling, rules: DfmRules, add) -> None:
                 bls[0].p0, b.id, tool=name, length=extent)  # fmt: skip
 
 
-def _formed(pattern: FlatPattern, outer: Polygon, all_lines, bends, rules: DfmRules, t: float, add) -> list:
-    """Embosses and extruded holes: their rims to the bends and to the outline. Returns the pre-hole centres."""
-    pre = []
+_CUT_FORMS = ("extruded_hole", "louvre", "bridge", "lance")
+_FORM_NAMES = {"emboss": "emboss", "extruded_hole": "extruded hole", "louvre": "louvre", "bridge": "bridge",
+               "lance": "lance"}  # fmt: skip
+
+
+def _formed(pattern: FlatPattern, outer: Polygon, holes, all_lines, bends, rules: DfmRules, t: float, add) -> None:
+    """Formed features: their rims (a lance: its opening) to the bends and to the outline.
+
+    A lance's own bend is not counted.
+    """
     for f in pattern.features:
-        if f.kind not in ("emboss", "extruded_hole") or f.outline is None or f.center is None:
+        if f.kind not in _FORM_NAMES or f.center is None:
             continue
-        if f.kind == "extruded_hole":
-            pre.append(f.center)
-        rim = Polygon(f.outline.polyline(0.01))
-        name = "emboss" if f.kind == "emboss" else "extruded hole"
+        if f.kind == "lance":
+            if not f.holes:
+                continue
+            rim = unary_union([holes[i] for i in f.holes]).convex_hull
+        elif f.outline is not None:
+            rim = Polygon(f.outline.polyline(0.01))
+        else:
+            continue
+        name = _FORM_NAMES[f.kind]
         d_edge = rim.exterior.distance(outer.exterior)
         if d_edge < rules.form_to_edge_t * t - 1e-9:
             add(Code.DFM_FORM_NEAR_EDGE, f"{name} {d_edge:.2f} mm from the edge < {rules.form_to_edge_t * t:g}",
@@ -456,7 +477,7 @@ def _formed(pattern: FlatPattern, outer: Polygon, all_lines, bends, rules: DfmRu
         done: set[int] = set()
         for bl, ls in all_lines:
             b = bends[bl.bend_id]
-            if b.id in done:
+            if b.id in done or b.id == f.bend_id:
                 continue
             d = rim.distance(ls) - (b.ba or 0.0) / 2  # from the tangent line
             need = rules.form_to_bend_t * t + b.r_in
@@ -464,7 +485,6 @@ def _formed(pattern: FlatPattern, outer: Polygon, all_lines, bends, rules: DfmRu
                 done.add(b.id)
                 add(Code.DFM_FORM_NEAR_BEND, f"{name} {max(d, 0.0):.2f} mm from the tangent line of bend {b.id}; "
                     f"needs {need:.2f}", f.center, b.id, distance=d, required=need, feature=f.id)  # fmt: skip
-    return pre
 
 
 def _corner_reliefs(ends, all_lines, bends, part: Polygon, rules: DfmRules, t: float, add) -> None:
@@ -587,23 +607,25 @@ def _beside(h: Polygon, bl) -> bool:
     return max(s) > 0 and min(s) < length
 
 
-def _leg(p, d, outer: Polygon, all_lines, this_line, bends, ba, b: Bend, t: float) -> float:
+def _leg(p, d, outer: Polygon, all_lines, this_line, bends, ba, b: Bend, t: float, stops=()) -> float:
     """Outer-mould-line length of the flange from bend line point p in direction d.
 
-    Stops at the outline or at the next bend line, whichever comes first.
+    Stops at the outline (or one of ``stops``, the openings of lances) or at the next
+    bend line, whichever comes first.
     """
     far = 1e6
     ray = LineString([p, (p[0] + d[0] * far, p[1] + d[1] * far)])
     best = math.inf
     stop_bend: Bend | None = None
-    hit = ray.intersection(outer.exterior)
-    for g in getattr(hit, "geoms", [hit]):
-        if g.is_empty:
-            continue
-        for q in getattr(g, "coords", []):
-            dd = math.dist(p, q)
-            if 1e-6 < dd < best:
-                best = dd
+    for edge in (outer.exterior, *stops):
+        hit = ray.intersection(edge)
+        for g in getattr(hit, "geoms", [hit]):
+            if g.is_empty:
+                continue
+            for q in getattr(g, "coords", []):
+                dd = math.dist(p, q)
+                if 1e-6 < dd < best:
+                    best = dd
     for bl, ls in all_lines:
         if bl is this_line:
             continue
@@ -625,11 +647,14 @@ def _leg(p, d, outer: Polygon, all_lines, this_line, bends, ba, b: Bend, t: floa
     return leg
 
 
-def _u_channels(pattern: FlatPattern, bends: dict[int, Bend], checks: list[BendCheck], rules: DfmRules, add) -> None:
+def _u_channels(
+    pattern: FlatPattern, bends: dict[int, Bend], checks: list[BendCheck], rules: DfmRules, add, skip=frozenset()
+) -> None:
     by_id = {c.bend_id: c for c in checks}
     lines: dict[int, BendLine] = {}
     for bl in pattern.bend_lines:
-        lines.setdefault(bl.bend_id, bl)
+        if bl.bend_id not in skip:
+            lines.setdefault(bl.bend_id, bl)
     ids = sorted(lines)
     for i, a in enumerate(ids):
         for b in ids[i + 1 :]:

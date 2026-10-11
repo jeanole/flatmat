@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_MakeFace,
@@ -198,29 +198,97 @@ def make_solid(part: Part):
         solid = cut.Shape()
     for lo, hi in part.adds:
         solid = BRepAlgoAPI_Fuse(solid, BRepPrimAPI_MakeBox(gp_Pnt(*lo), gp_Pnt(*hi)).Shape()).Shape()
-    for kind, idx, frac, z, rim, height, *rest in part.formed:
-        side = rest[-1]
+    for kind, idx, frac, z, *args in part.formed:
+        side = args[-1]
         p0, h, length = anchors[("flat", idx)]
         c = (p0[0] + frac * length * math.cos(h), p0[1] + frac * length * math.sin(h))
         n = (-math.sin(h), math.cos(h))
-        prof = _emboss_profile(part.t, rim, height, rest[0], rest[1]) if kind == "emboss" else (
-            _collar_profile(part.t, rim, height, rest[0]))  # fmt: skip
-        face = BRepBuilderAPI_MakeFace(_profile_wire(prof)).Face()
-        rev = BRepPrimAPI_MakeRevol(face, gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 2 * math.pi).Shape()
-        # local z = 0 is the far skin, local +z the side the feature stands out on
+        hole, add = _formed_tools(kind, part.t, *args[:-1])
+        # local z = 0 is the far skin, local +z the side the feature stands out on, local x along the flat
         org = gp_Pnt(c[0] - side * n[0] * part.t / 2, c[1] - side * n[1] * part.t / 2, z)
         tr = gp_Trsf()
         tr.SetTransformation(gp_Ax3(org, gp_Dir(side * n[0], side * n[1], 0), gp_Dir(math.cos(h), math.sin(h), 0)),
                              gp_Ax3())  # fmt: skip
-        rev = BRepBuilderAPI_Transform(rev, tr, True).Shape()
-        base = gp_Pnt(c[0] - n[0] * 5 * part.t, c[1] - n[1] * 5 * part.t, z)
-        hole = BRepPrimAPI_MakeCylinder(gp_Ax2(base, gp_Dir(n[0], n[1], 0)), rim, 10 * part.t).Shape()
-        solid = BRepAlgoAPI_Fuse(BRepAlgoAPI_Cut(solid, hole).Shape(), rev).Shape()
+        hole = BRepBuilderAPI_Transform(hole, tr, True).Shape()
+        add = BRepBuilderAPI_Transform(add, tr, True).Shape()
+        solid = BRepAlgoAPI_Fuse(BRepAlgoAPI_Cut(solid, hole).Shape(), add).Shape()
     if part.formed or part.adds:
         u = ShapeUpgrade_UnifySameDomain(solid, True, True, False)
         u.Build()
         solid = u.Shape()
     return solid
+
+
+def _formed_tools(kind: str, t: float, *a):
+    """(material to cut away, material to add) for a formed feature, in its local frame.
+
+    Local frame: the far skin at z = 0, the near skin at z = t, the feature stands
+    out towards +z; x runs along the flat, y across it. The origin is the centre.
+    """
+    deep = (-1.0, 3 * t + 100.0)  # z range of the cutting tools
+
+    def prism(x0, x1, y0, y1):
+        return BRepPrimAPI_MakeBox(gp_Pnt(x0, y0, deep[0]), gp_Pnt(x1, y1, deep[1])).Shape()
+
+    def revolve(prof, angle):
+        face = BRepBuilderAPI_MakeFace(_profile_wire(prof)).Face()
+        return BRepPrimAPI_MakeRevol(face, gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), angle).Shape()
+
+    def cylinder(r):
+        return BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0, 0, deep[0]), gp_Dir(0, 0, 1)), r, deep[1] - deep[0]).Shape()
+
+    if kind in ("emboss", "collar"):
+        rim, height, *f = a
+        prof = (
+            _emboss_profile(t, rim, height, f[0], f[1]) if kind == "emboss" else _collar_profile(t, rim, height, f[0])
+        )
+        return cylinder(rim), revolve(prof, 2 * math.pi)
+    if kind == "louvre":
+        # a raised half pad (y >= 0), open along its straight edge: a slit `gap` wide at y in [-gap, 0]
+        rim, height, a1, a2, gap = a
+        half = BRepAlgoAPI_Common(cylinder(rim), prism(-rim - 1, rim + 1, 0.0, rim + 1)).Shape()
+        hole = BRepAlgoAPI_Fuse(half, prism(-rim, rim, -gap, 0.0)).Shape()
+        return hole, revolve(_emboss_profile(t, rim, height, a1, a2), math.pi)
+    if kind == "bridge":
+        # a strip `width` wide raised by two 30° joggles at each end; slits `gap` wide along both sides
+        span, width, height, r, gap = a
+        ang = 30.0
+        rise = height - 2 * (1 - math.cos(math.radians(ang))) * (r + t / 2)  # height from the sloped flats
+        fr = rise / math.sin(math.radians(ang))
+        e = 5.0
+        prof = Part(
+            "strip", t=t, width=width, flats=[e, fr, 1.0, fr, e], bends=[(ang, r), (-ang, r), (-ang, r), (ang, r)]
+        )
+        _, _, anchors = _profile(prof)
+        x_end = anchors[("flat", 4)][0][0]
+        # make the top flat as long as needed for the requested span
+        top = span - (x_end - e - 1.0)
+        prof.flats[2] = top
+        _, _, anchors = _profile(prof)
+        x_end = anchors[("flat", 4)][0][0]
+        dx = -(e + x_end) / 2
+        strip = _place_profile(make_solid(prof), dx, width, t)
+        return prism(e + dx, x_end + dx, -width / 2 - gap, width / 2 + gap), strip
+    if kind == "lance":
+        # a tab `width` wide bent up by `angle` (radius r) along y at x = -length/2, cut free on the
+        # other three sides with slits `gap` wide; the opening is as long as the flat tab (K = 0.44)
+        length, width, angle, r, gap = a
+        e = 5.0
+        ba = math.radians(angle) * (r + 0.44 * t)
+        tab = Part("tab", t=t, width=width, flats=[e, length - ba], bends=[(angle, r)])
+        dx = -length / 2 - e
+        return (
+            prism(-length / 2, length / 2 + gap, -width / 2 - gap, width / 2 + gap),
+            _place_profile(make_solid(tab), dx, width, t),
+        )
+    raise ValueError(kind)
+
+
+def _place_profile(solid, dx: float, width: float, t: float):
+    """A profile solid (profile in xy, extruded along z by width) into the local frame of _formed_tools."""
+    tr = gp_Trsf()
+    tr.SetValues(1, 0, 0, dx, 0, 0, -1, width / 2, 0, 1, 0, t / 2)  # x -> x, y -> z, z -> -y
+    return BRepBuilderAPI_Transform(solid, tr, True).Shape()
 
 
 def _arc3(c, r, a0, a1):
@@ -333,6 +401,24 @@ def formed_cases() -> list[Part]:
             formed=[("collar", 0, 0.4, 30.0, 8.0, 8.0, 1.0, -1), ("collar", 1, 0.5, 70.0, 7.0, 6.0, 1.5, +1)],
             **L,
         ),
+    ]
+
+
+def cut_formed_cases() -> list[Part]:
+    """Louvres, bridges and lances on the 60 mm base of an L (t = 2, r = 2, 100 wide); slits 0.5 wide.
+
+    ("louvre", flat, frac, z, rim_radius, height, fillet_in, fillet_top, gap, side): a raised
+    half pad open along its straight edge; ("bridge", flat, frac, z, span, width, height, r,
+    gap, side): a strip raised by two joggles, slit along both sides; ("lance", flat, frac,
+    z, length, width, angle, r, gap, side): a tab bent out of an opening as long as its flat.
+    """
+    L = dict(t=2.0, width=100, flats=[60, 40], bends=[(90, 2.0)])
+    return [
+        Part("louvre_up", formed=[("louvre", 0, 0.5, 50.0, 10.0, 5.0, 1.0, 1.0, 0.5, +1)], **L),
+        Part("louvre_down", formed=[("louvre", 0, 0.5, 30.0, 8.0, 4.5, 1.0, 1.0, 0.5, -1)], **L),
+        Part("bridge", formed=[("bridge", 0, 0.5, 50.0, 30.0, 10.0, 4.0, 2.0, 0.5, +1)], **L),
+        Part("lance", formed=[("lance", 0, 0.5, 50.0, 25.0, 12.0, 30.0, 2.0, 0.5, +1)], **L),
+        Part("lance_90", formed=[("lance", 0, 0.4, 30.0, 20.0, 10.0, 90.0, 2.0, 0.5, -1)], **L),
     ]
 
 

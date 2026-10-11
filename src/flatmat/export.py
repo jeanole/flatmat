@@ -79,6 +79,8 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
     _add_loop(msp, pattern.outer, layers.outer)
     for h in pattern.holes:
         _add_loop(msp, h, layers.inner)
+    for sl in pattern.slits:  # cut lines without width
+        _add_loop(msp, sl, layers.inner)
     for f in pattern.features:
         if f.outline is not None:
             _add_loop(msp, f.outline, layers.form)
@@ -146,6 +148,10 @@ def _feature_label(f) -> str:
         return f"CBORE Ø{f.outer_diameter:g}{depth} {side}"
     if f.kind == "extruded_hole":
         return f"EXTR Ø{f.outer_diameter:.4g} H{f.height:.4g} {side} (PRE Ø{f.through_diameter:.3f})"
+    if f.kind in ("louvre", "bridge", "lance"):
+        size = f"{f.size[0]:.4g}x{f.size[1]:.4g} " if f.size else ""
+        angle = f"A{f.orientation_deg:.4g} " if f.orientation_deg is not None else ""
+        return f"{f.kind.upper()} {size}{angle}H{f.height:.4g} {side}"
     return f"EMBOSS H{f.height:.4g} {side}"
 
 
@@ -210,6 +216,10 @@ def bend_table(pattern: FlatPattern) -> dict:
             "height": f.height,
             "radius": f.radius,
             "rim": [list(p) for p in f.outline.polyline(0.01)] if f.outline is not None else None,
+            "orientation_deg": f.orientation_deg,
+            "size": list(f.size) if f.size else None,
+            "holes": list(f.holes),
+            "bend": f.bend_id,
         }
         for f in pattern.features
     ]
@@ -222,6 +232,7 @@ def bend_table(pattern: FlatPattern) -> dict:
         "flat_area": pattern.area,
         "bends": bends,
         "features": features,
+        "slits": [[list(p) for p in sl.polyline(0.01)] for sl in pattern.slits],
         "generator": {"flatmat": __version__, "ocp": OCP_VERSION},
         "diagnostics": [d.to_dict() for d in pattern.diagnostics],
     }
@@ -295,6 +306,8 @@ def write_svg(pattern: FlatPattern, path: str | os.PathLike, *, margin: float = 
     for f in pattern.features:
         if f.outline is not None:
             out.append(f'<polygon points="{pts(f.outline)}" fill="none" stroke="#a6a" stroke-width="{sw:.4f}"/>')
+    for sl in pattern.slits:
+        out.append(f'<polyline points="{pts(sl)}" fill="none" stroke="#2a7" stroke-width="{sw:.4f}"/>')
     for bl in pattern.bend_lines:
         col = "#d22" if bl.direction == "up" else "#22d"
         (x0, y0), (x1, y1) = bl.p0, bl.p1

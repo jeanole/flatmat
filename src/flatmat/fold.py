@@ -58,6 +58,8 @@ class FoldModel:
         self.pattern = pattern
         bends = {b.id: b for b in pattern.bends}
         part = Polygon(pattern.outer.polyline(tol), [h.polyline(tol) for h in pattern.holes]).buffer(0)
+        for sl in pattern.slits:  # cut lines without width still separate what they cut
+            part = part.difference(LineString(sl.polyline(tol)).buffer(1e-3))
         strips = []
         for bl in pattern.bend_lines:
             b = bends[bl.bend_id]

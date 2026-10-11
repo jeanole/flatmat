@@ -379,11 +379,12 @@ matrix); ruff, mypy, pytest.
   seam-split bends; holes and cut-outs crossing bends; hems with r > 0; DXF
   + bend table.
 - **v0.2**: canonical recognition of B-spline faces; sharp bends; countersinks
-  and counterbores; embosses and extruded holes (§5.4); warn-and-skip instead
+  and counterbores; embosses, extruded holes, louvres, bridges and lances
+  (§5.4); warn-and-skip instead
   of abort; DFM checks (§7) with the corner rule, tooling (§7.5), tool
   collisions and a bend order (§7.4).
-- **later**: cones; louvres, lances and bridges; tubes with a user-chosen
-  seam; assemblies.
+- **later**: cones; formed lances and louvres with curved slits; tubes with a
+  user-chosen seam; assemblies.
 
 ## 5. Hard geometry
 
@@ -550,7 +551,56 @@ the outer virtual-sharp line L.
   down, collars up, down and two on one part, a collar too tall for a
   pre-hole. All are exact in area and round-trip through STEP.
 
-Louvres, lances and bridges: still to do, as planned below.
+**Louvres, bridges and lances: implemented.**
+
+- **Detection** (`_formed_regions`, `_classify`): the opening's inner wire on
+  the host face is walked in order (`BRepTools_WireExplorer`). Each edge is
+  *attached* (to the region) or *cut* (to a thickness face); runs of each are
+  counted.
+  - A formed region (seeded, as for embosses) cut along one run that stays
+    within t of its chord (a straight slit or narrow slot) is a **louvre**
+    (Kieme); along two such runs, a **bridge** (Brücke).
+  - Without seeds, a region of planes and cylinders that hangs in an inner
+    wire of a plane face and touches nothing else is a **lance** (Lasche) if
+    held on one side: a tab bent out of an opening. If held on two sides it
+    is a **bridge** whose ramps are bent (its development would not close).
+  - Anything else (a formed lance with tori, cuts inside the region, cuts
+    that are not straight) → `FORMED_FEATURE`.
+- **Flat output:**
+  - louvre, bridge: as an emboss, the region is not developed. Its rim is a
+    marking (`Feature.outline`, layer `FORM`) and the inside is material.
+  - Each cut run is closed by the chord between its ends. With width, that is
+    a slot, cut as a hole: exact when the region's free edge is straight, as
+    it is in the flat. Without width, it is a cut line in `FlatPattern.slits`
+    (layer `INNER`); the fold model and the checks treat it as a cut.
+  - lance: the tab is developed like any flange (`Feature.bend_id`); the
+    opening around it is cut as it is.
+  - `Feature.holes` lists the holes each feature cuts (also pre-holes and
+    countersinks). `orientation_deg` is the direction of the slits or of the
+    lance's bend line, `size` the extent along and across it. DXF text:
+    `LOUVRE 20x10.5 A0 H5 TOP`.
+- **Checks:**
+  - their holes are judged with the feature, not as holes or narrow slots:
+    rim (a lance: its opening) to the outline ≥ 3t, to other bends ≥ 4t + r;
+  - a lance's flange is measured to its opening;
+  - lances are formed with the blank in a punching tool, not on the press
+    brake. Their bend gets no press-brake rules (flange to V, air radius,
+    tooling, tonnage, U channel), and the bend order treats them like hems
+    (made first, `BendPlan.unchecked`). Air-bending a tab inside a frame
+    would push the frame into the die, and the simulation shows exactly
+    that.
+- **Tests** (`tests/test_cut_forms.py`):
+  - a raised half pad open along its diameter (louvre, up and down);
+  - a strip raised by two joggles at each end (bridge);
+  - tabs bent 30° and 90° out of openings as long as their flat (lance);
+  - all slits 0.5 mm wide, round-tripped through STEP;
+  - flat areas exact to 1e-9; sizes, directions and heights as built;
+  - a synthetic slit without width through DXF, the fold model and the
+    checks.
+- **Not supported:** cuts inside a formed region, lances formed with
+  stretched (toroidal) ends, louvres whose slit is not straight. Real CAD
+  slits of zero width cannot form a valid solid where both sides start flat,
+  so models have a width there or touch only at a vertex.
 
 **Original plan:**
 
@@ -905,7 +955,7 @@ are a reasonable middle and are documented with their source.
 | `DFM_U_CHANNEL` | U with base < 2 × flange height, or flange taller than the punch clearance or gooseneck throat | — |
 | `DFM_TOOL_COLLISION` | collision with punch, die, clamp or beam in every order tried (§7.4) | — |
 | `DFM_TOOL_ANGLE` / `DFM_TOOL_LENGTH` | the bend's opening angle below the punch or die angle; bend longer than a tool (§7.5) | 2° overbend allowed |
-| `DFM_FORM_NEAR_BEND` / `DFM_FORM_NEAR_EDGE` | emboss or extruded-hole rim to the bend tangent line / to the outline | 4·t + r (CADEX: extruded holes 4t) / 3·t |
+| `DFM_FORM_NEAR_BEND` / `DFM_FORM_NEAR_EDGE` | rim of an emboss, extruded hole, louvre or bridge (a lance: its opening) to the bend tangent line / to the outline | 4·t + r (CADEX: extruded holes 4t) / 3·t |
 | `DFM_BEND_ANGLE` | angle beyond what the shop forms in one bend | 130° (SendCutSend), configurable |
 
 Every finding is a `Diagnostic` with severity `warning` (or `error` if the
@@ -956,8 +1006,8 @@ involved, so a UI can draw it.
     bends that dead-end are remembered (no subset is searched twice);
   - a node limit of 2000;
   - turning the part over is `BendStep.flip`;
-  - hems are pre-bent and closed with a hemming tool: they are made first
-    and not simulated.
+  - hems (pre-bent, closed with a hemming tool) and lances (formed in a
+    punching tool) are made first and not simulated.
 - **Output:**
   - a feasible order, or the longest feasible tail plus one `Collision`
     per bend that could not be placed (tool, angle reached, flange
