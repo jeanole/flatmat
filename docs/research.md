@@ -373,6 +373,7 @@ pythonocc-core LICENSE file itself; truck-stepio's robustness.
 | Dataset | Sheet metal? | Format | Licence |
 |---|---|---|---|
 | **BenDFM** ([paper](https://arxiv.org/html/2603.13102v1), [repo](https://github.com/UGent-CVAMO/bendfm), [Zenodo](https://zenodo.org/records/18622958)) | **yes** — 20 000 synthetic bent parts (BenDFM 14k + BenDFM-U 6k), train/val/test | per part: folded STEP, unfolded STEP, bend-sequence JSON, labels JSON; one 3.1 GB archive | data **GPL-3.0-or-later**, code MIT |
+|  ↳ details | made with PythonOCC (OCCT 7.7), true cylinders, mm. **K = 0.45 (ANSI) fixed**, not stored: back-computed from the bend strips of samples 0–5 (~30 bends at 30–90°, t 2.1–5.5 mm) and confirmed by the spike reproducing their flat areas. `<id>_sequence.json`: element 0 `{base_length, base_width, part_thickness}`, then per bend `bend_angle` (deflection), `bend_radius`, `bend_height`, `orientation`, ... `<id>.stp` ↔ `<id>_unfolded.stp` (XY plane, z from −t to 0; bend zones stay separate faces). Samples 0–5 are in `example_files/` of the repo; Zenodo has only the single 3.1 GB `data.tar.gz`. | | |
 | [ABC](https://deep-geometry.github.io/abc-dataset/) | no sheet metal subset found | STEP, Parasolid | model copyright stays with the Onshape creators |
 | [Fusion 360 Gallery](https://github.com/AutodeskAILab/Fusion360GalleryDataset/blob/master/LICENSE.md) | no | STEP | non-commercial research only, no redistribution |
 | [MFCAD](https://github.com/hducg/MFCAD) | no (machining features) | STEP + labels | MIT |
@@ -399,7 +400,7 @@ units BenDFM uses.
   - `BA = π·(R + K·T)·A / 180`
     ([SolidWorks](https://help.solidworks.com/2022/English/SolidWorks/sldworks/c_K_Factor.htm))
   - `OSSB = tan(A/2)·(R + T)`, `BD = 2·OSSB − BA` (textbook, from memory)
-- **DIN 6935:**
+- **DIN 6935** (resolved later, see the end of this section):
   - correction factor `k = 0.65 + 0.5·lg(r/s)`, range 0–2
     ([PTC Creo](https://support.ptc.com/help/creo/ced_modeling/r20.7.0.0/en/ced_modeling/OSDM_Modules/SheetMetal_adm_allow.html))
   - DIN measures in units of s/2, so **K_ANSI = k_DIN / 2**; CATIA's DIN
@@ -410,6 +411,26 @@ units BenDFM uses.
     - Compensation `v = π(180−β)/180·(r + k·s/2) − 2(r + s)` for β 0–90°.
     - For β 90–165° the last term is multiplied by `tan((180−β)/2)`.
     - v ≈ 0 for β 165–180°.
+- **DIN 6935, resolved** (from a near-verbatim English rendering of the
+  2011-10 text, [modulusmetal](https://www.modulusmetal.com/din-6935-cold-bending-of-flat-rolled-steel/),
+  formulas rebuilt and checked against all 7 of its worked examples to
+  0.01 mm, e.g. β = 90°, r = 6, s = 4 → v = −8.26):
+  - "For r : s > 5 … k = 1 applies" (continuous: 0.9995 at 5). Same in
+    Schlangen's PDF ("k = 1 wenn r ≥ 5·s oder α < 15°").
+  - **No lower clamp in the standard.** Table 5 starts at "r:s over 0.65 up
+    to 1 → 0.6"; then 1–1.5 → 0.7, 1.5–2.4 → 0.8, 2.4–3.8 → 0.9,
+    > 3.8 → 1.0. The formula reaches 0 at r/s ≈ 0.05. Clamping at k ≥ 0 is
+    a practitioner convention.
+  - With L = a + b + v (legs to the outer vertex, v normally negative):
+    - β 0–90°: `v = π(180°−β)/180°·(r + s/2·k) − 2(r + s)`
+    - β 90–165°: `v = π(180°−β)/180°·(r + s/2·k) − 2(r + s)·tan((180°−β)/2)`
+    - β 165–180°: v = 0
+  - Wikipedia, dewiki and cad.de use L = a + b − v (sign flipped) and start
+    the first range at 15°.
+  - β is the opening angle (Öffnungswinkel), α = 180° − β the bend angle
+    (Beiblatt 2 pairs 15° ↔ 165° … 180° ↔ 0°).
+  - K_ANSI = k_DIN / 2 (Wikipedia scale table, PTC; FreeCAD's
+    `_convert_to_ansi_kfactor` halves it).
 - **Typical K (ANSI convention, air bending):**
 
   | Source | Values |

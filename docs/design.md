@@ -1,7 +1,9 @@
 # flatmat — design
 
-Status: **design phase**. Nothing here is implemented yet. Everything marked
-*verify* has to be checked in the phase-0 spike before it is relied on.
+Status: **design phase, phase-0 spike done.** The spike
+([`spike/`](../spike/README.md)) runs §1 end to end on OCP 7.8 and 8.0. The
+results are folded into this document (marked *spike*). Anything still
+marked *verify* has not been checked yet.
 
 Research behind every decision below, with sources, is in
 [`research.md`](research.md).
@@ -64,12 +66,18 @@ Per edge (`TopExp.MapShapesAndAncestors(EDGE, FACE)`):
 
 - **Cylinder pairs:** axes parallel and within `tol.linear` of each other,
   overlapping axial spans (rules out counterbores), ΔR > tol → candidate ΔR,
-  weight = area.
-- **Plane pairs:** sample points inside the face (UV grid filtered with
-  `BRepTopAdaptor_FClass2d`), cast a ray against the normal
-  (`IntCurvesFace_ShapeIntersector`), the first hit on an antiparallel plane
-  gives a candidate distance weighted by area. No O(n²) booleans (the
-  shadow-solid approach build123d uses).
+  weight = area. Candidates are **bucketed by axis line** (canonical
+  direction + foot point, rounded). *Spike*: comparing all pairs was O(n²)
+  on the hole walls of perforated parts.
+- **Plane pairs, analytically:** for the largest skin planes, take a point
+  inside the face, its distance to each antiparallel plane of the other
+  skin, and test whether its foot lies inside that face. *Spike*: a ray cast
+  against the whole solid (`IntCurvesFace_ShapeIntersector`) was O(n²) on
+  perforated parts. No O(n²) booleans either (build123d's shadow solids).
+- **Point-in-face tests** use one `IntTools_FClass2d` built per face and
+  reused. *Spike*: `BRepClass_FaceClassifier` rebuilds per call (~9 ms on a
+  face with 1000 holes against 0.8 ms); `BRepTopAdaptor_FClass2d` no longer
+  exists in OCP 8.0.
 - `t` = weighted mode of the clustered candidates; `confidence` = share of
   skin area that agrees; < 0.95 → `VARIABLE_THICKNESS`. A user-given `t` is
   validated, not trusted.
@@ -166,9 +174,21 @@ matrices):
   - scalar;
   - `KTable` r/t → K, piecewise linear with bisection, clamped, warning
     `K_EXTRAPOLATED`;
-  - `KTable.din6935()`: `K = (0.65 + 0.5·lg(r/t)) / 2` for r/t < 5, else
-    0.5, clamped to [0, 0.5] (*verify* against the standard; only PTC and
-    CATIA documentation was available);
+  - `KTable.din6935()`: `K = k_DIN / 2` with `k_DIN = 0.65 + 0.5·lg(r/s)`.
+    **For r/s > 5 DIN sets k = 1** (K = 0.5); the switch is continuous
+    (0.9995 at 5).
+    - DIN 6935 does **not cover r/s ≤ 0.65**: its Table 5 starts at
+      "over 0.65". Below that flatmat clamps at k ≥ 0 and warns
+      `K_OUTSIDE_STANDARD`. The formula reaches 0 at r/s ≈ 0.05; the clamp
+      is a practitioner convention.
+    - The DIN compensation value `v` (legs dimensioned to the outer vertex,
+      β = opening angle = 180° − bend angle):
+      - β 0–90°: `v = π(180°−β)/180°·(r + s/2·k) − 2(r + s)`
+      - β 90–165°: `v = π(180°−β)/180°·(r + s/2·k) − 2(r + s)·tan((180°−β)/2)`
+      - β 165–180°: v = 0
+    - These were rebuilt from a near-verbatim English rendering of the
+      2011-10 text and match all 7 of its worked examples to 0.01 mm. Some
+      German sources flip the sign (`L = a + b − v`).
   - callable `k_for(bend, t) -> float` for material-, angle- or
     hem-dependent values.
 - Neutral fibre sits K·t from the **inside** skin. Measured from reference
@@ -324,12 +344,13 @@ matrix); ruff, mypy, pytest.
 
 ## 4. Order of work
 
-1. **Phase-0 spike**: check OCP API names on 7.8 and 8.0 (`_s` statics,
-   `TopExp.MapShapesAndAncestors_s`, `BRep_Tool.CurveOnSurface_s`,
-   `BRepTools.UVBounds_s`, `IntCurvesFace_ShapeIntersector`,
-   `ShapeUpgrade_UnifySameDomain` history, `GeomConvert_SurfToAnaSurf`,
-   `ShapeAnalysis_CanonicalRecognition`); build an L part from the generator
-   and unfold it end to end with timings.
+1. ~~**Phase-0 spike**~~ **done** ([`spike/README.md`](../spike/README.md)).
+   - 11 generated parts are exact to ≤ 3.5e-14.
+   - BenDFM samples 0–5 match their own unfolds to ≤ 2.9e-5 (limited by
+     sampling).
+   - OCP 7.8 and 8.0 give identical results.
+   - Typical parts take 10–90 ms including STEP read. 1000 holes take 1.5 s,
+     linear after six hotspot fixes.
 2. Repo skeleton: `pyproject.toml` (Apache-2.0), CI, ruff/mypy, fixture
    generator.
 3. `recognize` → `bendmodel` → `unfold` → `flat2d` → `export` → `cli`, each
@@ -519,21 +540,35 @@ read ─▶ (heal: full | fast | off) ─▶ validate ─▶ canonicalize ─▶
      swallow thin features.
    - Set `read.step.tessellated = 0`. Mesh-only faces mean
      `UNSUPPORTED_SURFACE`.
-2. **Healing modes**:
-   - `full` (default): the reader's built-in `FixShape`.
-   - `fast`:
-     - 7.9/8.0: `SetShapeProcessFlags(OperationsFlags())` (none), then
-       targeted fixes:
-       - `ShapeFix_Wire` without `FixSelfIntersection`
-       - `BRepLib::BuildPCurveForEdgeOnPlane` where pcurves are missing
-       - `SameParameter`
-     - On 7.8 there is no clean switch, so `fast` falls back to `full` and
-       a warning is emitted.
-   - `off`: debugging only.
-
-   The benchmark (§3) measures `full` against `fast` on perforated plates.
+2. **Healing modes** (*spike*, measured on an L with 1000 holes):
+   - **The reader's built-in healing runs `ShapeFix_Shell`, which is
+     quadratic in the face count:** 4.1 s of a 4.4 s transfer. Face- and
+     wire-level fixes on the same part take only ~130 ms.
+   - `fast` (default): the reader's `FixShape` with `FixShellMode = 0` and
+     `FixSolidMode = 0`; orientation is checked by us (volume > 0). Transfer
+     drops to **0.18 s (8.0) / 0.25 s (7.8)** and the solid stays valid.
+     - **OCP 8.0**: `reader.SetShapeFixParameters(map)` **after**
+       `ReadFile`, because the actor that stores the map only exists then.
+       Pass a complete key→value map: seed it with
+       `SetShapeFixParameters(DE_ShapeFixParameters())`, read it back,
+       `Bind` the overrides, set it again. The overload with "additional
+       parameters" does not override existing keys.
+       `SetShapeProcessFlags` cannot be called from Python, because
+       `std::bitset` is not bound.
+     - **OCP 7.8**: a resource file named `STEP` in a directory pointed to
+       by `$CSF_STEPDefaults`, set before the first read in the process,
+       with `FromSTEP.exec.op : FixShape` and the two modes at 0.
+   - `full`: the reader's default healing. On 7.8 that needs a process
+     without the resource override, so the worker pool keeps one 7.8
+     process per mode.
+   - Fallback: if any later stage fails on a `fast` import (outline not
+     closed, area identity broken), re-import with `full` once.
 3. **Validate**:
-   - `BRepCheck_Analyzer`: topology always, geometry in `full` mode.
+   - **No `BRepCheck_Analyzer` by default** (*spike*): on a face with 1000
+     holes it costs 1.3 s on 8.0 and **13 s** on 7.8, even topology-only.
+     It runs only as a diagnostic when a later stage fails, or with
+     `strict=True`. The self-checks (§1.5, §1.6) are cheaper and more to
+     the point.
    - `ShapeAnalysis_ShapeTolerance`: tolerance above 5 % of t means
      `DIRTY_TOLERANCE` (a warning, or an error if `strict`).
    - Volume above 0, otherwise `BRepLib::OrientClosedSolid`, then
@@ -694,16 +729,33 @@ involved, so a UI can draw it.
 - **Output:** a feasible order, or the bend that cannot be formed, with
   the reason.
 
+## OCP binding pitfalls (*spike*)
+
+- **Iterating an OCP shape list from Python costs ~0.3 ms per list** (7.8
+  and 8.0), about 1 s for the edge→face table of a 3000-edge part. Use
+  `First()`/`Last()`/`Size()`; an edge has at most two faces.
+- C++ `double&` out-parameters do not come back (e.g. `First`/`Last` of
+  `BRep_Tool.CurveOnSurface`). Use `BRepAdaptor_Curve2d`.
+- Cache one `BRepAdaptor_Surface` per face. Rebuilding it per edge made
+  edge classification take 9 s on a 1000-hole part.
+- 7.8 vs 8.0 names: maps and lists moved to `OCP.collections` with long
+  template names; `TopoDS.Face_s` became `TopoDS.Face`;
+  `BRepTopAdaptor_FClass2d` is gone. A ~20-line `_occ.py` shim covers it
+  (see `spike/occ_compat.py`).
+
 ## Open points
 
-- PyPI name `flatmat` free?
-- DIN 6935: the validity range of `k_DIN` (k = 1 for r/t > 5?) and the
-  exact compensation table (the standard is paywalled).
-- K-factor and units used by BenDFM; BenDFM label field names.
-- OCP 7.8 vs 8.0 API differences in practice. The stubs of both contain
-  `ShapeAnalysis_CanonicalRecognition`, `GeomConvert_SurfToAnaSurf` and
-  `GeomLib_IsPlanarSurface`; the runtime has not been imported yet.
-- Fast healing on 7.8: no clean switch found (7.9+ has
-  `SetShapeProcessFlags`).
-- Is OCCT 8.0's STEP reader thread-safe?
+- ~~PyPI name~~: `flatmat` is free (404 on 2026-10-11).
+- ~~DIN 6935 range~~: resolved (§1.7).
+- ~~BenDFM K~~: K = 0.45 (ANSI) for every bend checked, in mm, true
+  cylinders, made with PythonOCC. Confirmed by the spike reproducing their
+  flat areas.
+- ~~OCP 7.8 vs 8.0~~: resolved (see the pitfalls above and `spike/README.md`).
+- ~~Fast healing on 7.8~~: resolved via `$CSF_STEPDefaults` (§6.1).
+- Is OCCT 8.0's STEP reader thread-safe? (Irrelevant while we use one
+  process per part.)
 - Hem allowance and extruded-hole pre-hole tables: no open data found.
+- Real STEP exports from SolidWorks, Inventor, Fusion and Onshape have not
+  been tried yet. That is the next corpus to collect.
+- `ShapeUpgrade_UnifySameDomain` with `KeepShapes` and canonical recognition
+  are untested.

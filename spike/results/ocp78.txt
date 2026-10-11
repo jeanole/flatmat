@@ -1,0 +1,29 @@
+python 3.12.3  OCP 7.8.1.1  out=<scratch>
+== generated parts (K = 0.44), STEP round trip
+part             faces     t bends  area rel.err   identity  r/angle/dir  bspl err      ms
+L                   10  2.00     1       3.1e-15    0.0e+00           ok   0.0e+00    12.4
+L_down              10  2.00     1       3.1e-15    0.0e+00           ok   0.0e+00    11.7
+U                   14  1.50     2       3.4e-15    0.0e+00           ok   0.0e+00    26.6
+Z                   14  3.00     2       8.7e-15    2.4e-16           ok   0.0e+00    18.1
+hat                 22  1.00     4       4.1e-15    0.0e+00           ok   0.0e+00    28.4
+obtuse              10  2.00     1       1.3e-14    0.0e+00           ok   0.0e+00    11.1
+acute               10  2.00     1       3.5e-14    0.0e+00           ok   0.0e+00    11.1
+hem_open            10  1.00     1       5.0e-15    3.1e-16           ok   0.0e+00    11.1
+joggle              12  2.00     2       2.8e-14    2.7e-16           ok   0.0e+00    15.0
+L_holes             12  2.00     1       2.2e-05    2.2e-05           ok   0.0e+00    14.4
+L_hole_in_bend      11  2.00     1           n/a    6.1e-06           ok   2.7e-15    34.7
+== BenDFM samples (K = 0.45, their convention), area vs their unfolded STEP
+ id faces      t t json bends json        ours      theirs  rel.err      ms
+  0    86  5.522  5.522     7    7   166778.20   166783.09  2.9e-05   126.0
+  1    30  3.134  3.134     2    2    86573.71    86573.72  3.7e-08    52.1
+  2    30  2.078  2.078     2    2    79193.57    79193.57  1.5e-09    39.3
+  3    62  3.254  3.254     7    7   150745.99   150745.91  5.2e-07    66.3
+  4    70  3.829  3.829     8    8   154873.66   154875.48  1.2e-05    72.1
+  5    62  5.166  5.166     7    7   182893.64   182895.18  8.4e-06    67.2
+== scaling: L bracket with N holes in the long flange
+ holes  faces     read    tables  classify     skins thickness     bends     place   outline bendlines    total
+     0     10      7.4       2.6       1.1       0.0       0.6       0.0       0.2       0.4       1.8     14.1
+    10     20     25.4       5.9       1.2       0.0       1.8       0.0       0.1       2.1       1.7     38.3
+   100    110    140.1      56.9      11.6       0.2      13.0       0.0       0.1      20.8       2.6    245.5
+   400    410    552.2     278.4      40.1       0.9      79.8       0.1       0.2     137.4       9.2   1098.5
+  1000   1010   1245.9     432.5      71.5       1.3     106.9       0.1       0.2     263.7      12.8   2134.8

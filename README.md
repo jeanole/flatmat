@@ -21,7 +21,16 @@ diagnostic that names the faces involved, never silently unfolded wrong.
 
 ## Status
 
-**Design phase — there is no code yet.**
+**Design phase.** There is no library code yet, only a phase-0 spike that
+runs the core algorithm end to end and checks it:
+
+- 11 generated parts come out exact to ≤ 3.5e-14.
+- The BenDFM samples match their own unfolds.
+- OCP 7.8 and 8.0 give identical results.
+- Typical parts take 10–90 ms; a part with 1000 holes takes 1.5 s, and the
+  time grows linearly.
+
+See [`spike/README.md`](spike/README.md).
 
 - [`docs/design.md`](docs/design.md): algorithm, API and data model, test and
   benchmark plan, scope per version.
