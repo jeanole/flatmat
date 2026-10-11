@@ -425,7 +425,46 @@ This replaces any global "inner skin" assumption in §1.3 and §1.7.
   R ≈ t plus a t-high step face) give `HEM_MERGED` (error). An opt-in
   reconstruction splits the 2t block at its mid-plane (v0.2+).
 
-### 5.3 Sharp bends (v0.2)
+### 5.3 Sharp bends (implemented)
+
+**As built:**
+
+- The thickness is estimated **before** the skins are known
+  (`_plane_partners`): planes are bucketed by normal, and each plane gets as
+  partner the nearest antiparallel plane *behind* it whose face contains the
+  foot of an inner point. A sharp bend splits a skin into separate smooth
+  components, so the skins can only be found after the sharp bends.
+- A sharp-bend edge is a straight, non-tangent edge between two partnered
+  planes whose partners either meet at a sharp edge (sharp on both sides) or
+  touch a common cylinder of radius ≈ t (sharp inside, round outside). Skins
+  are the components over smooth edges *and* sharp-bend edges.
+- Placement across a sharp edge moves the child face perpendicular to the
+  edge by `Δ = BA(r) − 2·s·tan(φ/2)`. Here `s = r` if the reference skin is
+  the inside of the corner and `s = r + t` if it is the outside, with
+  `r = sharp_radius` (default 0, which raises the warning
+  `SHARP_BEND_ASSUMED_RADIUS`).
+- The outline is closed at the two vertices of the edge (`_close`):
+  - for `Δ ≥ 0`, a bridging line;
+  - for `Δ < 0`, both outline lines are trimmed to their intersection (or
+    joined if collinear);
+  - anything other than straight lines there gives `SHARP_BEND_UNSUPPORTED`.
+
+  Any other gap in the outline is now an error (`OUTLINE_OPEN`).
+- **Sharp inside, round outside, with the reference skin outside:** the
+  cylinder carries the corner. Its neutral radius is
+  `(BA(r) − 2·r·tan(φ/2)) / φ`, so a `sharp_radius` applies there too.
+- Bend lines lie in the middle of the inserted strip. The bend table reports
+  the radius actually used.
+- Tests:
+  - 7 generated parts (L, U, Z, obtuse, mixed; sharp inside or on both
+    sides) exact to 1e-9;
+  - random profiles that mix round, sharp-inside and sharp-both bends;
+  - the bend-line position and the `sharp_radius` formula.
+- **A bug found on the way:** canonicalising a direction's sign *before*
+  rounding let −1e-17 noise split parallel planes into different buckets.
+  Now it rounds first (`_canonical_dir`).
+
+**Original plan:**
 
 Classify each straight concave edge E between two skin faces A and B that
 have thickness partners. Cut-out corner edges of length ≈ t between
@@ -444,7 +483,28 @@ the outer virtual-sharp line L.
 - Collinear split edges are grouped into one bend. Sharp hems are handled
   as hems.
 
-### 5.4 Holes, countersinks, formed features (detection v0.2, flat output per type)
+### 5.4 Holes, countersinks, formed features
+
+**Countersinks and counterbores: implemented.**
+
+- **Detection:** non-skin faces are grouped over *all* edges. A group of
+  coaxial cylinders, cones and annular planes that touches both skins is a
+  hole feature:
+  - with a cone → countersink (included angle from the cone);
+  - with two or more cylinder radii → counterbore (depth from the large
+    circles).
+- **Flat output:** the through (smallest) circle is cut. Where the large rim
+  is on the reference skin, its loop is replaced by the through circle
+  (`COUNTERSINK_PROJECTED` for countersinks).
+- **Reporting:** the feature appears in `FlatPattern.features` with its flat
+  centre, in the bend table (`features`) and as DXF text (`CSK 90° Ø10 TOP`).
+- **Unchanged:** groups that are not hole features still go through the
+  per-component rule, so a chamfered outer edge is still `EDGE_FEATURE`.
+
+Formed features (louvres, embosses, extruded holes): still to do, as
+planned below.
+
+**Original plan:**
 
 For each inner wire of a planar skin face, classify the faces across its
 edges:

@@ -13,19 +13,24 @@ import flatmat as fm
 def profiles(draw):
     n = draw(st.integers(1, 4))
     t = draw(st.sampled_from([0.8, 1.0, 1.5, 2.0, 3.0, 5.0]))
-    bends = []
-    for _ in range(n):
-        ang = draw(st.floats(15, 165)) * draw(st.sampled_from([1, -1]))
-        r = draw(st.floats(0.5, 8.0))
+    bends, sharp_outer = [], []
+    for i in range(n):
+        kind = draw(st.sampled_from(["round", "round", "sharp_in", "sharp_both"]))
+        # a sharp outer corner sits t·tan(φ/2) beyond the inner one: keep it inside the flats
+        ang = draw(st.floats(15, 120 if kind == "sharp_both" else 165)) * draw(st.sampled_from([1, -1]))
+        r = 0.0 if kind != "round" else draw(st.floats(0.5, 8.0))
+        if kind == "sharp_both":
+            sharp_outer.append(i)
         bends.append((round(ang, 3), round(r, 3)))
-    # flats long enough that neighbouring flanges cannot collide in the folded part
-    flats = [round(draw(st.floats(20, 60)), 3) for _ in range(n + 1)]
+    # flats long enough that neighbouring flanges cannot collide in the folded part, and
+    # longer than the outer setback t·tan(φ/2) of a sharp corner
+    flats = [round(draw(st.floats(30, 60)), 3) for _ in range(n + 1)]
     width = round(draw(st.floats(10, 200)), 3)
     k = draw(st.floats(0.25, 0.5))
-    return Part("prop", t, width, flats, bends), k
+    return Part("prop", t, width, flats, bends, sharp_outer=tuple(sharp_outer)), k
 
 
-@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(profiles())
 def test_random_profiles_unfold_exactly(case):
     part, k = case

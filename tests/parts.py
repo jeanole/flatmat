@@ -7,6 +7,14 @@ segments have the same length on both skins, which makes the expected flat
 length exact:
 
     flat_length = sum(flats) + sum(|theta| * (r + K * t))
+
+A bend with r = 0 has a sharp inner corner and an outer radius t; listing its
+index in ``sharp_outer`` makes the outer corner sharp too. The flat length is the
+same formula with r = 0 (inner legs plus the neutral fibre through the corner).
+
+``features`` adds countersinks and counterbores to flats:
+("csk", flat, frac, z, d_through, d_top, side) with a 90° cone, or
+("cbore", flat, frac, z, d_through, d_bore, side, depth); side +1 = left skin.
 """
 
 from __future__ import annotations
@@ -16,7 +24,7 @@ from dataclasses import dataclass, field
 
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
-from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeCone, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism
 from OCP.GC import GC_MakeArcOfCircle, GC_MakeSegment
 from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt, gp_Vec
 from OCP.IFSelect import IFSelect_RetDone
@@ -34,6 +42,8 @@ class Part:
     bends: list[tuple[float, float]]  # (signed angle in degrees, inner radius)
     holes: list[tuple[str, int, float, float, float]] = field(default_factory=list)
     # ("flat", index, fraction along, z, diameter) or ("bend", index, 0.5, z, diameter)
+    sharp_outer: tuple[int, ...] = ()
+    features: list[tuple] = field(default_factory=list)
 
     def flat_length(self, k: float) -> float:
         return sum(self.flats) + sum(math.radians(abs(a)) * (r + k * self.t) for a, r in self.bends)
@@ -76,12 +86,32 @@ def _profile(part: Part):
 
             r_left = rc - s * t / 2
             r_right = rc + s * t / 2
-            for side, rad in ((left, r_left), (right, r_right)):
-                side.append(("arc", on_arc(0, rad), on_arc(th / 2, rad), on_arc(th, rad)))
+            for side_list, rad, outer in ((left, r_left, s < 0), (right, r_right, s > 0)):
+                if rad < 1e-12:
+                    continue  # sharp inner corner: the neighbouring lines meet at the centre
+                if outer and i in part.sharp_outer:
+                    side_list.append(("corner",))
+                else:
+                    side_list.append(("arc", on_arc(0, rad), on_arc(th / 2, rad), on_arc(th, rad)))
             anchors[("bend", i)] = (c, h, th, rc, s)
             p = on_arc(th, rc)
             h += th
-    return left, right, anchors
+    return _corners(left), _corners(right), anchors
+
+
+def _corners(side):
+    """Replace ("corner",) markers by extending the neighbouring lines to their intersection."""
+    out = list(side)
+    while any(e[0] == "corner" for e in out):
+        k = next(i for i, e in enumerate(out) if e[0] == "corner")
+        (_, a0, a1), (_, b0, b1) = out[k - 1], out[k + 1]
+        d1 = (a1[0] - a0[0], a1[1] - a0[1])
+        d2 = (b1[0] - b0[0], b1[1] - b0[1])
+        den = d1[0] * d2[1] - d1[1] * d2[0]
+        u = ((b0[0] - a0[0]) * d2[1] - (b0[1] - a0[1]) * d2[0]) / den
+        x = (a0[0] + u * d1[0], a0[1] + u * d1[1])
+        out[k - 1 : k + 2] = [("line", a0, x), ("line", x, b1)]
+    return out
 
 
 def _p3(xy, z=0.0):
@@ -96,6 +126,7 @@ def make_solid(part: Part):
     edges.append(_edge("line", [left[-1][-1], right[-1][-1]]))
     for kind, *pts in reversed(right):
         edges.append(_edge(kind, list(reversed(pts))))
+    # a sharp inner corner leaves two lines meeting without an arc: nothing to add
     edges.append(_edge("line", [right[0][1], left[0][1]]))
     wire = BRepBuilderAPI_MakeWire()
     for e in edges:
@@ -103,8 +134,23 @@ def make_solid(part: Part):
     face = BRepBuilderAPI_MakeFace(wire.Wire()).Face()
     solid = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, part.width)).Shape()
 
-    if part.holes:
+    if part.holes or part.features:
         tools = TopTools_ListOfShape()
+        for kind, idx, frac, z, d, big, side, *rest in part.features:
+            p0, h, length = anchors[("flat", idx)]
+            c = (p0[0] + frac * length * math.cos(h), p0[1] + frac * length * math.sin(h))
+            n = (-math.sin(h), math.cos(h))
+            eps = 0.05
+            top = gp_Pnt(c[0] + side * n[0] * (part.t / 2 + eps), c[1] + side * n[1] * (part.t / 2 + eps), z)
+            down = gp_Dir(-side * n[0], -side * n[1], 0)
+            if kind == "csk":  # 90° included angle: the radius shrinks by 1 per unit depth
+                tools.Append(
+                    BRepPrimAPI_MakeCone(gp_Ax2(top, down), big / 2 + eps, d / 2, big / 2 + eps - d / 2).Shape()
+                )
+            else:
+                tools.Append(BRepPrimAPI_MakeCylinder(gp_Ax2(top, down), big / 2, rest[0] + eps).Shape())
+            base = gp_Pnt(c[0] - n[0] * 5 * part.t, c[1] - n[1] * 5 * part.t, z)
+            tools.Append(BRepPrimAPI_MakeCylinder(gp_Ax2(base, gp_Dir(n[0], n[1], 0)), d / 2, 10 * part.t).Shape())
         for kind, idx, frac, z, d in part.holes:
             if kind == "flat":
                 p0, h, length = anchors[("flat", idx)]
@@ -139,6 +185,39 @@ def write_step(shape, path: str) -> None:
     w.Transfer(shape, STEPControl_AsIs)
     if w.Write(path) != IFSelect_RetDone:
         raise RuntimeError(f"STEP write failed: {path}")
+
+
+def sharp_cases() -> list[Part]:
+    return [
+        Part("sharp_in_L", t=2.0, width=80, flats=[50, 40], bends=[(90, 0.0)]),
+        Part("sharp_both_L", t=2.0, width=80, flats=[50, 40], bends=[(90, 0.0)], sharp_outer=(0,)),
+        Part("sharp_both_U", t=1.5, width=60, flats=[30, 50, 30], bends=[(90, 0.0), (90, 0.0)], sharp_outer=(0, 1)),
+        Part("sharp_both_Z", t=3.0, width=70, flats=[40, 30, 40], bends=[(90, 0.0), (-90, 0.0)], sharp_outer=(0, 1)),
+        Part("sharp_in_Z", t=3.0, width=70, flats=[40, 30, 40], bends=[(90, 0.0), (-90, 0.0)]),
+        Part("sharp_both_obtuse", t=2.0, width=50, flats=[40, 40], bends=[(120, 0.0)], sharp_outer=(0,)),
+        Part("sharp_mixed", t=2.0, width=60, flats=[40, 30, 40], bends=[(90, 0.0), (90, 2.0)], sharp_outer=(0,)),
+    ]
+
+
+def feature_cases() -> list[Part]:
+    return [
+        Part(
+            "csk_L",
+            t=3.0,
+            width=80,
+            flats=[60, 40],
+            bends=[(90, 2.0)],
+            features=[("csk", 0, 0.4, 20.0, 6.0, 10.0, +1), ("csk", 0, 0.4, 60.0, 6.0, 10.0, -1)],
+        ),
+        Part(
+            "cbore_L",
+            t=4.0,
+            width=80,
+            flats=[60, 40],
+            bends=[(90, 2.0)],
+            features=[("cbore", 0, 0.4, 20.0, 5.0, 9.0, +1, 2.0), ("cbore", 1, 0.5, 60.0, 5.0, 9.0, -1, 2.0)],
+        ),
+    ]
 
 
 def cases() -> list[Part]:

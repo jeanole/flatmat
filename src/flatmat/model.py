@@ -207,10 +207,13 @@ class FaceInfo:
 
 @dataclass(frozen=True)
 class BendSegment:
-    face_id: int
+    """One face (or, for a sharp bend, one edge) of a bend."""
+
+    face_id: int  # 0 for a sharp bend
     length: float
     axis_point: tuple[float, float, float]
     axis_dir: tuple[float, float, float]
+    edge_id: int | None = None  # the sharp edge, for sharp bends
 
 
 @dataclass(frozen=True)
@@ -220,7 +223,7 @@ class Bend:
     r_in: float
     angle_deg: float
     direction: Literal["up", "down"]
-    kind: Literal["bend", "hem"]
+    kind: Literal["bend", "hem", "sharp"]
     flanges: tuple[int, ...] = ()
     # filled by unfold()
     k: float | None = None
@@ -241,6 +244,25 @@ class Flange:
 
 
 @dataclass(frozen=True)
+class Feature:
+    """A hole feature the flat pattern cannot show: countersink or counterbore.
+
+    The flat pattern cuts the through diameter; the feature is reported here (and in
+    the bend table / DXF annotations) for the process that makes it.
+    """
+
+    id: int
+    kind: Literal["countersink", "counterbore"]
+    through_diameter: float
+    outer_diameter: float
+    side: Literal["top", "bottom"]  # top = the reference skin, facing the viewer of the flat
+    angle_deg: float | None = None  # countersink included angle
+    depth: float | None = None  # counterbore depth
+    face_ids: tuple[int, ...] = ()
+    center: tuple[float, float] | None = None  # in the flat pattern, set by unfold()
+
+
+@dataclass(frozen=True)
 class SheetPart:
     thickness: float
     thickness_confidence: float
@@ -250,6 +272,7 @@ class SheetPart:
     reference_root: int
     diagnostics: tuple[Diagnostic, ...] = ()
     source: str = ""
+    features: tuple[Feature, ...] = ()
     # internal: the recognition context unfold() works on (OCP objects); not public API
     _ctx: Any = field(default=None, repr=False, compare=False)
 
@@ -271,7 +294,7 @@ class BendLine:
     direction: Literal["up", "down"]
     angle_deg: float
     r_in: float
-    kind: Literal["bend", "hem"] = "bend"
+    kind: Literal["bend", "hem", "sharp"] = "bend"
 
 
 @dataclass(frozen=True)
@@ -285,6 +308,7 @@ class FlatPattern:
     area: float
     diagnostics: tuple[Diagnostic, ...] = ()
     meta: dict = field(default_factory=dict)
+    features: tuple[Feature, ...] = ()
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:

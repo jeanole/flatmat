@@ -14,14 +14,15 @@ from .bendmodel import KDin6935, KScalar, KTable, bend_allowance, bend_deduction
 from .diagnostics import Code, Diagnostic, FlatmatError, Severity
 from .export import LayerMap, bend_table, write_bend_table, write_dxf, write_svg
 from .io import StepModel, load_step
-from .model import Arc, Bend, BendLine, FlatPattern, Line, Loop2D, SheetPart, Spline, Tolerances
+from .model import Arc, Bend, BendLine, Feature, FlatPattern, Line, Loop2D, SheetPart, Spline, Tolerances
 from .recognize import recognize
 from .unfold import unfold
 
 
-def unfold_step(path, k=0.44, *, heal="fast", solid=None, thickness=None, tol=None) -> FlatPattern:
+def unfold_step(path, k=0.44, *, heal="fast", solid=None, thickness=None, tol=None, sharp_radius=0.0) -> FlatPattern:
     """Read, recognise and unfold in one call."""
-    return unfold(recognize(load_step(path, heal=heal), solid=solid, thickness=thickness, tol=tol), k=k)
+    sheet = recognize(load_step(path, heal=heal), solid=solid, thickness=thickness, tol=tol)
+    return unfold(sheet, k=k, sharp_radius=sharp_radius)
 
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "BendLine",
     "Code",
     "Diagnostic",
+    "Feature",
     "FlatPattern",
     "FlatmatError",
     "KDin6935",

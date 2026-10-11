@@ -23,7 +23,7 @@ from shapely.validation import explain_validity
 
 from ._occ import OCP_VERSION, as_vertex
 from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
-from .diagnostics import Code, Diagnostic, refuse
+from .diagnostics import Code, Diagnostic, refuse, warn
 from .model import Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
 from .recognize import Context, _Face, pcurve
 
@@ -72,11 +72,14 @@ def _vertex_uv(v, e, f) -> tuple[float, float]:
     return p.X(), p.Y()
 
 
-def unfold(sheet: SheetPart, k=0.44, *, check_overlap: bool = True) -> FlatPattern:
+def unfold(sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap: bool = True) -> FlatPattern:
     """Develop the recognised sheet into a flat pattern with bend lines.
 
     ``k`` is a K-factor (float), a :class:`~flatmat.bendmodel.KTable`,
     ``KTable.din6935()`` or a callable ``(r_in, t, angle_rad) -> K``.
+
+    ``sharp_radius`` is the inner radius the shop actually gets where the model has a
+    sharp bend (r = 0), e.g. from the die: air bending gives ~16 % of V on mild steel.
     """
     ctx: Context = sheet._ctx  # type: ignore[assignment]
     if ctx is None:
@@ -86,31 +89,57 @@ def unfold(sheet: SheetPart, k=0.44, *, check_overlap: bool = True) -> FlatPatte
     faces = ctx.faces
     diags: list[Diagnostic] = list(sheet.diagnostics)
 
-    # neutral radius per bend face, from its own convexity (joggles: design §5.1)
+    # K per bend; a sharp bend (r = 0 in the model) is made with sharp_radius
     k_of_bend: dict[int, float] = {}
+    r_of_bend: dict[int, float] = {}
     for b in sheet.bends:
-        kk, d = kmodel(b.r_in, t, math.radians(b.angle_deg))
-        k_of_bend[b.id] = kk
+        r = sharp_radius if b.kind == "sharp" else b.r_in
+        kk, d = kmodel(r, t, math.radians(b.angle_deg))
+        k_of_bend[b.id], r_of_bend[b.id] = kk, r
         if d is not None:
             diags.append(d)
+    if sharp_radius == 0.0 and any(b.kind == "sharp" for b in sheet.bends):
+        diags.append(warn(Code.SHARP_BEND_ASSUMED_RADIUS, "sharp bends developed with inner radius 0"))
+
+    def sharp_delta(bend_id: int, angle: float, concave: bool) -> float:
+        """Strip width between the two faces of a sharp corner (negative: overlap).
+
+        The faces of the reference skin run to the virtual sharp. A real bend of radius r
+        has BA between tangent points that sit r·tan(φ/2) (reference skin inside) or
+        (r + t)·tan(φ/2) (outside) back from that sharp.
+        """
+        r = r_of_bend[bend_id]
+        setback = (r if concave else r + t) * math.tan(angle / 2)
+        return bend_allowance(angle, r, t, k_of_bend[bend_id]) - 2 * setback
+
+    # neutral radius per bend face, from its own convexity (joggles: design §5.1)
     devs: dict[int, _Dev] = {}
     for i in ctx.skin_a:
         bf = ctx.bend_faces.get(i)
         rn = None
         if bf is not None:
-            rn = bf.r_in + k_of_bend[bf.bend_id] * t
+            if bf.r_in == 0.0:
+                # sharp inside, round (R = t) outside, reference skin outside: the flanges end
+                # at the cylinder's tangent lines, which sit on the inner sharp, so the
+                # cylinder carries the inside-sharp strip BA(r) - 2·r·tan(φ/2)
+                rn = sharp_delta(bf.bend_id, bf.angle, True) / bf.angle
+            else:
+                rn = bf.r_in + k_of_bend[bf.bend_id] * t
         devs[i] = _Dev(faces[i - 1], rn)
+    shifts = {ei: sharp_delta(se.bend_id, se.angle, se.concave) for ei, se in ctx.sharp_edges.items()}
 
-    place = _place(ctx, devs)
-    outer, holes = _outline(ctx, devs, place)
+    place, sharp_geo = _place(ctx, devs, shifts)
+    sharp_v = {v: shifts[ei] for ei, se in ctx.sharp_edges.items() for v in se.vertices}
+    outer, holes, feature_centers = _outline(ctx, devs, place, sharp_v, diags)
 
     # self-checks
     area = outer.area() - sum(-h.area() for h in holes)
     expected = 0.0
     for i in ctx.skin_a:
         f = faces[i - 1]
-        bf = ctx.bend_faces.get(i)
-        expected += f.area * ((bf.r_in + k_of_bend[bf.bend_id] * t) / f.radius if bf else 1.0)
+        expected += f.area * (devs[i].s / f.radius if i in ctx.bend_faces else 1.0)
+    expected += sum(shifts[ei] * se.length for ei, se in ctx.sharp_edges.items())
+    expected += sum(extra for _, extra in feature_centers.values())  # rims replaced by through holes
     rel = abs(area - expected) / expected
     if rel > ctx.tol.area_rel:
         raise refuse(Code.AREA_MISMATCH, f"flat area {area:.4f} vs developed {expected:.4f}", rel_err=rel)
@@ -123,21 +152,28 @@ def unfold(sheet: SheetPart, k=0.44, *, check_overlap: bool = True) -> FlatPatte
     lines: list[BendLine] = []
     bends = []
     for b in sheet.bends:
-        kk = k_of_bend[b.id]
+        kk, r = k_of_bend[b.id], r_of_bend[b.id]
         rad = math.radians(b.angle_deg)
         bends.append(
             _with(
                 b,
+                r_in=r,  # for a sharp bend: the radius it is made with
                 k=kk,
-                ba=bend_allowance(rad, b.r_in, t, kk),
-                bd=bend_deduction(rad, b.r_in, t, kk),
-                ossb=outside_setback(rad, b.r_in, t),
+                ba=bend_allowance(rad, r, t, kk),
+                bd=bend_deduction(rad, r, t, kk),
+                ossb=outside_setback(rad, r, t),
             )
         )
         for seg in b.segments:
+            if seg.edge_id is not None:  # sharp bend: the middle of the inserted strip
+                a1, a2, n, d = sharp_geo[seg.edge_id]
+                h = d / 2
+                p0, p1 = (a1[0] + h * n[0], a1[1] + h * n[1]), (a2[0] + h * n[0], a2[1] + h * n[1])
+                lines.append(BendLine(b.id, 0, p0, p1, b.direction, b.angle_deg, r, b.kind))
+                continue
             f = faces[seg.face_id - 1]
             for p0, p1 in _bend_line(f, devs[seg.face_id], place[seg.face_id]):
-                lines.append(BendLine(b.id, seg.face_id, p0, p1, b.direction, b.angle_deg, b.r_in, b.kind))
+                lines.append(BendLine(b.id, seg.face_id, p0, p1, b.direction, b.angle_deg, r, b.kind))
 
     # normalise: bbox minimum at the origin
     pts = outer.polyline(0.01)
@@ -146,6 +182,10 @@ def unfold(sheet: SheetPart, k=0.44, *, check_overlap: bool = True) -> FlatPatte
     outer = _move_loop(outer, shift)
     holes = [_move_loop(h, shift) for h in holes]
     lines = [_with(bl, p0=_apply(shift, bl.p0), p1=_apply(shift, bl.p1)) for bl in lines]
+    features = tuple(
+        _with(f, center=_apply(shift, feature_centers[f.id][0]) if f.id in feature_centers else None)
+        for f in sheet.features
+    )
 
     return FlatPattern(
         outer=outer,
@@ -156,7 +196,8 @@ def unfold(sheet: SheetPart, k=0.44, *, check_overlap: bool = True) -> FlatPatte
         k_model=kmodel.describe(),
         area=area,
         diagnostics=tuple(diags),
-        meta={"source": sheet.source, "ocp": OCP_VERSION, "area_rel_err": rel},
+        meta={"source": sheet.source, "ocp": OCP_VERSION, "area_rel_err": rel, "sharp_radius": sharp_radius},
+        features=features,
     )
 
 
@@ -169,9 +210,21 @@ def _with(obj, **kw):
 # ------------------------------------------------------------------------------ placement
 
 
-def _place(ctx: Context, devs: dict[int, _Dev]) -> dict[int, Rigid]:
+def _inner_uv(f: _Face) -> tuple[float, float]:
+    u0, u1, v0, v1 = f.uv
+    for su in (0.5, 0.25, 0.75, 0.1, 0.9):
+        for sv in (0.5, 0.25, 0.75, 0.1, 0.9):
+            u, v = u0 + su * (u1 - u0), v0 + sv * (v1 - v0)
+            if f.inside(u, v):
+                return u, v
+    return 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+
+
+def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
+    """Rigid placement of every reference-skin face; a sharp edge inserts a strip of shifts[ei]."""
     faces, edges = ctx.faces, ctx.edges
     place = {ctx.root: _IDENTITY}
+    sharp_geo: dict[int, tuple[Point, Point, Point, float]] = {}
     q = deque([ctx.root])
     seen = set()
     worst = 0.0
@@ -196,6 +249,16 @@ def _place(ctx: Context, devs: dict[int, _Dev]) -> dict[int, Rigid]:
                     edges=(ei,),
                 )
             Tc = _rigid(a1, a2, b1, b2)
+            if ei in shifts:
+                # move C away from P, perpendicular to the edge, by the strip width
+                L = math.dist(a1, a2)
+                n = (-(a2[1] - a1[1]) / L, (a2[0] - a1[0]) / L)
+                qc = _apply(Tc, devs[c](*_inner_uv(faces[c - 1])))
+                if (qc[0] - a1[0]) * n[0] + (qc[1] - a1[1]) * n[1] < 0:
+                    n = (-n[0], -n[1])
+                d = shifts[ei]
+                Tc = (Tc[0], Tc[1], Tc[2] + d * n[0], Tc[3] + d * n[1])
+                sharp_geo[ei] = (a1, a2, n, d)
             if c in place:
                 worst = max(worst, *(math.dist(_apply(place[c], b), _apply(Tc, b)) for b in (b1, b2)))
                 if worst > ctx.tol.flat:
@@ -212,7 +275,7 @@ def _place(ctx: Context, devs: dict[int, _Dev]) -> dict[int, Rigid]:
     if len(place) != len(ctx.skin_a):
         missing = sorted(ctx.skin_a - set(place))
         raise refuse(Code.DEVELOP_FAILED, "part of the skin is not connected to the root", faces=missing)
-    return place
+    return place, sharp_geo
 
 
 # ------------------------------------------------------------------------------ outline
@@ -276,8 +339,10 @@ def _circle_ccw(m, c2, a, b, cen) -> bool:
     return cross > 0
 
 
-def _outline(ctx: Context, devs: dict[int, _Dev], place: dict[int, Rigid]) -> tuple[Loop2D, list[Loop2D]]:
+def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list):
     faces = ctx.faces
+    feature_of_face = {i: fid for fid, fs in ctx.features.items() for i in fs}
+    feature_of_edge: dict[int, int] = {}
     pieces = []  # (v_start, v_end, segment)
     for ei, (e, fi) in enumerate(ctx.edges):
         inside = [i for i in fi if i in ctx.skin_a]
@@ -287,6 +352,9 @@ def _outline(ctx: Context, devs: dict[int, _Dev], place: dict[int, Rigid]) -> tu
         f = faces[i - 1]
         if BRep_Tool.IsClosed_s(e, f.shape):
             continue  # seam
+        other = [j for j in fi if j != i]
+        if other and other[0] in feature_of_face:
+            feature_of_edge[ei] = feature_of_face[other[0]]
         seg = _edge_segment(e, ei, f, devs[i], place[i])
         vs = _vertices(e)
         va, vb = ctx.vmap.FindIndex(vs[0]), ctx.vmap.FindIndex(vs[-1])
@@ -294,16 +362,41 @@ def _outline(ctx: Context, devs: dict[int, _Dev], place: dict[int, Rigid]) -> tu
         if va != vb and math.dist(seg.start, pa) > math.dist(seg.end, pa):
             seg = seg.reversed()
         pieces.append((va, vb, seg))
-    loops = [_merge_collinear(L) for L in _chain(pieces)]
+    loops = [_merge_collinear(_close(segs, jv, sharp_v, ctx.tol.flat)) for segs, jv in _chain(pieces)]
+
+    # hole features: report the centre; where the large rim is on the reference skin,
+    # cut the through hole instead (the countersink / counterbore is made afterwards)
+    centers: dict[int, tuple[Point, float]] = {}
+    out = []
+    for L in loops:
+        fids = {feature_of_edge.get(s.source_edge) for s in L.segments}
+        fid = next(iter(fids)) if len(fids) == 1 else None
+        if fid is None:
+            out.append(L)
+            continue
+        if len(L.segments) != 1 or not isinstance(L.segments[0], Arc) or not L.segments[0].is_circle:
+            diags.append(warn(Code.FEATURE_NOT_CIRCULAR, "a hole feature is not a circle in the flat; kept as is"))
+            out.append(L)
+            continue
+        arc = L.segments[0]
+        if ctx.feature_on_a.get(fid):
+            r = ctx.feature_through_r[fid]
+            centers[fid] = (arc.center, math.pi * (arc.radius**2 - r**2))
+            out.append(Loop2D((Arc(arc.center, r, arc.a0, arc.a1, arc.ccw, arc.source_edge),)))
+        else:
+            centers[fid] = (arc.center, 0.0)
+            out.append(L)
+    loops = out
     loops.sort(key=lambda L: -abs(L.area()))
     outer, holes = loops[0], loops[1:]
     if outer.area() < 0:
         outer = _reverse_loop(outer)
     holes = [_reverse_loop(h) if h.area() > 0 else h for h in holes]
-    return outer, holes
+    return outer, holes, centers
 
 
-def _chain(pieces) -> list[Loop2D]:
+def _chain(pieces) -> list[tuple[list, list[int]]]:
+    """Chain pieces into loops by vertex identity: (segments, vertex at the start of each)."""
     by_v = defaultdict(list)
     for n, (a, b, _) in enumerate(pieces):
         by_v[a].append(n)
@@ -315,7 +408,7 @@ def _chain(pieces) -> list[Loop2D]:
             continue
         a, b, seg = pieces[start]
         used.add(start)
-        segs = [seg]
+        segs, jv = [seg], [a]
         cur = b
         while cur != a:
             nxt = next((n for n in by_v[cur] if n not in used), None)
@@ -323,14 +416,72 @@ def _chain(pieces) -> list[Loop2D]:
                 raise refuse(Code.OUTLINE_OPEN, "the flat outline does not close", edges=(seg.source_edge,))
             used.add(nxt)
             na, nb, s = pieces[nxt]
+            jv.append(cur)
             if na == cur:
                 segs.append(s)
                 cur = nb
             else:
                 segs.append(s.reversed())
                 cur = na
-        loops.append(Loop2D(tuple(segs)))
+        loops.append((segs, jv))
     return loops
+
+
+def _close(segs: list, jv: list[int], sharp_v: dict[int, float], tol: float) -> Loop2D:
+    """Make consecutive segments meet.
+
+    At a sharp-bend vertex the two sides were moved apart (strip, delta > 0: bridge the
+    gap with a line) or into each other (delta < 0: trim both lines to their
+    intersection, or join them if they are collinear). Any other gap is an error.
+    """
+    segs = list(segs)
+    if len(segs) == 1:
+        return Loop2D(tuple(segs))
+    out: list = []
+    n = len(segs)
+    for i in range(n):
+        prev, cur, v = segs[i - 1], segs[i], jv[i]
+        if math.dist(prev.end, cur.start) <= tol:
+            continue
+        if v not in sharp_v:
+            raise refuse(Code.OUTLINE_OPEN, "gap in the flat outline", edges=(cur.source_edge,))
+        if sharp_v[v] >= 0:
+            continue  # bridged below, in order
+        if not (isinstance(prev, Line) and isinstance(cur, Line)):
+            raise refuse(
+                Code.SHARP_BEND_UNSUPPORTED,
+                "the outline at a sharp bend is not straight; cannot trim the overlap",
+                edges=(prev.source_edge, cur.source_edge),
+            )
+        x = _intersect(prev, cur)
+        if x is None:  # collinear: drop the overlap by joining the two
+            x = cur.start if _along(prev, cur.start) < _along(prev, prev.end) else prev.end
+            segs[i - 1] = Line(prev.p0, x, prev.source_edge)
+            segs[i] = Line(x, cur.p1, cur.source_edge)
+        else:
+            segs[i - 1] = Line(prev.p0, x, prev.source_edge)
+            segs[i] = Line(x, cur.p1, cur.source_edge)
+    for i in range(n):
+        prev, cur = segs[i - 1], segs[i]
+        if math.dist(prev.end, cur.start) > tol:  # a strip (delta > 0): bridge it
+            out.append(Line(prev.end, cur.start, cur.source_edge))
+        out.append(cur)
+    return Loop2D(tuple(s for s in out if not (isinstance(s, Line) and s.length() <= tol)))
+
+
+def _along(line: Line, p: Point) -> float:
+    d = (line.p1[0] - line.p0[0], line.p1[1] - line.p0[1])
+    return (p[0] - line.p0[0]) * d[0] + (p[1] - line.p0[1]) * d[1]
+
+
+def _intersect(a: Line, b: Line) -> Point | None:
+    d1 = (a.p1[0] - a.p0[0], a.p1[1] - a.p0[1])
+    d2 = (b.p1[0] - b.p0[0], b.p1[1] - b.p0[1])
+    den = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(den) <= 1e-9 * (math.hypot(*d1) * math.hypot(*d2) or 1.0):
+        return None
+    u = ((b.p0[0] - a.p0[0]) * d2[1] - (b.p0[1] - a.p0[1]) * d2[0]) / den
+    return (a.p0[0] + u * d1[0], a.p0[1] + u * d1[1])
 
 
 def _merge_collinear(L: Loop2D, tol: float = 1e-9) -> Loop2D:

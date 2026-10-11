@@ -28,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     u.add_argument("--table", help="bend table, .json or .csv")
     u.add_argument("--svg", help="SVG preview")
     u.add_argument("--thickness", type=float, help="expected thickness (checked, not trusted)")
+    u.add_argument("--sharp-radius", type=float, default=0.0, help="inner radius to use for sharp bends (default 0)")
     u.add_argument("--solid", type=int, help="index of the solid if the file has several")
     u.add_argument("--heal", choices=["fast", "full"], default="fast")
     u.add_argument("--labels", choices=["delem", "plain", "none"], default="delem")
@@ -38,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
     try:
         sheet = recognize(load_step(a.step, heal=a.heal), solid=a.solid, thickness=a.thickness)
-        pat = unfold(sheet, k=KDin6935() if a.din else a.k_factor)
+        pat = unfold(sheet, k=KDin6935() if a.din else a.k_factor, sharp_radius=a.sharp_radius)
     except FlatmatError as e:
         print(json.dumps(e.diagnostic.to_dict()), file=sys.stderr)
         return 2
@@ -48,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     for b in pat.bends:
         print(f"  bend {b.id}: {b.direction:4} {b.angle_deg:7.2f}°  r_in {b.r_in:g}  K {b.k:.4f}  BA {b.ba:.4f}"
               f"  segments {len(b.segments)}")  # fmt: skip
+    for f in pat.features:
+        print(f"  {f.kind} {f.side}: through Ø{f.through_diameter:g}, outer Ø{f.outer_diameter:g}")
     for d in pat.diagnostics:
         print(f"  {d.severity.value}: {d.code.value}: {d.message}", file=sys.stderr)
     if a.dxf:

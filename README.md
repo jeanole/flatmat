@@ -42,6 +42,7 @@ Results are identical on OCP 7.8 and 8.0.
 pip install -e .            # needs Python >= 3.11; pulls cadquery-ocp-novtk
 flatmat unfold part.step -k 0.44 -o part.dxf --table part.json --svg part.svg
 flatmat unfold part.step --din  # K per bend from DIN 6935
+flatmat unfold part.step --sharp-radius 1.6   # radius the die gives on sharp (r = 0) bends
 ```
 
 ```python
@@ -83,8 +84,9 @@ today:
 - **v0.1 (implemented, not released yet):** flat faces and cylindrical bends;
   one solid of constant thickness; holes and cut-outs across bends; hems; K as
   a scalar, an r/t table or DIN 6935; exact DXF and bend table.
-- **v0.2:** recognising B-spline faces as cylinders or planes; sharp bends;
-  countersinks and counterbores; manufacturability checks.
+- **v0.2 (in progress):** sharp bends (r = 0, inside or both sides, with an
+  optional tooling radius) — done; countersinks and counterbores — done;
+  recognising B-spline faces as cylinders or planes; manufacturability checks.
 - **Later:** cones, other formed features, tubes, assemblies, bend-sequence
   feasibility.
 

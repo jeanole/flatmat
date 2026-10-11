@@ -95,6 +95,18 @@ def _write_dxf(pattern, path, layers, labels, version, text_height) -> None:
             msp.add_text(
                 _label(b, labels), dxfattribs={"layer": layers.text, "height": th, "rotation": ang}
             ).set_placement(mid)
+        for f in pattern.features:
+            if f.center is None:
+                continue
+            if f.kind == "countersink":
+                txt = f"CSK {f.angle_deg:.0f}° Ø{f.outer_diameter:g} {f.side.upper()}"
+            else:
+                depth = f" T{f.depth:g}" if f.depth else ""
+                txt = f"CBORE Ø{f.outer_diameter:g}{depth} {f.side.upper()}"
+            x, y = f.center
+            msp.add_text(txt, dxfattribs={"layer": layers.text, "height": th * 0.6}).set_placement(
+                (x + f.through_diameter / 2 + th * 0.3, y)
+            )
     doc.saveas(os.fspath(path))
 
 
@@ -146,6 +158,19 @@ def bend_table(pattern: FlatPattern) -> dict:
             }
         )
     w, h = pattern.size
+    features = [
+        {
+            "id": f.id,
+            "kind": f.kind,
+            "side": f.side,
+            "center": list(f.center) if f.center else None,
+            "through_diameter": f.through_diameter,
+            "outer_diameter": f.outer_diameter,
+            "angle_deg": f.angle_deg,
+            "depth": f.depth,
+        }
+        for f in pattern.features
+    ]
     return {
         "schema": "flatmat.bendtable/1",
         "units": "mm",
@@ -154,6 +179,7 @@ def bend_table(pattern: FlatPattern) -> dict:
         "flat_size": [w, h],
         "flat_area": pattern.area,
         "bends": bends,
+        "features": features,
         "generator": {"flatmat": __version__, "ocp": OCP_VERSION},
         "diagnostics": [d.to_dict() for d in pattern.diagnostics],
     }
