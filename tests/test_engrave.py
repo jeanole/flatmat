@@ -110,7 +110,7 @@ def test_flat_is_the_plain_part(engraved, name):
     assert pat.meta["area_rel_err"] < 1e-9
     assert not pat.holes and not pat.slits
     assert all(f.kind == "engraving" for f in pat.features)
-    (d,) = [d for d in pat.diagnostics if d.code is fm.Code.ENGRAVED_RECESS]
+    (d,) = (d for d in pat.diagnostics if d.code is fm.Code.ENGRAVED_RECESS)
     assert d.severity is fm.Severity.WARNING and d.data["recesses"] == 1
 
 
