@@ -26,6 +26,7 @@ class LayerMap:
     bend_down: str = "BEND_DOWN"
     text: str = "TEXT"
     form: str = "FORM"  # rims of embosses and extruded holes: markings, not cuts
+    engrave: str = "ENGRAVE"  # rims of engravings: marked by the laser, not cut
 
     @classmethod
     def default(cls) -> LayerMap:
@@ -72,6 +73,7 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
         (layers.bend_down, 5),
         (layers.text, 2),
         (layers.form, 4),
+        (layers.engrave, 6),
     ):
         if name not in doc.layers:
             doc.layers.add(name, color=color)
@@ -83,7 +85,7 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
         _add_loop(msp, sl, layers.inner)
     for f in pattern.features:
         if f.outline is not None:
-            _add_loop(msp, f.outline, layers.form)
+            _add_loop(msp, f.outline, layers.engrave if f.kind == "engraving" else layers.form)
     w, h = pattern.size
     th = text_height or max(1.0, min(5.0, 0.02 * max(w, h)))
     for bl in pattern.bend_lines:
@@ -105,7 +107,7 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
                 dxfattribs={"layer": layers.text, "height": th, "rotation": ang},
             ).set_placement(mid)
         for f in pattern.features:
-            if f.center is None:
+            if f.center is None or f.kind == "engraving":  # its rim says it all; text is often many rims
                 continue
             x, y = f.center
             msp.add_text(_feature_label(f), dxfattribs={"layer": layers.text, "height": th * 0.6}).set_placement(
@@ -152,6 +154,8 @@ def _feature_label(f) -> str:
         size = f"{f.size[0]:.4g}x{f.size[1]:.4g} " if f.size else ""
         angle = f"A{f.orientation_deg:.4g} " if f.orientation_deg is not None else ""
         return f"{f.kind.upper()} {size}{angle}H{f.height:.4g} {side}"
+    if f.kind == "engraving":
+        return f"ENGRAVE T{f.depth:.3g} {side}"
     return f"EMBOSS H{f.height:.4g} {side}"
 
 

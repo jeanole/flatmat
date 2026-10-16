@@ -114,6 +114,9 @@ class Context:
     feature_gap: dict[int, float] = field(default_factory=dict)  # their width
     developed: set[int] = field(default_factory=set)  # lances laid flat by bending
     feature_free: dict[int, tuple[int, list[int]]] = field(default_factory=dict)  # host face, free edges
+    # rims of engravings not in a face of the reference skin (the far skin, islands):
+    # feature id -> (the reference-skin plane to project onto, edges of the rim in wire order)
+    projected_rims: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
     tol: Tolerances = field(default_factory=Tolerances)
 
 
@@ -847,6 +850,80 @@ def _formed_feature(fid: int, reg: _Formed, faces: list[_Face], edges, t: float,
     )
 
 
+# ------------------------------------------------------------------------------ engravings
+
+
+@dataclass
+class _Recess:
+    """A recess that does not go through the sheet: a pocket, a groove, engraved text, a blind hole."""
+
+    faces: list[int]
+    host: int  # the skin plane it opens into
+    rims: list[tuple[int, list[int]]]  # (the face it bounds, its edge indices in wire order) per rim
+    depth: float
+
+
+def _recess(group: list[int], skin: set[int], faces: list[_Face], edges, t: float, tol: Tolerances):
+    """The group as a recess into one plane of ``skin``, or None.
+
+    It must open into a single plane face of the skin only through inner wires of that face
+    (so it reaches no edge of the part), and stay less than the thickness below the plane.
+    Faces of the group flush with that plane are islands its floor leaves standing (the
+    middle of an O): their rims are rims of the recess too. Every edge of a rim must be the
+    recess's own (none is shared with a through cut).
+    """
+    gs = set(group)
+    hosts = {j for _, fi in edges if len(fi) == 2 and (fi[0] in gs) != (fi[1] in gs) for j in fi if j not in gs}
+    if len(hosts) != 1:
+        return None
+    h = next(iter(hosts))
+    host = faces[h - 1]
+    if h not in skin or host.kind != "plane":
+        return None
+    n = host.normal.Normalized()
+    o = host.ad.Plane().Location()
+    islands = {
+        i
+        for i in gs
+        if faces[i - 1].kind == "plane"
+        and faces[i - 1].normal.Angle(host.normal) < tol.smooth_angle
+        and abs(gp_Vec(o, faces[i - 1].ad.Plane().Location()).Dot(n)) <= tol.linear
+    }
+    walls = gs - islands
+    if not walls:
+        return None
+    mouth = {ei for ei, (_, fi) in enumerate(edges) if len(fi) == 2 and (fi[0] in walls) != (fi[1] in walls)}
+    outer, inner = _wires(host)
+    if any(_has_edge(outer, edges[ei][0]) for ei in mouth if h in edges[ei][1]):
+        return None
+    rims: list[tuple[int, list[int]]] = []
+    surfaces = [(h, inner)]
+    for i in sorted(islands):
+        o_i, inner_i = _wires(faces[i - 1])
+        surfaces.append((i, [o_i, *inner_i]))
+    for i, wires in surfaces:
+        for w in wires:
+            if any(_has_edge(w, edges[ei][0]) for ei in mouth if i in edges[ei][1]):
+                rims.append((i, _wire_edges(w, faces[i - 1], i, edges)))
+    if not rims or {ei for _, rim in rims for ei in rim} != mouth:
+        return None
+    lo, hi = _region_extent(_Formed(-1, walls, host=h), faces)
+    depth = -lo
+    if hi > tol.linear or depth <= tol.linear or depth >= t * (1 - tol.thickness_rel):
+        return None
+    return _Recess(sorted(group), h, rims, depth)
+
+
+def _rim_diameter(rim: list[int], edges) -> float:
+    """The diameter of a rim that is one full circle, else 0."""
+    if len(rim) != 1:
+        return 0.0
+    c = BRepAdaptor_Curve(edges[rim[0]][0])
+    if c.GetType() != GeomAbs_Circle or abs(c.LastParameter() - c.FirstParameter() - 2 * math.pi) > 1e-9:
+        return 0.0
+    return 2 * c.Circle().Radius()
+
+
 # ------------------------------------------------------------------------------ public
 
 
@@ -857,12 +934,17 @@ def recognize(
     solid: int | None = None,
     tol: Tolerances | None = None,
     canonical: bool = True,
+    engrave: bool = False,
 ) -> SheetPart:
     """Recognise a solid as sheet metal: thickness, skins, bends, flanges, hole features.
 
     ``model`` is a :class:`~flatmat.io.StepModel` or an OCP solid. With ``canonical``
     (default), B-spline faces and edges that are really planes, cylinders, cones, lines
     or circles are converted first (on a copy).
+
+    With ``engrave``, a recess that does not go through the sheet (a pocket, a groove,
+    engraved text, a blind hole) is an ``engraving`` feature: its rim is marked on the flat
+    pattern and its depth is not made. Without it such a part is refused (``EDGE_FEATURE``).
     """
     tol = tol or Tolerances()
     diags: list[Diagnostic] = []
@@ -946,6 +1028,7 @@ def recognize(
     groups = _components(len(faces), [(a, b) for a in between for b in nb_all[a] if b not in in_skin and a < b])
     groups = [g for g in groups if g[0] not in in_skin]
     feature_groups: list[tuple[list[int], tuple]] = []
+    recesses: list[_Recess] = []
     featured: set[int] = set()
     for g in groups:
         touches = {s for s in (0, 1) if any(n in skins[s] for i in g for n in nb_all[i])}
@@ -953,6 +1036,11 @@ def recognize(
         if hf is not None:
             feature_groups.append((g, hf))
             featured |= set(g)
+        elif engrave and len(touches) == 1:
+            rec = _recess(g, skins[next(iter(touches))], faces, edges, t, tol)
+            if rec is not None:
+                recesses.append(rec)
+                featured |= set(g)
     for comp in comps[2:]:
         if set(comp) & featured:
             continue
@@ -1097,6 +1185,31 @@ def recognize(
         feat_edges[fid] = set(reg.wire)
         feat_cuts[fid] = reg.cuts
 
+    # engravings: one per rim (a ring-shaped groove has two). A rim in a face of the reference
+    # skin is chained with the outline; any other is projected onto the plane of that skin behind it.
+    projected_rims: dict[int, tuple[int, list[int]]] = {}
+    for rec in recesses:
+        on_a = rec.host in skin_a
+        behind = rec.host if on_a else partners.get(rec.host)
+        if behind is None or behind not in skin_a:
+            raise refuse(Code.EDGE_FEATURE, "a recess in a face with no face of the other skin behind it",
+                         faces=rec.faces)  # fmt: skip
+        for face, rim in rec.rims:
+            fid = len(features) + 1
+            features.append(Feature(fid, "engraving", 0.0, _rim_diameter(rim, edges), "top" if on_a else "bottom",
+                                    depth=rec.depth, face_ids=tuple(rec.faces)))  # fmt: skip
+            if face in skin_a:
+                feat_edges[fid] = set(rim)
+            else:
+                projected_rims[fid] = (behind, rim)
+    if recesses:
+        deepest = max(r.depth for r in recesses)
+        diags.append(warn(Code.ENGRAVED_RECESS,
+                          f"{len(recesses)} recess(es) up to {deepest:.3g} deep engraved along their rims; "
+                          "their depth is not made",
+                          faces=sorted(i for r in recesses for i in r.faces),
+                          recesses=len(recesses), depth=deepest))  # fmt: skip
+
     adj: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for a, b, ei in smooth:
         adj[a].append((b, ei))
@@ -1122,6 +1235,7 @@ def recognize(
     ctx.feature_kind = {f.id: f.kind for f in features}
     ctx.feature_edges, ctx.feature_cuts = feat_edges, feat_cuts
     ctx.feature_gap, ctx.developed, ctx.feature_free = feat_gap, developed, feat_free
+    ctx.projected_rims = projected_rims
     return SheetPart(
         thickness=t,
         thickness_confidence=conf,

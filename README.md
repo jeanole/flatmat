@@ -49,6 +49,7 @@ flatmat unfold part.step --check --material stainless -o part.dxf   # DFM findin
 flatmat unfold part.step --check --sequence --punch gooseneck_88 --die V12   # collisions and a bend order
 flatmat unfold part.step --check --sequence 3,1,2 --tooling tools.json       # check this order with your tools
 flatmat unfold part.step --pre-hole 3.2 -o part.dxf   # extruded holes: pre-hole from your table
+flatmat unfold part.step --engrave -o part.dxf   # pockets, grooves, text that do not go through: rim on ENGRAVE
 ```
 
 ```python
@@ -112,7 +113,9 @@ today:
   marked; a bent lance's tab developed) — done;
   corner rule (corner
   relief, gap between folded flanges) — done; punch and die data, tool
-  collisions and a bend order — done.
+  collisions and a bend order — done; recesses that do not go through
+  (pockets, grooves, engraved text, blind holes) as engravings of their rim,
+  with `recognize(engrave=True)` — done.
 - **Later:** cones, tubes, assemblies.
 
 ## Stack
