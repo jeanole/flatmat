@@ -49,6 +49,11 @@ def _parser() -> argparse.ArgumentParser:
         help="with --check: find a collision-free bend order, or check ORDER (bend ids, e.g. 3,1,2)",
     )
     u.add_argument("--pre-hole", type=float, help="pre-hole diameter for extruded holes (default: neutral fibre)")
+    u.add_argument(
+        "--engrave",
+        action="store_true",
+        help="take a recess that does not go through (pocket, groove, text) as an engraving of its rim",
+    )
     return p
 
 
@@ -66,7 +71,7 @@ def _tooling(a, t: float):
 def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
     try:
-        sheet = recognize(load_step(a.step, heal=a.heal), solid=a.solid, thickness=a.thickness)
+        sheet = recognize(load_step(a.step, heal=a.heal), solid=a.solid, thickness=a.thickness, engrave=a.engrave)
         pat = unfold(sheet, k=KDin6935() if a.din else a.k_factor, sharp_radius=a.sharp_radius, pre_hole=a.pre_hole)
     except FlatmatError as e:
         print(json.dumps(e.diagnostic.to_dict()), file=sys.stderr)
@@ -83,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
         elif f.kind in ("louvre", "bridge", "lance"):
             print(f"  {f.kind} {f.side}: {f.size[0]:g} x {f.size[1]:g} at {f.orientation_deg:g}°, "
                   f"height {f.height:g}" if f.size else f"  {f.kind} {f.side}")  # fmt: skip
+        elif f.kind == "engraving":
+            rim = f", Ø{f.outer_diameter:g}" if f.outer_diameter else ""
+            print(f"  engraving {f.side}: depth {f.depth:.3g}{rim}")
         elif f.kind == "extruded_hole":
             print(f"  extruded hole {f.side}: bore Ø{f.outer_diameter:g}, height {f.height:g}, "
                   f"pre-hole Ø{f.through_diameter:.3f}")  # fmt: skip

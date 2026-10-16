@@ -473,7 +473,7 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
                     cut_area += abs(slot.area())
             centers[fid] = (_centroid(rim), rim.area() - cut_area)
             continue
-        if kind == "emboss":
+        if kind in ("emboss", "engraving"):
             rim = L if L.area() > 0 else _reverse_loop(L)
             outlines[fid] = rim
             centers[fid] = (_centroid(rim), rim.area())
@@ -500,6 +500,12 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
         else:
             centers[fid] = (arc.center, 0.0)
             out.append((L, fid))
+    # rims of engravings on the far skin or round an island: projected onto the plane behind them
+    for fid, (behind, rim_edges) in ctx.projected_rims.items():
+        rim = _projected_rim(ctx, devs, place, behind, rim_edges)
+        rim = rim if rim.area() > 0 else _reverse_loop(rim)
+        outlines[fid] = rim
+        centers[fid] = (_centroid(rim), 0.0)
     out.sort(key=lambda lf: -abs(lf[0].area()))
     outer = out[0][0]
     if outer.area() < 0:
@@ -507,6 +513,46 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
     holes = [_reverse_loop(h) if h.area() > 0 else h for h, _ in out[1:]]
     hole_fid = [f for _, f in out[1:]]
     return outer, holes, centers, outlines, hole_fid, slits, orient
+
+
+def _projected_rim(ctx: Context, devs, place, host: int, rim: list[int]) -> Loop2D:
+    """A closed wire of edges, in wire order, projected onto the plane ``host`` in the flat."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+
+    pieces: list[list] = []
+    for ei in rim:
+        e = ctx.edges[ei][0]
+        c = BRepAdaptor_Curve(e)
+        if c.GetType() == GeomAbs_Circle and abs(c.LastParameter() - c.FirstParameter() - 2 * math.pi) < 1e-9:
+            circ = c.Circle()
+            centre = _on_host_point(ctx, devs, place, host, circ.Location())
+            pieces.append([Arc(centre, circ.Radius(), 0.0, 2 * math.pi, True, ei)])
+            continue
+        segs = [_with(s, source_edge=ei) for s in _on_host(ctx, devs, place, host, e)]
+        if segs:
+            pieces.append(segs)
+    if not pieces:
+        raise refuse(Code.OUTLINE_OPEN, "the rim of an engraving is empty in the flat", edges=tuple(rim))
+    # the edges are in wire order, each running either way: turn each to start where the last ended
+    if len(pieces) > 1:
+        first, second = pieces[0], pieces[1]
+        ends = (second[0].start, second[-1].end)
+        if min(math.dist(first[0].start, p) for p in ends) < min(math.dist(first[-1].end, p) for p in ends):
+            pieces[0] = [s.reversed() for s in reversed(first)]
+        for n in range(1, len(pieces)):
+            prev, cur = pieces[n - 1][-1].end, pieces[n]
+            if math.dist(cur[-1].end, prev) < math.dist(cur[0].start, prev):
+                pieces[n] = [s.reversed() for s in reversed(cur)]
+    return Loop2D(tuple(s for piece in pieces for s in piece))
+
+
+def _on_host_point(ctx: Context, devs, place, host: int, p) -> Point:
+    """A 3D point projected onto the plane ``host``, in the flat."""
+    pos = ctx.faces[host - 1].ad.Plane().Position()
+    o, xd, yd = pos.Location(), pos.XDirection(), pos.YDirection()
+    d = (p.X() - o.X(), p.Y() - o.Y(), p.Z() - o.Z())
+    uv = (d[0] * xd.X() + d[1] * xd.Y() + d[2] * xd.Z(), d[0] * yd.X() + d[1] * yd.Y() + d[2] * yd.Z())
+    return _apply(place[host], devs[host](*uv))
 
 
 def _on_host(ctx: Context, devs, place, host: int, e) -> list:

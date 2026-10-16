@@ -263,6 +263,12 @@ class Feature:
       narrow holes, or as ``FlatPattern.slits`` if they have no width).
     - lance (Lasche): a tab bent out of an opening; it is developed like any flange
       (``bend_id``), the opening around it is cut.
+    - engraving (Gravur), only with ``recognize(engrave=True)``: a recess that does not
+      go through the sheet (a pocket, a groove, engraved text, a blind hole). ``outline``
+      is its rim in the flat, which the laser marks; its depth is not made. ``depth`` is
+      how far it goes into the sheet, ``outer_diameter`` the rim's diameter if it is a
+      circle (else 0), ``side`` the skin it opens into. A recess whose floor leaves an
+      island (a ring groove, an O) is one engraving per rim.
 
     For the last three, ``orientation_deg`` is the direction of the slits (louvre,
     bridge) or of the bend line (lance) in the flat, ``size`` the extent along and
@@ -270,17 +276,17 @@ class Feature:
     """
 
     id: int
-    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance"]
+    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance", "engraving"]
     through_diameter: float
     outer_diameter: float
     side: Literal["top", "bottom"]  # top = the reference skin, facing the viewer of the flat
     angle_deg: float | None = None  # countersink included angle
-    depth: float | None = None  # counterbore depth
+    depth: float | None = None  # counterbore, engraving depth
     face_ids: tuple[int, ...] = ()
     center: tuple[float, float] | None = None  # in the flat pattern, set by unfold()
     height: float | None = None  # emboss, extruded hole
     radius: float | None = None  # extruded hole: fillet inner radius
-    outline: Loop2D | None = None  # in the flat pattern, set by unfold(): rim of the formed region
+    outline: Loop2D | None = None  # in the flat pattern, set by unfold(): rim of the formed region or engraving
     orientation_deg: float | None = None  # louvre, bridge, lance; set by unfold()
     size: tuple[float, float] | None = None  # louvre, bridge, lance; set by unfold()
     holes: tuple[int, ...] = ()  # set by unfold()

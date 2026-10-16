@@ -258,7 +258,7 @@ Non-zero exit code on refusal; the diagnostic goes to stderr as JSON.
 | geometry | `EDGE_FEATURE`, `UNSUPPORTED_SURFACE`, `BEND_TOO_LARGE`, `BEND_UNPAIRED`, `FORMED_FEATURE`, `HEM_MERGED` |
 | unfolding | `CYCLE_INCONSISTENT`, `DEVELOP_FAILED`, `DEVELOP_FOLDBACK` |
 | flat checks | `FLAT_OVERLAP`, `AREA_MISMATCH` |
-| warnings | `K_EXTRAPOLATED`, `COUNTERSINK_PROJECTED`, `SHARP_BEND_ASSUMED_RADIUS`, `SURFACE_CONVERTED`, `NEAR_TANGENT_KINK`, `HEM_CONTACT`, `HEM_DEFAULT_ALLOWANCE`, `INSIDE_OUT_FIXED`, `SLIVER_FACE` |
+| warnings | `K_EXTRAPOLATED`, `COUNTERSINK_PROJECTED`, `ENGRAVED_RECESS`, `SHARP_BEND_ASSUMED_RADIUS`, `SURFACE_CONVERTED`, `NEAR_TANGENT_KINK`, `HEM_CONTACT`, `HEM_DEFAULT_ALLOWANCE`, `INSIDE_OUT_FIXED`, `SLIVER_FACE` |
 | DFM (§7) | `DFM_*` — see §7 |
 
 ### Bend table (JSON, versioned schema)
@@ -629,6 +629,41 @@ curved slits.
 - **Not supported:** cuts inside a formed region; regions held on more than
   two sides of their opening. The material a formed feature stretches is
   not accounted for: inside its rim the blank is flat.
+
+**Engravings: implemented, behind `recognize(engrave=True)`** (`recognize.py`,
+`unfold.py`). A recess that does not go through the sheet — a pocket, a
+groove, engraved text, a blind hole — is machined on a mill; on a laser the
+shop marks its rim instead. Without the switch such a part is refused as
+before (`EDGE_FEATURE`).
+
+- **Detection** (`_recess`): a group of non-skin faces (grouped over all
+  edges, as for hole features) that touches only one skin is a recess when
+  - it opens into a single plane face of that skin (the host), through inner
+    wires of that face only: it reaches no edge of the part and no bend;
+  - every edge of those wires is its own (none is shared with a through
+    cut);
+  - it stays less than t below the host (vertices and inner sample points,
+    along the host's normal); that is its `depth`.
+  Faces of the group flush with the host are islands its floor leaves
+  standing (the middle of an O); their wires are rims too.
+- **Features:** one `engraving` per rim, so a ring groove is two. `side` is
+  the skin it opens into, `outer_diameter` the rim's diameter if it is one
+  circle, `depth` the recess's. One `ENGRAVED_RECESS` warning per part
+  counts them and gives the deepest: the depth is not made.
+- **Flat output:** the rim is `Feature.outline`, never a hole: the flat is
+  that of the part without the recess (area and size tested exact).
+  - a rim in a face of the reference skin is a loop of that face and is
+    chained with the outline, exactly (lines, arcs, splines); the area
+    self-check adds what lies inside it, as for an emboss;
+  - a rim on the far skin, or round an island, is projected along the
+    normal onto the plane of the reference skin behind it
+    (`_projected_rim`): circles stay circles, other edges are fitted as a
+    line or an arc, else polylined at 1e-4 mm;
+  - DXF: rims on layer `ENGRAVE`, no text per rim (text is many rims). The
+    bend table has `depth` and `rim`.
+- **Not supported:** a recess reaching the outline (a rebate) or running
+  into a bend: `EDGE_FEATURE`, as without the switch. A recess so large that
+  its floor outweighs the skin it is cut into is read as a skin.
 
 ### 5.5 B-spline faces (canonical recognition, implemented)
 
