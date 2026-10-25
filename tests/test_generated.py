@@ -1,6 +1,7 @@
 """Generated parts with exactly known flat lengths, each round-tripped through STEP."""
 
 import math
+import sys
 
 import pytest
 from conftest import write_and_load
@@ -63,6 +64,18 @@ def test_hole_through_bend_is_an_exact_spline_and_splits_the_bend_line(generated
     assert len(pat.bend_lines) == 2  # interrupted by the hole
     total = sum(math.dist(b.p0, b.p1) for b in pat.bend_lines)
     assert total == pytest.approx(100.0 - 6.0, abs=0.05)  # width minus the hole (~ its diameter)
+
+
+def test_bend_line_ends_on_the_hole_edge(generated, monkeypatch):
+    # the hole (d = 6 at 50 across the width) crosses the bend line at 47 and 53: where
+    # the line meets the hole's pcurve, and by bisection where that intersection is not used
+    def ends():
+        pat = fm.unfold(generated["L_hole_in_bend"][1], k=K)
+        return sorted(p[1] for bl in pat.bend_lines for p in (bl.p0, bl.p1))
+
+    assert ends() == pytest.approx([0.0, 47.0, 53.0, 100.0], abs=1e-7)
+    monkeypatch.setattr(sys.modules["flatmat.unfold"], "_iso_u_crossings", lambda *a: None)
+    assert ends() == pytest.approx([0.0, 47.0, 53.0, 100.0], abs=1e-6)
 
 
 def test_bend_values(generated):

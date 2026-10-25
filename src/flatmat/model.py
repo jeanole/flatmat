@@ -139,8 +139,13 @@ class Spline:
         return (x / ww, y / ww)
 
     def points(self, us: np.ndarray) -> np.ndarray:
-        """:meth:`point` at many parameters at once (N x 2): the same steps on arrays, so the
-        same numbers to the last bit."""
+        """:meth:`point` at many parameters at once (N x 2)."""
+        d, _ = self._deboor_many(us)
+        return d[:, :2] / d[:, 2:3]
+
+    def _deboor_many(self, us: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """:meth:`_deboor` at many parameters at once (N x 3 each): the same steps on
+        arrays, so the same numbers to the last bit."""
         p, kv = self.degree, np.asarray(self.flat_knots)
         n = len(self.poles)
         u = np.minimum(np.maximum(us, kv[p]), kv[n])
@@ -149,13 +154,16 @@ class Spline:
         poles = np.asarray(self.poles)
         idx = k[:, None] - p + np.arange(p + 1)
         d = np.stack([poles[idx, 0] * w[idx], poles[idx, 1] * w[idx], w[idx]], axis=-1)  # N x (p+1) x 3
+        der = np.zeros((len(u), 3))
         for r in range(1, p + 1):
+            if r == p:
+                der = (p / (kv[k + 1] - kv[k]))[:, None] * (d[:, p] - d[:, p - 1])
             for j in range(p, r - 1, -1):
                 i = j + k - p
                 den = kv[i + p - r + 1] - kv[i]
                 a = np.divide(u - kv[i], den, out=np.zeros_like(u), where=den != 0)[:, None]
                 d[:, j] = (1 - a) * d[:, j - 1] + a * d[:, j]
-        return d[:, p, :2] / d[:, p, 2:3]
+        return d[:, p], der
 
     @property
     def start(self) -> Point:
@@ -190,15 +198,19 @@ class Spline:
         """
         nodes = _gauss_legendre(self.degree + 1 if not self.weights else 2 * self.degree + 8)
         kv, p = self.flat_knots, self.degree
-        total = 0.0
+        us, whs = [], []
         for i in range(p, len(self.poles)):
             a, b = kv[i], kv[i + 1]
             if b <= a:
                 continue
             h, m = 0.5 * (b - a), 0.5 * (a + b)
             for x, wt in nodes:
-                (X, Y, W), (dX, dY, _) = self._deboor(m + h * x)
-                total += wt * h * (X * dY - Y * dX) / (W * W)
+                us.append(m + h * x)
+                whs.append(wt * h)
+        (X, Y, W), (dX, dY, _) = (c.T for c in self._deboor_many(np.asarray(us)))
+        total = 0.0
+        for term in (np.asarray(whs) * (X * dY - Y * dX) / (W * W)).tolist():
+            total += term  # in order: sum() compensates (Python 3.12+), which changes the last bits
         return total
 
 
