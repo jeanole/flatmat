@@ -23,7 +23,7 @@ from shapely.ops import unary_union
 from .diagnostics import Code, Diagnostic, Severity
 from .fold import FoldModel, apply, boundary_points
 from .geom2d import cross, cut_slits, dot, midpoint, offset, perp, sub, unit
-from .model import Arc, Bend, BendLine, FlatPattern
+from .model import SAMPLE_TOL, Arc, Bend, BendLine, FlatPattern
 from .sequence import BendPlan, plan_bends
 from .tooling import Tooling, die_opening
 
@@ -272,10 +272,10 @@ def check(
     v = die_v or (tooling.die.v if tooling is not None else die_opening(t))
     out = _Findings(rules, Severity.ERROR if strict else Severity.WARNING)
 
-    outer = Polygon(pattern.outer.polyline(0.01))
-    holes = [Polygon(h.polyline(0.01)) for h in pattern.holes]
+    outer = Polygon(pattern.outer.polyline(SAMPLE_TOL))
+    holes = [Polygon(h.polyline(SAMPLE_TOL)) for h in pattern.holes]
     part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes])
-    part = cut_slits(part, pattern.slits, 0.01)
+    part = cut_slits(part, pattern.slits, SAMPLE_TOL)
     lines_by_bend: dict[int, list] = {}
     for bl in pattern.bend_lines:
         lines_by_bend.setdefault(bl.bend_id, []).append(bl)
@@ -578,7 +578,7 @@ def _formed_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
         if not f.kind_info.formed or f.center is None:
             continue
         if f.outline is not None:
-            rim = Polygon(f.outline.polyline(0.01))
+            rim = Polygon(f.outline.polyline(SAMPLE_TOL))
         elif f.kind_info.tool_bent and f.holes:  # a bent lance: its opening
             rim = unary_union([holes[i] for i in f.holes]).convex_hull
         else:

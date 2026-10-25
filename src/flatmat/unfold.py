@@ -25,7 +25,12 @@ from ._topology import Context, Face, edge_vertices, inner_uv, pcurve
 from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .geom2d import IDENTITY, Rigid, cross, dot, heading, offset, perp, rigid_fit, sub, transform, unit
-from .model import FEATURE_KINDS, Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
+from .model import FEATURE_KINDS, SAMPLE_TOL, Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
+
+# chord errors (mm) for the jobs here that need finer polylines than SAMPLE_TOL
+_OVERLAP_TOL = 0.005  # the self-overlap check of the flat
+_CENTROID_TOL = 0.001  # centres of feature rims
+_SLOT_TOL = 1e-4  # slots built from projected region edges: matched to the snapping in _slots_by_faces
 
 
 class _Dev:
@@ -137,7 +142,7 @@ def unfold(
     if rel > ctx.tol.area_rel:
         raise refuse(Code.AREA_MISMATCH, f"flat area {area:.4f} vs developed {expected:.4f}", rel_err=rel)
     if check_overlap:
-        poly = Polygon(outer.polyline(0.005), [h.polyline(0.005) for h in holes])
+        poly = Polygon(outer.polyline(_OVERLAP_TOL), [h.polyline(_OVERLAP_TOL) for h in holes])
         if not poly.is_valid:
             raise refuse(Code.FLAT_OVERLAP, f"the flat pattern overlaps itself: {explain_validity(poly)}")
 
@@ -168,7 +173,7 @@ def unfold(
                 lines.append(BendLine(b.id, seg.face_id, p0, p1, b.direction, b.angle_deg, r, b.kind))
 
     # normalise: bbox minimum at the origin
-    pts = outer.polyline(0.01)
+    pts = outer.polyline(SAMPLE_TOL)  # as FlatPattern.bbox, so the bbox starts at the origin
     dx, dy = -min(p[0] for p in pts), -min(p[1] for p in pts)
     shift = (1.0, 0.0, dx, dy)
     outer = _move_loop(outer, shift)
@@ -221,9 +226,9 @@ def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | N
     if not f.kind_info.oriented:
         return f
     if f.outline is not None:
-        pts = f.outline.polyline(0.01)
+        pts = f.outline.polyline(SAMPLE_TOL)
     else:  # a bent lance: its opening, along its bend line
-        pts = [p for i in f.holes for p in holes[i].polyline(0.01)]
+        pts = [p for i in f.holes for p in holes[i].polyline(SAMPLE_TOL)]
         bl = next((b for b in lines if b.bend_id == f.bend_id), None)
         if bl is not None:
             angle = heading(bl.p0, bl.p1)
@@ -540,7 +545,7 @@ def _on_host(ctx: Context, devs, place, host: int, e) -> list:
     from OCP.GCPnts import GCPnts_QuasiUniformDeflection
 
     c = BRepAdaptor_Curve(e)
-    sampler = GCPnts_QuasiUniformDeflection(c, 1e-4)
+    sampler = GCPnts_QuasiUniformDeflection(c, _SLOT_TOL)
     params = [sampler.Parameter(i) for i in range(1, sampler.NbPoints() + 1)] if sampler.IsDone() else []
     if len(params) < 2:
         params = [c.FirstParameter(), c.LastParameter()]
@@ -642,17 +647,17 @@ def _slots_by_faces(rim: Loop2D, runs: list[list], free: list[list[Point]]) -> l
     from shapely.geometry import LineString
     from shapely.ops import polygonize, unary_union
 
-    rim_pts = rim.polyline(1e-4)
+    rim_pts = rim.polyline(_SLOT_TOL)
     rim_line = LineString([*rim_pts, rim_pts[0]])
-    # the region's edges end on the rim (a polyline within 1e-4 of it) and on each other
+    # the region's edges end on the rim (a polyline within _SLOT_TOL of it) and on each other
     # (projected from different edges): snap to the rim and to a 1e-6 grid so they meet
-    lines = [rim_line] + [snap(LineString(p), rim_line, 2e-4) for p in free if len(p) > 1]
+    lines = [rim_line] + [snap(LineString(p), rim_line, 2 * _SLOT_TOL) for p in free if len(p) > 1]
     lines = [set_precision(g, 1e-6) for g in lines]
     cut_lines = []
     for chain in runs:
         pts: list[Point] = []
         for sg in chain:
-            sp = sg.sample(1e-4)
+            sp = sg.sample(_SLOT_TOL)
             pts.extend(sp if not pts else sp[1:])
         cut_lines.append(LineString(pts))
     out = []
@@ -686,7 +691,7 @@ def _cut_runs(L: Loop2D, cut_edges: set[int]) -> list[list]:
 
 
 def _centroid(L: Loop2D) -> Point:
-    pts = L.polyline(0.001)
+    pts = L.polyline(_CENTROID_TOL)
     a = cx = cy = 0.0
     for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1], strict=True):
         c = x0 * y1 - x1 * y0

@@ -15,7 +15,7 @@ import ezdxf
 from . import __version__
 from ._occ import OCP_VERSION
 from .geom2d import heading, midpoint
-from .model import Arc, Feature, FlatPattern, Line, Loop2D, Spline
+from .model import SAMPLE_TOL, Arc, Feature, FlatPattern, Line, Loop2D, Spline
 
 Labels = Literal["delem", "plain"] | None
 
@@ -233,7 +233,7 @@ def bend_table(pattern: FlatPattern) -> dict:
             "depth": f.depth,
             "height": f.height,
             "radius": f.radius,
-            "rim": [list(p) for p in f.outline.polyline(0.01)] if f.outline is not None else None,
+            "rim": [list(p) for p in f.outline.polyline(SAMPLE_TOL)] if f.outline is not None else None,
             "orientation_deg": f.orientation_deg,
             "size": list(f.size) if f.size else None,
             "holes": list(f.holes),
@@ -250,7 +250,7 @@ def bend_table(pattern: FlatPattern) -> dict:
         "flat_area": pattern.area,
         "bends": bends,
         "features": features,
-        "slits": [[list(p) for p in sl.polyline(0.01)] for sl in pattern.slits],
+        "slits": [[list(p) for p in sl.polyline(SAMPLE_TOL)] for sl in pattern.slits],
         "generator": {"flatmat": __version__, "ocp": OCP_VERSION},
         "diagnostics": [d.to_dict() for d in pattern.diagnostics],
     }
@@ -304,13 +304,16 @@ def write_bend_table(pattern: FlatPattern, path: str | os.PathLike, *, dfm=None)
 # ------------------------------------------------------------------------------ SVG
 
 
+_SVG_TOL = 0.02  # chord error of the SVG preview, mm (a picture, not geometry)
+
+
 def write_svg(pattern: FlatPattern, path: str | os.PathLike, *, margin: float = 5.0) -> None:
     """A quick visual check (not for production): outline, holes, bend lines."""
     w, h = pattern.size
     W, H = w + 2 * margin, h + 2 * margin
 
     def pts(loop: Loop2D) -> str:
-        return " ".join(f"{x + margin:.4f},{H - (y + margin):.4f}" for x, y in loop.polyline(0.02))
+        return " ".join(f"{x + margin:.4f},{H - (y + margin):.4f}" for x, y in loop.polyline(_SVG_TOL))
 
     sw = max(w, h) / 800
     out = [

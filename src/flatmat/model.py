@@ -11,6 +11,11 @@ from .diagnostics import Diagnostic
 
 Point = tuple[float, float]
 
+# How finely curves become polylines where a polygon is needed: the largest chord error,
+# in mm. One value for every geometry check, so the places that must agree do: the flat's
+# bounding box and its shift to the origin, and the DFM rules and the folding model.
+SAMPLE_TOL = 0.01
+
 
 # ---------------------------------------------------------------------------- 2D geometry
 
@@ -32,7 +37,7 @@ class Line:
     def reversed(self) -> Line:
         return replace(self, p0=self.p1, p1=self.p0)
 
-    def sample(self, tol: float = 0.01) -> list[Point]:
+    def sample(self, tol: float = SAMPLE_TOL) -> list[Point]:
         return [self.p0, self.p1]
 
     def length(self) -> float:
@@ -75,7 +80,7 @@ class Arc:
     def reversed(self) -> Arc:
         return replace(self, a0=self.a1, a1=self.a0, ccw=not self.ccw)
 
-    def sample(self, tol: float = 0.01) -> list[Point]:
+    def sample(self, tol: float = SAMPLE_TOL) -> list[Point]:
         # chord error r(1 - cos(d/2)) <= tol
         step = 2 * math.acos(max(-1.0, 1 - tol / self.radius)) if self.radius > tol else math.pi / 4
         n = max(4, math.ceil(self.sweep / max(step, 1e-6)))
@@ -149,7 +154,7 @@ class Spline:
             weights=tuple(reversed(self.weights)) if self.weights else None,
         )
 
-    def sample(self, tol: float = 0.01) -> list[Point]:
+    def sample(self, tol: float = SAMPLE_TOL) -> list[Point]:
         # control polygon length bounds the curve length; dense enough for checks
         ctrl = sum(math.dist(a, b) for a, b in zip(self.poles, self.poles[1:], strict=False))
         n = max(8 * len(self.poles), min(4000, math.ceil(ctrl / max(tol, 1e-6) ** 0.5 * 2)))
@@ -206,7 +211,7 @@ Seg2D = Line | Arc | Spline
 class Loop2D:
     segments: tuple[Seg2D, ...]
 
-    def polyline(self, tol: float = 0.01) -> list[Point]:
+    def polyline(self, tol: float = SAMPLE_TOL) -> list[Point]:
         pts: list[Point] = []
         for s in self.segments:
             sp = s.sample(tol)
@@ -440,7 +445,7 @@ class FlatPattern:
 
     @cached_property
     def bbox(self) -> tuple[float, float, float, float]:
-        pts = self.outer.polyline(0.01)
+        pts = self.outer.polyline(SAMPLE_TOL)
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         return (min(xs), min(ys), max(xs), max(ys))
 

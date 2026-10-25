@@ -28,7 +28,7 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 from .geom2d import cut_slits, midpoint, offset, perp, unit
-from .model import Bend, BendLine, FlatPattern
+from .model import SAMPLE_TOL, Bend, BendLine, FlatPattern
 
 
 @dataclass(frozen=True)
@@ -66,7 +66,7 @@ class _Crossing:
 class FoldModel:
     """Regions of a flat pattern and the hinges between them."""
 
-    def __init__(self, pattern: FlatPattern, tol: float = 0.01):
+    def __init__(self, pattern: FlatPattern, tol: float = SAMPLE_TOL):
         t = pattern.thickness
         self.t = t
         self.pattern = pattern
