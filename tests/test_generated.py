@@ -5,7 +5,7 @@ import sys
 
 import pytest
 from conftest import write_and_load
-from parts import Part, cases
+from parts import Part, cases, make_solid
 
 import flatmat as fm
 from flatmat.model import Arc, Spline
@@ -108,3 +108,13 @@ def test_given_thickness_is_checked(step_dir):
     with pytest.raises(fm.FlatmatError) as e:
         fm.recognize(model, thickness=2.5)
     assert e.value.diagnostic.code == fm.Code.VARIABLE_THICKNESS
+
+
+def test_edge_table_finds_an_edge_in_either_orientation():
+    R = sys.modules["flatmat.recognize"]
+    solid = make_solid(next(p for p in cases() if p.name == "L_holes"))
+    fmap, _ = R._face_table(solid)
+    edges = R._edge_table(solid, fmap)
+    for ei, (e, _) in enumerate(edges):
+        assert edges.find(e) == edges.find(e.Reversed()) == ei
+    assert edges.find(fmap.FindKey(1)) == -1  # not an edge of the table
