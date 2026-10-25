@@ -1,9 +1,12 @@
 # flatmat — design
 
-Status: **design phase, phase-0 spike done.** The spike
-([`spike/`](../spike/README.md)) runs §1 end to end on OCP 7.8 and 8.0. The
-results are folded into this document (marked *spike*). Anything still
-marked *verify* has not been checked yet.
+Status: **v0.1 implemented, v0.2 in progress** (see the
+[README](../README.md)). This document began as the design. The phase-0
+spike ([`spike/`](../spike/README.md)) ran §1 end to end on OCP 7.8 and 8.0;
+its results are folded in (marked *spike*). Where the code differs from the
+plan, the section says so (*as built*); the modules are listed in
+[§4](#code-layout-as-built). Anything still marked *verify* has not been
+checked yet.
 
 Research behind every decision below, with sources, is in
 [`research.md`](research.md).
@@ -146,7 +149,12 @@ matrices):
   `tol.flat`, else `CYCLE_INCONSISTENT` naming the edge as a suggested cut
   (tubes, §5.6).
 
-### 1.6 Flat pattern (`flatmat/flat2d.py`)
+### 1.6 Flat pattern (`flatmat/unfold.py`)
+
+*As built*: there is no separate `flat2d.py`; the outline, the bend lines and
+both checks are part of `unfold.py`. The overlap check samples the loops at
+0.005 mm and tests them with shapely; `AREA_MISMATCH` uses
+`Tolerances.area_rel` (1e-4 by default).
 
 - **Outline without booleans**: boundary edges of A (edges with only one
   face in A, i.e. against a thickness face) are mapped to 2D and chained
@@ -290,7 +298,7 @@ CSV: the same content, flattened to one row per segment.
 
 ## 3. Testing and benchmark
 
-### Fixture generator (`tests/fixtures/gen.py`, OCP only, no licence issues)
+### Fixture generator (`tests/parts.py`, OCP only, no licence issues)
 
 A 2D profile (flat lengths, angles, r, t) with inner fillet r and outer
 fillet r + t, extruded by a width. Shapes: L, U, Z, hat, hem, joggle, box
@@ -298,6 +306,12 @@ with corner reliefs. Variants: holes in a flange, **a hole through a bend**,
 a cut-out splitting a bend (grouping), seam-split cylinders
 (`ShapeUpgrade_FaceDivide`), NURBS-converted (`BRepBuilderAPI_NurbsConvert`,
 v0.2), each round-tripped through STEP.
+
+*As built*: `tests/parts.py` builds L, U, Z, hat, obtuse, acute, open hem
+and joggle profiles, holes in a flange and through a bend, sharp bends,
+countersinks and counterbores, and one part per DFM rule (cut-outs as boxes).
+The NURBS variants are made in `tests/test_canonical.py`. Not built yet: the
+box with corner reliefs, a cut-out splitting a bend, and seam-split cylinders.
 
 ### Tests
 
@@ -313,7 +327,7 @@ v0.2), each round-tripped through STEP.
   stripped pcurves, split faces, reversed faces) each expecting either a
   correct result after healing or a specific code.
 
-### BenDFM (`bench/bendfm.py`)
+### BenDFM (planned: `bench/bendfm.py`)
 
 20 000 synthetic bent parts with folded STEP, unfolded STEP, bend-sequence
 JSON and labels JSON. GPL-3.0 data: downloaded and cached at run time,
@@ -322,18 +336,27 @@ unfolded STEP on invariants (area, perimeter, hole count, sorted hole
 areas) and bend count against the labels. Report success rate and a
 histogram of refusal codes. *Verify* first which K and units BenDFM uses.
 
+*As built*: only the six example parts in the BenDFM repository are used, by
+`tests/test_external.py` when `FLATMAT_BENDFM_DIR` points at them (CI
+downloads them). It checks thickness, bend count and flat area against their
+unfolded STEP, with K = 0.45. The evaluation on the full 20 000 parts is not
+built yet.
+
 ### FreeCAD oracle
 
 Optional CI job in a FreeCAD + SheetMetal container comparing flat areas on
 the fixture set.
 
-### Benchmark (`bench/run.py`)
+### Benchmark (planned: `bench/run.py`)
 
 Times per stage (read, heal, unify, recognize, unfold, flat2d, export).
 Scaling series: perforated plate with N = 10 … 5000 holes, to show linear
 behaviour. 500 BenDFM parts for p50/p95. Target: recognize + unfold < 50 ms
 for ≤ 500 faces. Results stored as a CI JSON artifact; no hard threshold at
 first.
+
+*As built*: not built yet. The phase-0 spike measured the scaling series
+with `spike/run.py`.
 
 ### CI
 
@@ -356,7 +379,8 @@ matrix); ruff, mypy, pytest.
 3. ~~`recognize` → `bendmodel` → `unfold` → `export` → `cli`~~ **done for
    v0.1**, in `src/flatmat/`. Changes against the plan above:
    - the 2D outline lives in `unfold.py` (no separate `flat2d.py`);
-   - loop areas are exact (Green's theorem per line and arc);
+   - loop areas are exact (Green's theorem per line and arc; splines by
+     Gauss quadrature per knot span);
    - collinear lines and co-circular arcs are joined (SolidWorks splits
      circles into halves);
    - periodic B-spline pcurves are clamped with `SetNotPeriodic()` before
@@ -370,6 +394,24 @@ matrix); ruff, mypy, pytest.
 5. v0.2: canonical recognition, sharp bends, countersinks, DFM checks.
 6. Consumers: Snest calls flatmat from its STEP worker where it currently
    refuses bent parts.
+
+### Code layout (as built)
+
+All in `src/flatmat/`:
+
+| module | contents |
+|---|---|
+| `io.py` | STEP import and healing (§1.0, §6.1) → `StepModel` |
+| `canonical.py` | B-spline faces and edges that are really planes, cylinders, cones, lines or circles → analytic (§5.5) |
+| `recognize.py` | face graph, skins, thickness, sharp bends, bends, flanges, hole features (§1.1–1.3, §5.3–5.4) → `SheetPart` |
+| `_topology.py` | internal: the OCP-side context `recognize()` hands to `unfold()` (faces, bend faces, sharp edges, pcurves) |
+| `unfold.py` | per-face development, placement, outline, bend lines, self-checks (§1.4–1.6) → `FlatPattern` |
+| `bendmodel.py` | BA, BD, OSSB, K models, DIN 6935 (§1.7) |
+| `dfm.py` | manufacturability checks, one function per rule group (§7) → `DfmReport` |
+| `export.py` | DXF, bend table (JSON/CSV), SVG (§2) |
+| `model.py`, `diagnostics.py` | the public dataclasses and the diagnostic codes |
+| `_occ.py` | the differences between OCP 7.8 and 8.0 |
+| `cli.py` | `flatmat unfold` |
 
 ### Scope by version
 
