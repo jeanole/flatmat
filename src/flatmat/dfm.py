@@ -690,7 +690,11 @@ def _corner_relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None
         if any(math.dist(q, s) < rho for s in seen):
             continue
         seen.append(q)
-        fill = part.intersection(Point(q).buffer(rho, quad_segs=32)).area / disc_area
+        disc = Point(q).buffer(rho, quad_segs=32)
+        x0, y0, x1, y1 = disc.bounds
+        m = 0.1 * rho  # the clip box stays clear of the disc, so only the part inside the disc counts
+        near = shapely.clip_by_rect(part, x0 - m, y0 - m, x1 + m, y1 + m)  # the overlay sees the box, not the sheet
+        fill = near.intersection(disc).area / disc_area
         if fill > rules.corner_fill:
             add(Code.DFM_CORNER_RELIEF, f"bends {b.id} and {o.bend_id} meet without a corner relief "
                 f"(≥ ⌀{2 * rho:g} mm clear around the bend zones' corner)", q, b.id, other=o.bend_id,

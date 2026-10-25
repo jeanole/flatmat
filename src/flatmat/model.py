@@ -7,6 +7,8 @@ from dataclasses import dataclass, field, replace
 from functools import cache, cached_property
 from typing import Any, Literal
 
+import numpy as np
+
 from .diagnostics import Diagnostic
 
 Point = tuple[float, float]
@@ -136,6 +138,25 @@ class Spline:
         (x, y, ww), _ = self._deboor(u)
         return (x / ww, y / ww)
 
+    def points(self, us: np.ndarray) -> np.ndarray:
+        """:meth:`point` at many parameters at once (N x 2): the same steps on arrays, so the
+        same numbers to the last bit."""
+        p, kv = self.degree, np.asarray(self.flat_knots)
+        n = len(self.poles)
+        u = np.minimum(np.maximum(us, kv[p]), kv[n])
+        k = np.clip(np.searchsorted(kv, u, side="right") - 1, p, n - 1)  # the span, as _deboor walks to it
+        w = np.asarray(self.weights or (1.0,) * n)
+        poles = np.asarray(self.poles)
+        idx = k[:, None] - p + np.arange(p + 1)
+        d = np.stack([poles[idx, 0] * w[idx], poles[idx, 1] * w[idx], w[idx]], axis=-1)  # N x (p+1) x 3
+        for r in range(1, p + 1):
+            for j in range(p, r - 1, -1):
+                i = j + k - p
+                den = kv[i + p - r + 1] - kv[i]
+                a = np.divide(u - kv[i], den, out=np.zeros_like(u), where=den != 0)[:, None]
+                d[:, j] = (1 - a) * d[:, j - 1] + a * d[:, j]
+        return d[:, p, :2] / d[:, p, 2:3]
+
     @property
     def start(self) -> Point:
         return self.poles[0]  # clamped: the curve starts and ends on its end poles
@@ -159,7 +180,7 @@ class Spline:
         ctrl = sum(math.dist(a, b) for a, b in zip(self.poles, self.poles[1:], strict=False))
         n = max(8 * len(self.poles), min(4000, math.ceil(ctrl / max(tol, 1e-6) ** 0.5 * 2)))
         lo, hi = self.knots[0], self.knots[-1]
-        return [self.point(lo + (hi - lo) * i / n) for i in range(n + 1)]
+        return [tuple(q) for q in self.points(lo + (hi - lo) * np.arange(n + 1) / n).tolist()]
 
     def green(self) -> float:
         """The integral of (x dy - y dx) along the curve, by Gauss quadrature per knot span.
@@ -212,11 +233,22 @@ class Loop2D:
     segments: tuple[Seg2D, ...]
 
     def polyline(self, tol: float = SAMPLE_TOL) -> list[Point]:
-        pts: list[Point] = []
-        for s in self.segments:
-            sp = s.sample(tol)
-            pts.extend(sp if not pts else sp[1:])
-        return pts[:-1] if len(pts) > 1 and math.dist(pts[0], pts[-1]) < 1e-9 else pts
+        """The loop as points with chord error ``tol``.
+
+        Sampled once per tolerance (a loop does not change; the DFM checks and the folding
+        model ask for the same ones); each call gets its own copy.
+        """
+        if tol not in self._polylines:
+            pts: list[Point] = []
+            for s in self.segments:
+                sp = s.sample(tol)
+                pts.extend(sp if not pts else sp[1:])
+            self._polylines[tol] = pts[:-1] if len(pts) > 1 and math.dist(pts[0], pts[-1]) < 1e-9 else pts
+        return list(self._polylines[tol])
+
+    @cached_property
+    def _polylines(self) -> dict[float, list[Point]]:
+        return {}
 
     def area(self) -> float:
         """Signed area (counter-clockwise positive), exact for lines, arcs and splines.
