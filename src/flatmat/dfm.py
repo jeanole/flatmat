@@ -186,7 +186,12 @@ def check(
     With ``strict`` the findings are errors instead of warnings.
     """
     rules = rules or DfmRules()
-    mat = MATERIALS[material] if isinstance(material, str) else material
+    if isinstance(material, str):
+        if material not in MATERIALS:
+            raise ValueError(f"unknown material {material!r}; known: {', '.join(sorted(MATERIALS))}")
+        mat = MATERIALS[material]
+    else:
+        mat = material
     t = pattern.thickness
     v = die_v or die_opening(t)
     sev = Severity.ERROR if strict else Severity.WARNING

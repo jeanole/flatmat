@@ -75,6 +75,8 @@ def test_tonnage_and_material(flats):
     assert "DFM_TONNAGE" in fm.check(pat, machine_max_force_kn=10).codes()
     hem = flats["dfm_short_hem"]
     assert "DFM_HEM_MATERIAL" in fm.check(hem, material="aluminium_6061_t6").codes()
+    with pytest.raises(ValueError, match="unknown material 'steel304'"):
+        fm.check(pat, material="steel304")
 
 
 def test_grain_direction(flats):
