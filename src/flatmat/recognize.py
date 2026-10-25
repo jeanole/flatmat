@@ -275,13 +275,13 @@ def _plane_partners(faces: list[Face], tol: Tolerances) -> dict[int, tuple[float
     return found
 
 
-def _thickness(
-    faces: list[Face], skins: list[set[int]], partners: dict[int, tuple[float, int]], tol: Tolerances
-) -> tuple[float, float]:
+def _thickness(faces: list[Face], skins: list[set[int]], tol: Tolerances, max_planes: int = 12):
     """Thickness and the share of the sheet (by area) that agrees with it.
 
-    Candidates: coaxial cylinders on opposite skins, and planes whose partner lies on the
-    other skin.
+    Candidates: coaxial cylinders on opposite skins, and the largest planes of each skin
+    with the nearest antiparallel plane of the other skin. (Not the partners from
+    _plane_partners: their distance is measured along the other plane's normal, which can
+    differ in the last bit and moves t off a round value on some OCP builds.)
     """
     cands: list[tuple[float, float]] = []
     # coaxial cylinder pairs, bucketed by axis line (all pairs was O(n^2) on hole walls)
@@ -296,9 +296,26 @@ def _thickness(
                     dr = abs(a.radius - b.radius)
                     if dr > tol.linear:
                         cands.append((dr, min(a.area, b.area)))
-    for i, (d, g) in partners.items():
-        if (i in skins[0] and g in skins[1]) or (i in skins[1] and g in skins[0]):
-            cands.append((d, faces[i - 1].area))
+    # plane pairs, analytically: distance to antiparallel planes of the other skin,
+    # with the foot inside that face (a ray cast against the solid was O(n^2))
+    planes = [sorted((faces[i - 1] for i in s if faces[i - 1].kind == "plane"), key=lambda f: -f.area) for s in skins]
+    for side in (0, 1):
+        for f in planes[side][:max_planes]:
+            p = _inner_point(f)
+            if p is None:
+                continue
+            best = None
+            for g in planes[1 - side][:max_planes]:
+                if g.normal.Angle(f.normal) < math.pi - 1e-3:
+                    continue
+                d = abs(gp_Vec(g.ad.Plane().Location(), p).Dot(g.normal) / g.normal.Magnitude())
+                if d <= tol.linear or (best is not None and d >= best):
+                    continue
+                foot = gp_Pnt(p.XYZ() - f.normal.Normalized().XYZ() * d)
+                if g.inside(*_plane_uv(g, foot)):
+                    best = d
+            if best is not None:
+                cands.append((best, f.area))
     if not cands:
         raise refuse(Code.NO_THICKNESS, "no pair of opposite faces found")
     t0, band = _mode(cands, tol)
@@ -1163,7 +1180,7 @@ def recognize(
     formed = {i for reg in regions if not reg.developed for i in reg.faces}
     _check_skin_surfaces(faces, skins, formed)
 
-    t, conf = _thickness(faces, skins, plane_partners, tol)
+    t, conf = _thickness(faces, skins, tol)
     t = _checked_thickness(t, conf, thickness, tol)
     feature_groups, recesses = _between_skins(faces, edges, comps, skins, g, t, engrave, tol)
 
