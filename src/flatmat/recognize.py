@@ -89,10 +89,23 @@ def _face_table(solid) -> tuple[Any, list[Face]]:
     return fmap, faces
 
 
-def _edge_table(solid, fmap) -> list[tuple[Any, tuple[int, ...]]]:
+class _EdgeTable(list[tuple[Any, tuple[int, ...]]]):
+    """The solid's edges as (edge, indices of its faces), in the order of the map they
+    come from, which also finds an edge's index."""
+
+    def __init__(self, efm):
+        super().__init__()
+        self._efm = efm
+
+    def find(self, e) -> int:
+        """The index of edge e (the same edge, either orientation), or -1."""
+        return self._efm.FindIndex(e) - 1
+
+
+def _edge_table(solid, fmap) -> _EdgeTable:
     efm = EdgeFaceMap()
     TopExp.MapShapesAndAncestors_s(solid, TopAbs_EDGE, TopAbs_FACE, efm)
-    edges = []
+    edges = _EdgeTable(efm)
     for i in range(1, efm.Extent() + 1):
         e = as_edge(efm.FindKey(i))
         lst = efm.FindFromIndex(i)
@@ -120,17 +133,19 @@ class _Graph:
 
 
 def _is_smooth(e, f1: Face, f2: Face, tol: Tolerances) -> bool:
+    """The normals of both faces agree at three points along the edge."""
     c = BRepAdaptor_Curve(e)
     a, b = c.FirstParameter(), c.LastParameter()
-    worst = 0.0
+    sides = [(f, pcurve(e, f.shape)) for f in (f1, f2)]
     for s in (0.25, 0.5, 0.75):
         tm = a + s * (b - a)
         n = []
-        for f in (f1, f2):
-            uv = pcurve(e, f.shape).Value(tm)
+        for f, c2 in sides:
+            uv = c2.Value(tm)
             n.append(surface_props(f.shape, f.ad, uv.X(), uv.Y())[0])
-        worst = max(worst, n[0].Angle(n[1]))
-    return worst < tol.smooth_angle
+        if n[0].Angle(n[1]) >= tol.smooth_angle:
+            return False
+    return True
 
 
 def _graph(faces: list[Face], edges, tol: Tolerances) -> _Graph:
@@ -608,14 +623,14 @@ def _wires(face: Face):
     return outer, inner
 
 
-def _wire_edges(wire, face: Face, host: int, edges) -> list[int]:
+def _wire_edges(wire, face: Face, host: int, edges: _EdgeTable) -> list[int]:
     """Edge indices of a wire, in order along it."""
-    mine = [(ei, e) for ei, (e, fi) in enumerate(edges) if host in fi]
     out = []
     ex = BRepTools_WireExplorer(as_wire(wire), face.shape)
     while ex.More():
-        cur = ex.Current()
-        out += [ei for ei, e in mine if e.IsSame(cur)][:1]
+        ei = edges.find(ex.Current())
+        if ei >= 0 and host in edges[ei][1]:
+            out.append(ei)
         ex.Next()
     return out
 
