@@ -4,7 +4,7 @@ import json
 
 import ezdxf
 import pytest
-from parts import cases, dfm_cases, make_solid
+from parts import Part, cases, dfm_cases, make_solid
 
 import flatmat as fm
 from flatmat.dfm import bending_force_kn, die_opening
@@ -63,6 +63,35 @@ def test_strict_makes_errors(flats):
 def test_rules_are_configurable(flats):
     assert fm.check(flats["dfm_short_flange"], rules=fm.DfmRules(min_flange_v=0.5, min_flange_t=2.0)).ok
     assert fm.check(flats["dfm_short_flange"], rules=fm.DfmRules(disabled=frozenset({"DFM_FLANGE_TOO_SHORT"}))).ok
+
+
+def _perforated():
+    """Round holes far apart (left out of the web and slot morphology), two too close to be,
+    and a narrow slot (not round: kept in, and reported)."""
+    holes = [("flat", 0, f, z, 4.0) for f in (0.2, 0.5) for z in (20.0, 30.0, 40.0, 50.0)]
+    holes += [("flat", 0, 0.8, 75.0, 4.0), ("flat", 0, 0.8, 80.5, 4.0)]  # 1.5 mm apart
+    cuts = [((10.0, -2.0, 88.0), (30.0, 2.0, 89.0))]
+    return Part("dfm_perforated", t=2.0, width=100, flats=[50, 40], bends=[(90, 2.0)], holes=holes, cuts=cuts)
+
+
+def test_leaving_isolated_holes_out_changes_no_finding(flats, monkeypatch):
+    from flatmat import dfm
+
+    parts = dict(flats) | {"dfm_perforated": fm.unfold(fm.recognize(make_solid(_perforated())), k=K)}
+    seen = {}
+    real = dfm._isolated_holes
+
+    def counting(sheet, rad):
+        seen[id(sheet)] = real(sheet, rad)
+        return seen[id(sheet)]
+
+    monkeypatch.setattr(dfm, "_isolated_holes", counting)
+    with_shortcut = {name: fm.check(p).to_dict() for name, p in parts.items()}
+    assert len(next(v for v in seen.values() if len(v) >= 8)) == 8  # the 8 round holes far apart
+    monkeypatch.setattr(dfm, "_isolated_holes", lambda sheet, rad: set())
+    for name, p in parts.items():
+        assert fm.check(p).to_dict() == with_shortcut[name], name
+    assert "DFM_FEATURE_TOO_SMALL" in {f["code"] for f in with_shortcut["dfm_perforated"]["findings"]}
 
 
 @pytest.mark.parametrize("name", list(EXPECT))

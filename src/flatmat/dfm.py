@@ -274,8 +274,7 @@ def check(
 
     outer = Polygon(pattern.outer.polyline(SAMPLE_TOL))
     holes = [Polygon(h.polyline(SAMPLE_TOL)) for h in pattern.holes]
-    part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes])
-    part = cut_slits(part, pattern.slits, SAMPLE_TOL)
+    part = _part(outer, holes, pattern)
     lines_by_bend: dict[int, list] = {}
     for bl in pattern.bend_lines:
         lines_by_bend.setdefault(bl.bend_id, []).append(bl)
@@ -481,19 +480,78 @@ def _hole_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> set[int]:
     return flagged
 
 
+def _part(outer: Polygon, holes: list[Polygon], pattern: FlatPattern):
+    """The flat as one shapely polygon: outline minus holes, with the slits cut."""
+    part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes])
+    return cut_slits(part, pattern.slits, SAMPLE_TOL)
+
+
+# a narrow web or slot is reported if its piece of the opening or closing is larger than
+# this × rad² (a convex or concave corner alone changes < ~0.22 rad²)
+_PIECE_AREA = 0.6
+# a hole is left out of that morphology only with this much to spare
+_ISOLATION = 1.1
+
+
+def _isolated_holes(sheet: _Sheet, rad: float) -> set[int]:
+    """Holes that cannot take part in a narrow web or slot of half-width ``rad``.
+
+    With no other boundary (outline, hole, slit) within 2·rad of it, what opening and
+    closing do near a hole depends on the hole alone: nothing if it is a circle of radius
+    > rad; otherwise opening and closing the hole by itself tells, and it is left out if
+    no piece comes near the size that is reported.
+    """
+    reach = 2 * rad * _ISOLATION
+    slits = [LineString(sl.polyline(SAMPLE_TOL)) for sl in sheet.pattern.slits]
+    out = set()
+    for i, h in enumerate(sheet.holes):
+        if h.distance(sheet.outer.exterior) < reach or any(h.distance(s) < reach for s in slits):
+            continue
+        if any(j != i and h.distance(sheet.holes[j]) < reach for j in _near(sheet.hole_tree, h.bounds, reach)):
+            continue
+        segs = sheet.pattern.holes[i].segments
+        seg = segs[0]
+        if len(segs) == 1 and isinstance(seg, Arc) and seg.is_circle:
+            if seg.radius > rad * _ISOLATION:
+                out.add(i)
+        elif _morphology_change(h, rad) <= _PIECE_AREA * rad * rad / (2 * _ISOLATION):
+            out.add(i)
+    return out
+
+
+def _morphology_change(hole: Polygon, rad: float) -> float:
+    """How much area opening or closing by ``rad`` changes about one hole: a bound on its
+    largest piece.
+
+    Parts of the hole narrower than 2·rad are filled by the closing of the sheet (the
+    opening of the hole); tongues of sheet into it narrower than 2·rad are removed by the
+    opening of the sheet (the closing of the hole). Opening only removes and closing only
+    adds, so the change in area is the total of the pieces; polygonisation alone makes it
+    ~3e-2 rad² for a circle. Areas, not differences: an overlay of a polygon with a near
+    copy of itself costs ~10 ms per hole.
+    """
+    opened = hole.buffer(-rad, join_style="round").buffer(rad, join_style="round")
+    closed = hole.buffer(rad, join_style="round").buffer(-rad, join_style="round")
+    return max(hole.area - opened.area, closed.area - hole.area)
+
+
 def _web_and_slot_rules(sheet: _Sheet, rules: DfmRules, out: _Findings, flagged: set[int]) -> None:
     """Narrow webs (an opening removes them) and narrow slots (a closing fills them)."""
     add = out.add
     t, part, bends = sheet.t, sheet.part, sheet.bends
     rad = rules.min_feature_t * t / 2
+    # the two differences below are what this rule spends its time on; isolated holes
+    # (on perforated sheet, most of them) change neither, so they are left out
+    isolated = _isolated_holes(sheet, rad)
+    if isolated:
+        part = _part(sheet.outer, [h for i, h in enumerate(sheet.holes) if i not in isolated], sheet.pattern)
     near_flagged = unary_union([sheet.holes[i].buffer(rules.hole_to_edge_t * t) for i in flagged]) if flagged else None
     relief_margin = max((b.ba or 0) / 2 + b.r_in + 2 * t for b in bends.values()) if bends else 0.0
     opened = part.buffer(-rad, join_style="round").buffer(rad, join_style="round")
     closed = part.buffer(rad, join_style="round").buffer(-rad, join_style="round")
     for what, diff in (("web", part.difference(opened)), ("slot", closed.difference(part))):
         for piece in getattr(diff, "geoms", [diff]):
-            # a convex (opening) or concave (closing) corner alone changes < ~0.22 r²
-            if piece.is_empty or piece.area <= 0.6 * rad * rad:
+            if piece.is_empty or piece.area <= _PIECE_AREA * rad * rad:
                 continue
             if near_flagged is not None and piece.within(near_flagged):
                 continue  # the same narrow web as a hole-to-edge / hole-to-hole finding
