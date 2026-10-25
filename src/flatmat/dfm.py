@@ -191,13 +191,17 @@ class _Sheet:
 
     @cached_property
     def ends(self) -> list[tuple[tuple[float, float], BendLine, bool]]:
-        """Bend-line ends, and whether each sits on another bend (a corner where two bends meet)."""
+        """Bend-line ends, and whether each sits on another bend (a corner where two bends meet).
+
+        Pieces of the same bend (a hole across it splits its line) do not make a corner.
+        """
         reach = max(((b.ba or 0.0) / 2 + self.t for b in self.bends.values()), default=0.0)
         out = []
         for bl, _ls in self.all_lines:
             for end in (bl.p0, bl.p1):
                 corner = any(
-                    other is not bl and ls2.distance(Point(end)) <= (self.bends[other.bend_id].ba or 0.0) / 2 + self.t
+                    other.bend_id != bl.bend_id
+                    and ls2.distance(Point(end)) <= (self.bends[other.bend_id].ba or 0.0) / 2 + self.t
                     for other, ls2 in (self.all_lines[j] for j in _near(self.line_tree, (*end, *end), reach))
                 )
                 out.append((end, bl, corner))
@@ -680,7 +684,7 @@ def _corner_relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None
         others = [
             (o, ls)
             for o, ls in all_lines
-            if o is not bl and ls.distance(Point(e)) <= (bends[o.bend_id].ba or 0.0) / 2 + t
+            if o.bend_id != bl.bend_id and ls.distance(Point(e)) <= (bends[o.bend_id].ba or 0.0) / 2 + t
         ]
         if not others:
             continue
@@ -690,7 +694,11 @@ def _corner_relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None
         if any(math.dist(q, s) < rho for s in seen):
             continue
         seen.append(q)
-        fill = part.intersection(Point(q).buffer(rho, quad_segs=32)).area / disc_area
+        disc = Point(q).buffer(rho, quad_segs=32)
+        x0, y0, x1, y1 = disc.bounds
+        m = 0.1 * rho  # the clip box stays clear of the disc, so only the part inside the disc counts
+        near = shapely.clip_by_rect(part, x0 - m, y0 - m, x1 + m, y1 + m)  # the overlay sees the box, not the sheet
+        fill = near.intersection(disc).area / disc_area
         if fill > rules.corner_fill:
             add(Code.DFM_CORNER_RELIEF, f"bends {b.id} and {o.bend_id} meet without a corner relief "
                 f"(≥ ⌀{2 * rho:g} mm clear around the bend zones' corner)", q, b.id, other=o.bend_id,

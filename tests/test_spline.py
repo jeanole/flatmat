@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import pytest
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
 from OCP.BRepGProp import BRepGProp
@@ -76,3 +77,21 @@ def test_area_of_a_rational_circle():
     poles = ((1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0))
     s = Spline(2, poles, (0, 1, 2, 3, 4), (3, 2, 2, 2, 3), (1, h, 1, h, 1, h, 1, h, 1))
     assert Loop2D((s,)).area() == pytest.approx(math.pi, abs=1e-13)
+
+
+@pytest.mark.parametrize("rational", [False, True])
+def test_vectorised_points_are_point_to_the_last_bit(rational):
+    poles = ((0, 0), (1, 2), (3, 3), (4, 0), (6, 1), (7, 4))
+    weights = (1, 0.7, 1.3, 1, 0.5, 1) if rational else None
+    s = Spline(3, poles, (0.0, 0.3, 0.7, 1.0), (4, 1, 1, 4), weights)
+    us = [i / 333 for i in range(334)] + [0.3, 0.7, -0.1, 1.1]  # knots, and outside the range
+    assert [tuple(p) for p in s.points(np.asarray(us)).tolist()] == [s.point(u) for u in us]
+
+
+def test_polyline_is_sampled_once_and_handed_out_as_copies():
+    s = Spline(2, ((0, 0), (1, 1), (2, 0)), (0.0, 1.0), (3, 3))
+    loop = Loop2D((s, Line((2, 0), (0, 0))))
+    a = loop.polyline(0.01)
+    a.append((99.0, 99.0))
+    assert loop.polyline(0.01) == a[:-1] and loop.polyline(0.01) is not loop.polyline(0.01)
+    assert len(loop.polyline(0.001)) > len(a) - 1  # each tolerance on its own

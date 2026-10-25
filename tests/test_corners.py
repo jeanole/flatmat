@@ -1,7 +1,7 @@
 """The corner rule: where two bends meet, a relief around the bend zones, and a gap between the folded flanges."""
 
 import pytest
-from parts import box_solid
+from parts import box_solid, cases, make_solid
 
 import flatmat as fm
 
@@ -53,3 +53,13 @@ def test_closed_corner_gap(boxes):
 
 def test_open_corner_and_profiles_have_no_gap_findings(boxes):
     assert "DFM_CORNER_GAP" not in fm.check(boxes["ok"]).codes()  # 2 mm apart
+
+
+def test_a_hole_through_a_bend_is_not_a_corner(boxes):
+    # the hole splits the bend line in two: its pieces are one bend, not two bends meeting
+    part = next(p for p in cases() if p.name == "L_hole_in_bend")
+    pat = fm.unfold(fm.recognize(make_solid(part)), k=K)
+    assert "DFM_CORNER_RELIEF" not in fm.check(pat).codes()
+    for d in fm.check(boxes["tear"]).findings:
+        if d.code == fm.Code.DFM_CORNER_RELIEF:
+            assert d.data["bend"] != d.data["other"]
