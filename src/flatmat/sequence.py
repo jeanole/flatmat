@@ -257,7 +257,7 @@ def plan_bends(
     bends = {b.id: b for b in pattern.bends}
     # hems (pre-bent, closed with a flattening tool) and lances (formed with the blank, in a
     # punching tool) are not made on the press brake: not simulated, made first
-    lances = {f.bend_id for f in pattern.features if f.kind == "lance"}
+    lances = {f.bend_id for f in pattern.features if f.kind_info.tool_bent}
     hems = frozenset(b for b in model.bend_ids() if bends[b].kind == "hem" or b in lances)
     ids = [b for b in model.bend_ids() if b not in hems]
     unchecked = tuple(sorted(set(bends) - set(ids)))

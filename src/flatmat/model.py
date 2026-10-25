@@ -296,6 +296,44 @@ class Flange:
     area: float
 
 
+FeatureKindName = Literal[
+    "countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance", "engraving"
+]
+
+
+@dataclass(frozen=True)
+class FeatureKind:
+    """How the stages after recognition treat one kind of :class:`Feature`.
+
+    :data:`FEATURE_KINDS` is the one place that says this: unfold(), check(),
+    plan_bends() and the exports ask it instead of comparing kind names.
+    """
+
+    name: str  # in messages: "extruded hole"
+    # what the flat pattern shows: its through hole (countersink, counterbore), a pre-hole
+    # inside a marked rim (extruded hole), slits or an opening cut inside a marked rim
+    # (louvre, bridge, lance), or only a marked rim (emboss, engraving)
+    flat: Literal["hole", "pre_hole", "slits", "rim"]
+    formed: bool = False  # pressed out of the sheet: the DFM distance rules for formed features apply
+    owns_holes: bool = False  # the holes it cuts (pre-hole, slits, opening) are judged with it, not as holes
+    tool_bent: bool = False  # its tab is bent in the punching tool with the blank, not on the press brake
+    oriented: bool = False  # has a direction and a size in the flat instead of diameters
+    rim_layer: Literal["form", "engrave"] = "form"  # the LayerMap layer its rim is drawn on
+    label: bool = True  # a text label next to it in the DXF (an engraving's rim says it all)
+
+
+FEATURE_KINDS: dict[str, FeatureKind] = {
+    "countersink": FeatureKind("countersink", "hole"),
+    "counterbore": FeatureKind("counterbore", "hole"),
+    "emboss": FeatureKind("emboss", "rim", formed=True),
+    "extruded_hole": FeatureKind("extruded hole", "pre_hole", formed=True, owns_holes=True),
+    "louvre": FeatureKind("louvre", "slits", formed=True, owns_holes=True, oriented=True),
+    "bridge": FeatureKind("bridge", "slits", formed=True, owns_holes=True, oriented=True),
+    "lance": FeatureKind("lance", "slits", formed=True, owns_holes=True, tool_bent=True, oriented=True),
+    "engraving": FeatureKind("engraving", "rim", rim_layer="engrave", label=False),
+}
+
+
 @dataclass(frozen=True)
 class Feature:
     """A feature the flat outline cannot show: countersink, counterbore, emboss or extruded hole.
@@ -329,7 +367,7 @@ class Feature:
     """
 
     id: int
-    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance", "engraving"]
+    kind: FeatureKindName
     through_diameter: float
     outer_diameter: float
     side: Literal["top", "bottom"]  # top = the reference skin, facing the viewer of the flat
@@ -344,6 +382,11 @@ class Feature:
     size: tuple[float, float] | None = None  # louvre, bridge, lance; set by unfold()
     holes: tuple[int, ...] = ()  # set by unfold()
     bend_id: int | None = None  # lance
+
+    @property
+    def kind_info(self) -> FeatureKind:
+        """What this kind of feature is, for the stages that treat kinds differently."""
+        return FEATURE_KINDS[self.kind]
 
 
 @dataclass(frozen=True)

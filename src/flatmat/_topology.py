@@ -74,6 +74,26 @@ class SharpEdge:
 
 
 @dataclass(frozen=True)
+class FeatureData:
+    """What unfold() needs to know about one feature, beyond the public Feature."""
+
+    kind: str
+    # faces off the reference skin whose border with it is this feature's hole or rim
+    # (hole stacks, formed regions left out of the development)
+    outline_faces: tuple[int, ...] = ()
+    through_r: float = 0.0  # hole features: the through hole cut when the large rim is on the reference skin
+    on_a: bool = False  # the large rim (or the formed region) is on the reference skin
+    edges: frozenset[int] = frozenset()  # edges of a formed feature's opening, or of an engraving's rim
+    cuts: tuple[tuple[int, ...], ...] = ()  # a formed feature's slits, as runs of edges
+    gap: float = 0.0  # their width
+    developed: bool = False  # a lance laid flat by bending like any flange
+    free: tuple[int, tuple[int, ...]] = (0, ())  # host face, the region's edges along thickness faces
+    # an engraving's rim not in a face of the reference skin (the far skin, an island):
+    # (the reference-skin plane to project it onto, its edges in wire order)
+    projected_rim: tuple[int, tuple[int, ...]] | None = None
+
+
+@dataclass(frozen=True)
 class Context:
     """Everything unfold() needs; kept out of the public model."""
 
@@ -88,18 +108,7 @@ class Context:
     thickness: float
     bend_faces: dict[int, BendFace] = field(default_factory=dict)
     sharp_edges: dict[int, SharpEdge] = field(default_factory=dict)
-    features: dict[int, tuple[int, ...]] = field(default_factory=dict)  # feature id -> faces
-    feature_through_r: dict[int, float] = field(default_factory=dict)
-    feature_on_a: dict[int, bool] = field(default_factory=dict)
-    feature_kind: dict[int, str] = field(default_factory=dict)
-    feature_edges: dict[int, set[int]] = field(default_factory=dict)  # edges of a formed feature's opening
-    feature_cuts: dict[int, list[list[int]]] = field(default_factory=dict)  # its slits, as runs of edges
-    feature_gap: dict[int, float] = field(default_factory=dict)  # their width
-    developed: set[int] = field(default_factory=set)  # lances laid flat by bending
-    feature_free: dict[int, tuple[int, list[int]]] = field(default_factory=dict)  # host face, free edges
-    # rims of engravings not in a face of the reference skin (the far skin, islands):
-    # feature id -> (the reference-skin plane to project onto, edges of the rim in wire order)
-    projected_rims: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
+    features: dict[int, FeatureData] = field(default_factory=dict)  # by feature id, ascending
     tol: Tolerances = field(default_factory=Tolerances)
 
 

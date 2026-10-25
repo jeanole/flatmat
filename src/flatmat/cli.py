@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 
 from . import __version__
 from .bendmodel import KDin6935
@@ -12,6 +13,7 @@ from .dfm import MATERIALS, check
 from .diagnostics import FlatmatError
 from .export import write_bend_table, write_dxf, write_svg
 from .io import load_step
+from .model import Feature
 from .recognize import recognize
 from .tooling import DIES, PUNCHES, Tooling
 from .unfold import unfold
@@ -69,6 +71,31 @@ def _tooling(a, t: float):
     return None
 
 
+def _hole_details(f: Feature) -> str:
+    return f": through Ø{f.through_diameter:g}, outer Ø{f.outer_diameter:g}"
+
+
+def _oriented_details(f: Feature) -> str:
+    if not f.size:
+        return ""
+    return f": {f.size[0]:g} x {f.size[1]:g} at {f.orientation_deg:g}°, height {f.height:g}"
+
+
+# what the summary prints after "<kind> <side>" (one entry per kind in model.FEATURE_KINDS)
+_DETAILS: dict[str, Callable[[Feature], str]] = {
+    "countersink": _hole_details,
+    "counterbore": _hole_details,
+    "emboss": lambda f: f": height {f.height:g}",
+    "extruded_hole": lambda f: (
+        f": bore Ø{f.outer_diameter:g}, height {f.height:g}, pre-hole Ø{f.through_diameter:.3f}"
+    ),
+    "louvre": _oriented_details,
+    "bridge": _oriented_details,
+    "lance": _oriented_details,
+    "engraving": lambda f: f": depth {f.depth:.3g}" + (f", Ø{f.outer_diameter:g}" if f.outer_diameter else ""),
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
     try:
@@ -84,19 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  bend {b.id}: {b.direction:4} {b.angle_deg:7.2f}°  r_in {b.r_in:g}  K {b.k:.4f}  BA {b.ba:.4f}"
               f"  segments {len(b.segments)}")  # fmt: skip
     for f in pat.features:
-        if f.kind == "emboss":
-            print(f"  emboss {f.side}: height {f.height:g}")
-        elif f.kind in ("louvre", "bridge", "lance"):
-            print(f"  {f.kind} {f.side}: {f.size[0]:g} x {f.size[1]:g} at {f.orientation_deg:g}°, "
-                  f"height {f.height:g}" if f.size else f"  {f.kind} {f.side}")  # fmt: skip
-        elif f.kind == "engraving":
-            rim = f", Ø{f.outer_diameter:g}" if f.outer_diameter else ""
-            print(f"  engraving {f.side}: depth {f.depth:.3g}{rim}")
-        elif f.kind == "extruded_hole":
-            print(f"  extruded hole {f.side}: bore Ø{f.outer_diameter:g}, height {f.height:g}, "
-                  f"pre-hole Ø{f.through_diameter:.3f}")  # fmt: skip
-        else:
-            print(f"  {f.kind} {f.side}: through Ø{f.through_diameter:g}, outer Ø{f.outer_diameter:g}")
+        print(f"  {f.kind_info.name} {f.side}{_DETAILS[f.kind](f)}")
     for d in pat.diagnostics:
         print(f"  {d.severity.value}: {d.code.value}: {d.message}", file=sys.stderr)
     report = None

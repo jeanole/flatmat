@@ -296,9 +296,9 @@ def check(
         {b.id: b for b in pattern.bends},
         lines_by_bend,
         [(bl, LineString([bl.p0, bl.p1])) for bl in pattern.bend_lines],
-        {i for f in pattern.features if f.kind in _CUT_FORMS for i in f.holes},
-        [holes[i].exterior for f in pattern.features if f.kind == "lance" for i in f.holes],
-        {f.bend_id for f in pattern.features if f.kind == "lance"},
+        {i for f in pattern.features if f.kind_info.owns_holes for i in f.holes},
+        [holes[i].exterior for f in pattern.features if f.kind_info.tool_bent for i in f.holes],
+        {f.bend_id for f in pattern.features if f.kind_info.tool_bent},
     )
 
     checks = _bend_rules(sheet, mat, rules, out, tooling, rolling_direction_deg, machine_max_force_kn)
@@ -574,26 +574,21 @@ def _tool_limits(b: Bend, bls, tooling: Tooling, rules: DfmRules, add) -> None:
                 bls[0].p0, b.id, tool=name, length=extent)  # fmt: skip
 
 
-_CUT_FORMS = ("extruded_hole", "louvre", "bridge", "lance")
-_FORM_NAMES = {"emboss": "emboss", "extruded_hole": "extruded hole", "louvre": "louvre", "bridge": "bridge",
-               "lance": "lance"}  # fmt: skip
-
-
 def _formed(pattern: FlatPattern, outer: Polygon, holes, all_lines, bends, rules: DfmRules, t: float, add) -> None:
     """Formed features: their rims (a lance: its opening) to the bends and to the outline.
 
     A lance's own bend is not counted.
     """
     for f in pattern.features:
-        if f.kind not in _FORM_NAMES or f.center is None:
+        if not f.kind_info.formed or f.center is None:
             continue
         if f.outline is not None:
             rim = Polygon(f.outline.polyline(0.01))
-        elif f.kind == "lance" and f.holes:  # a bent lance: its opening
+        elif f.kind_info.tool_bent and f.holes:  # a bent lance: its opening
             rim = unary_union([holes[i] for i in f.holes]).convex_hull
         else:
             continue
-        name = _FORM_NAMES[f.kind]
+        name = f.kind_info.name
         d_edge = rim.exterior.distance(outer.exterior)
         if d_edge < rules.form_to_edge_t * t - 1e-9:
             add(Code.DFM_FORM_NEAR_EDGE, f"{name} {d_edge:.2f} mm from the edge < {rules.form_to_edge_t * t:g}",

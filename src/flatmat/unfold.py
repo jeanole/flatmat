@@ -23,7 +23,7 @@ from ._occ import OCP_VERSION
 from ._topology import Context, Face, edge_vertices, inner_uv, pcurve
 from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
 from .diagnostics import Code, Diagnostic, refuse, warn
-from .model import Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
+from .model import FEATURE_KINDS, Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
 
 Rigid = tuple[float, float, float, float]  # cos, sin, tx, ty
 _IDENTITY: Rigid = (1.0, 0.0, 0.0, 0.0)
@@ -130,11 +130,11 @@ def unfold(
         diags = [d for d in diags if d.code != Code.PRE_HOLE]  # the recognised pre-hole is replaced
         sheet_features = [
             _with(f, through_diameter=float(pre_hole(f) if callable(pre_hole) else pre_hole))
-            if f.kind == "extruded_hole"
+            if f.kind_info.flat == "pre_hole"
             else f
             for f in sheet_features
         ]
-    pre_r = {f.id: f.through_diameter / 2 for f in sheet_features if f.kind == "extruded_hole"}
+    pre_r = {f.id: f.through_diameter / 2 for f in sheet_features if f.kind_info.flat == "pre_hole"}
     outer, holes, feature_centers, outlines, hole_fid, slits, orient = _outline(ctx, devs, place, sharp_v, diags, pre_r)
 
     # self-checks
@@ -231,7 +231,7 @@ def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | N
     The direction is that of the bend line (a bent lance) or of the chord of the longest
     slit (the others; for a formed lance, the side it is held on).
     """
-    if f.kind not in ("louvre", "bridge", "lance"):
+    if not f.kind_info.oriented:
         return f
     if f.outline is not None:
         pts = f.outline.polyline(0.01)
@@ -386,7 +386,7 @@ def _circle_ccw(m, c2, a, b, cen) -> bool:
 
 def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, pre_r: dict[int, float]):
     faces = ctx.faces
-    feature_of_face = {i: fid for fid, fs in ctx.features.items() for i in fs}
+    feature_of_face = {i: fid for fid, fd in ctx.features.items() for i in fd.outline_faces}
     feature_of_edge: dict[int, int] = {}
     pieces = []  # (v_start, v_end, segment)
     for ei, (e, fi) in enumerate(ctx.edges):
@@ -407,10 +407,10 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
         if va != vb and math.dist(seg.start, pa) > math.dist(seg.end, pa):
             seg = seg.reversed()
         pieces.append((va, vb, seg))
-    for opening, es in ctx.feature_edges.items():  # openings of louvres, bridges, lances
-        for ei in es:
+    for opening, fd in ctx.features.items():  # openings of louvres, bridges, lances; rims of engravings
+        for ei in fd.edges:
             feature_of_edge.setdefault(ei, opening)
-    cut_edges = {ei for chains in ctx.feature_cuts.values() for c in chains for ei in c}
+    cut_edges = {ei for fd in ctx.features.values() for c in fd.cuts for ei in c}
     loops = [
         _merge_collinear(_close(segs, jv, sharp_v, ctx.tol.flat), keep_apart=cut_edges) for segs, jv in _chain(pieces)
     ]
@@ -431,11 +431,12 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
         if fid is None:
             out.append((L, None))
             continue
-        kind = ctx.feature_kind.get(fid)
-        if kind == "lance" and fid in ctx.developed:
+        fd = ctx.features[fid]
+        flat = FEATURE_KINDS[fd.kind].flat
+        if fd.developed:  # a lance laid flat: its opening is cut as it is
             out.append((L, fid))
             continue
-        if kind in ("louvre", "bridge", "lance"):
+        if flat == "slits":
             rim = L if L.area() > 0 else _reverse_loop(L)
             outlines[fid] = rim
             cut_area = 0.0
@@ -443,8 +444,8 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
             if runs:
                 c = max(runs, key=lambda ch: math.dist(ch[0].start, ch[-1].end))
                 orient[fid] = math.atan2(c[-1].end[1] - c[0].start[1], c[-1].end[0] - c[0].start[0])
-            host, free = ctx.feature_free.get(fid, (0, []))
-            if ctx.feature_gap.get(fid, 0.0) <= 1e-6 or not free:
+            host, free = fd.free
+            if fd.gap <= 1e-6 or not free:
                 slits.extend((Loop2D(tuple(chain)), fid) for chain in runs)  # no width: cut lines
             else:
                 edge_pts = [_on_host(ctx, devs, place, host, ctx.edges[ei][0]) for ei in free]
@@ -453,12 +454,12 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
                     cut_area += abs(slot.area())
             centers[fid] = (_centroid(rim), rim.area() - cut_area)
             continue
-        if kind in ("emboss", "engraving"):
+        if flat == "rim":
             rim = L if L.area() > 0 else _reverse_loop(L)
             outlines[fid] = rim
             centers[fid] = (_centroid(rim), rim.area())
             continue
-        if kind == "extruded_hole":
+        if flat == "pre_hole":
             seg = L.segments[0]
             if len(L.segments) != 1 or not isinstance(seg, Arc) or not seg.is_circle:
                 raise refuse(Code.FORMED_FEATURE, "the rim of an extruded hole is not a circle in the flat")
@@ -473,15 +474,18 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
             out.append((L, fid))
             continue
         arc = L.segments[0]
-        if ctx.feature_on_a.get(fid):
-            r = ctx.feature_through_r[fid]
+        if fd.on_a:
+            r = fd.through_r
             centers[fid] = (arc.center, math.pi * (arc.radius**2 - r**2))
             out.append((Loop2D((Arc(arc.center, r, arc.a0, arc.a1, arc.ccw, arc.source_edge),)), fid))
         else:
             centers[fid] = (arc.center, 0.0)
             out.append((L, fid))
     # rims of engravings on the far skin or round an island: projected onto the plane behind them
-    for fid, (behind, rim_edges) in ctx.projected_rims.items():
+    for fid, fd in ctx.features.items():
+        if fd.projected_rim is None:
+            continue
+        behind, rim_edges = fd.projected_rim
         rim = _projected_rim(ctx, devs, place, behind, rim_edges)
         rim = rim if rim.area() > 0 else _reverse_loop(rim)
         outlines[fid] = rim
@@ -495,7 +499,7 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
     return outer, holes, centers, outlines, hole_fid, slits, orient
 
 
-def _projected_rim(ctx: Context, devs, place, host: int, rim: list[int]) -> Loop2D:
+def _projected_rim(ctx: Context, devs, place, host: int, rim: tuple[int, ...]) -> Loop2D:
     """A closed wire of edges, in wire order, projected onto the plane ``host`` in the flat."""
     from OCP.BRepAdaptor import BRepAdaptor_Curve
 
