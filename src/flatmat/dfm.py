@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from shapely import STRtree
 from shapely.geometry import LineString, Point, Polygon
@@ -168,6 +169,49 @@ def _unit(p0, p1):
 # ------------------------------------------------------------------------------- check
 
 
+@dataclass
+class _Sheet:
+    """The flat pattern as the rules see it: shapely geometry, bends and their lines."""
+
+    pattern: FlatPattern
+    t: float
+    v: float  # die opening
+    outer: Polygon
+    holes: list[Polygon]
+    part: Polygon  # outer minus holes
+    bends: dict[int, Bend]
+    lines_by_bend: dict[int, list[BendLine]]
+    all_lines: list[tuple[BendLine, LineString]]
+
+    @cached_property
+    def ends(self) -> list[tuple[tuple[float, float], BendLine, bool]]:
+        """Bend-line ends, and whether each sits on another bend (a corner where two bends meet)."""
+        out = []
+        for bl, _ls in self.all_lines:
+            for end in (bl.p0, bl.p1):
+                corner = any(
+                    other is not bl and ls2.distance(Point(end)) <= (self.bends[other.bend_id].ba or 0.0) / 2 + self.t
+                    for other, ls2 in self.all_lines
+                )
+                out.append((end, bl, corner))
+        return out
+
+
+class _Findings:
+    """Collects findings; a rule that is switched off adds none, and can ask to skip its work."""
+
+    def __init__(self, rules: DfmRules, sev: Severity):
+        self.rules, self.sev = rules, sev
+        self.items: list[Diagnostic] = []
+
+    def on(self, *codes: Code) -> bool:
+        return any(c.value not in self.rules.disabled for c in codes)
+
+    def add(self, code: Code, msg: str, at=None, bend=None, info: bool = False, **data) -> None:
+        if self.on(code):
+            self.items.append(_finding(code, msg, Severity.INFO if info else self.sev, at, bend, **data))
+
+
 def check(
     pattern: FlatPattern,
     *,
@@ -194,26 +238,50 @@ def check(
         mat = material
     t = pattern.thickness
     v = die_v or die_opening(t)
-    sev = Severity.ERROR if strict else Severity.WARNING
-    out: list[Diagnostic] = []
-
-    def add(code: Code, msg: str, at=None, bend=None, info: bool = False, **data):
-        if code.value not in rules.disabled:
-            out.append(_finding(code, msg, Severity.INFO if info else sev, at, bend, **data))
+    out = _Findings(rules, Severity.ERROR if strict else Severity.WARNING)
 
     outer = Polygon(pattern.outer.polyline(0.01))
     holes = [Polygon(h.polyline(0.01)) for h in pattern.holes]
-    part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes])
-    bends = {b.id: b for b in pattern.bends}
     lines_by_bend: dict[int, list] = {}
     for bl in pattern.bend_lines:
         lines_by_bend.setdefault(bl.bend_id, []).append(bl)
-    all_lines = [(bl, LineString([bl.p0, bl.p1])) for bl in pattern.bend_lines]
+    sheet = _Sheet(
+        pattern,
+        t,
+        v,
+        outer,
+        holes,
+        Polygon(outer.exterior.coords, [h.exterior.coords for h in holes]),
+        {b.id: b for b in pattern.bends},
+        lines_by_bend,
+        [(bl, LineString([bl.p0, bl.p1])) for bl in pattern.bend_lines],
+    )
 
-    # ---- per bend: flanges, radius, angle, hem, tonnage
+    checks = _bend_rules(sheet, mat, rules, out, rolling_direction_deg, machine_max_force_kn)
+    if out.on(Code.DFM_U_CHANNEL):
+        _u_channels(pattern, sheet.bends, checks, rules, out.add)
+    flagged = _hole_rules(sheet, rules, out)
+    if out.on(Code.DFM_FEATURE_TOO_SMALL):
+        _web_and_slot_rules(sheet, rules, out, flagged)
+    if out.on(Code.DFM_RELIEF_MISSING):
+        _relief_rules(sheet, rules, out)
+    return DfmReport(mat, v, tuple(out.items), tuple(checks), rules)
+
+
+def _bend_rules(
+    sheet: _Sheet,
+    mat: Material,
+    rules: DfmRules,
+    out: _Findings,
+    rolling_direction_deg: float | None,
+    machine_max_force_kn: float | None,
+) -> list[BendCheck]:
+    """Per bend: flanges, hem, radius, angle and tonnage; always measured for the report."""
+    add = out.add
+    t, v, bends = sheet.t, sheet.v, sheet.bends
     checks: list[BendCheck] = []
     for bid, b in bends.items():
-        bls = lines_by_bend.get(bid, [])
+        bls = sheet.lines_by_bend.get(bid, [])
         if not bls:
             continue
         ba = b.ba or 0.0
@@ -227,7 +295,7 @@ def check(
                 s = 0.05 + 0.9 * k / 10
                 p = (bl.p0[0] + s * length * u[0], bl.p0[1] + s * length * u[1])
                 for side, sg in ((0, 1.0), (1, -1.0)):
-                    leg = _leg(p, (sg * n[0], sg * n[1]), outer, all_lines, bl, bends, ba, b, t)
+                    leg = _leg(p, (sg * n[0], sg * n[1]), sheet.outer, sheet.all_lines, bl, bends, ba, b, t)
                     legs[side].append(leg)
                     if leg < worst[side][0]:
                         worst[side] = (leg, p)
@@ -274,26 +342,39 @@ def check(
             add(Code.DFM_TONNAGE, f"bend {bid}: {force:.0f} kN > machine {machine_max_force_kn:g} kN",
                 bls[0].p0, bid, force_kn=force)  # fmt: skip
         checks.append(BendCheck(bid, v, r_air, force, need, (med[0], med[1])))
+    return checks
 
-    # ---- U channels: two parallel bends of the same direction, base < ratio * flange
-    _u_channels(pattern, bends, checks, rules, add)
 
-    # ---- holes: size, edge, each other, bends
-    tree = STRtree(holes) if holes else None
-    flagged: set[int] = set()  # holes already reported for a narrow web (no duplicate below)
+def _hole_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> set[int]:
+    """Holes: size, distance to the edge, to each other and to the bends.
+
+    Returns the holes that sit in a narrow web (near the edge or another hole), which the
+    web rule does not report a second time; so those distances are measured whenever
+    the web rule is on, even when their own rules are off.
+    """
+    add = out.add
+    t, v, holes, bends = sheet.t, sheet.v, sheet.holes, sheet.bends
+    webs = out.on(Code.DFM_FEATURE_TOO_SMALL)
+    to_edge = webs or out.on(Code.DFM_HOLE_NEAR_EDGE)
+    to_holes = webs or out.on(Code.DFM_HOLES_TOO_CLOSE)
+    to_bends = out.on(Code.DFM_CUT_IN_BEND_ZONE, Code.DFM_HOLE_NEAR_BEND)
+    tree = STRtree(holes) if holes and to_holes else None
+    flagged: set[int] = set()
     for i, h in enumerate(holes):
         c = h.centroid
-        loop = pattern.holes[i]
+        loop = sheet.pattern.holes[i]
         seg0 = loop.segments[0]
         if len(loop.segments) == 1 and isinstance(seg0, Arc) and seg0.is_circle:
             dia = 2 * seg0.radius
             if dia < rules.min_hole_t * t - 1e-9:
-                add(Code.DFM_HOLE_TOO_SMALL, f"hole ⌀{dia:g} < {rules.min_hole_t * t:g} mm", (c.x, c.y), diameter=dia)
-        d_edge = h.distance(outer.exterior)
-        if d_edge < rules.hole_to_edge_t * t - 1e-9:
-            flagged.add(i)
-            add(Code.DFM_HOLE_NEAR_EDGE, f"hole {d_edge:.2f} mm from the edge < {rules.hole_to_edge_t * t:g}",
-                (c.x, c.y), distance=d_edge)  # fmt: skip
+                add(Code.DFM_HOLE_TOO_SMALL, f"hole ⌀{dia:g} < {rules.min_hole_t * t:g} mm", (c.x, c.y),
+                    diameter=dia)  # fmt: skip
+        if to_edge:
+            d_edge = h.distance(sheet.outer.exterior)
+            if d_edge < rules.hole_to_edge_t * t - 1e-9:
+                flagged.add(i)
+                add(Code.DFM_HOLE_NEAR_EDGE, f"hole {d_edge:.2f} mm from the edge < {rules.hole_to_edge_t * t:g}",
+                    (c.x, c.y), distance=d_edge)  # fmt: skip
         if tree is not None:
             for j in tree.query(h.buffer(rules.hole_to_hole_t * t)):
                 j = int(j)
@@ -304,8 +385,10 @@ def check(
                     flagged.update((i, j))
                     add(Code.DFM_HOLES_TOO_CLOSE, f"web between holes {d:.2f} mm < {rules.hole_to_hole_t * t:g}",
                         (c.x, c.y), distance=d)  # fmt: skip
+        if not to_bends:
+            continue
         in_zone: set[int] = set()
-        for bl, ls in all_lines:
+        for bl, ls in sheet.all_lines:
             b = bends[bl.bend_id]
             ba = b.ba or 0.0
             d = h.distance(ls)
@@ -320,23 +403,16 @@ def check(
             if d < need - 1e-9 and _beside(h, bl):
                 add(Code.DFM_HOLE_NEAR_BEND, f"hole {d - ba / 2:.2f} mm from the tangent line of bend {b.id}; "
                     f"needs {need - ba / 2:.2f}", (c.x, c.y), b.id, distance=d, required=need)  # fmt: skip
+    return flagged
 
-    # bend-line ends, and which of them sit on another bend (a corner where two bends meet)
-    ends: list[tuple[tuple[float, float], object, bool]] = []
-    for bl, _ls in all_lines:
-        for end in (bl.p0, bl.p1):
-            corner = any(
-                other is not bl and ls2.distance(Point(end)) <= (bends[other.bend_id].ba or 0.0) / 2 + t
-                for other, ls2 in all_lines
-            )
-            ends.append((end, bl, corner))
 
-    def near_bend_end(geom, margin: float) -> bool:
-        return any(Point(e).distance(geom) <= margin for e, _, _ in ends)
-
-    # ---- narrow webs (opening removes them) and narrow slots (closing fills them)
+def _web_and_slot_rules(sheet: _Sheet, rules: DfmRules, out: _Findings, flagged: set[int]) -> None:
+    """Narrow webs (an opening removes them) and narrow slots (a closing fills them)."""
+    add = out.add
+    t, part, bends = sheet.t, sheet.part, sheet.bends
     rad = rules.min_feature_t * t / 2
-    near_flagged = unary_union([holes[i].buffer(rules.hole_to_edge_t * t) for i in flagged]) if flagged else None
+    near_flagged = unary_union([sheet.holes[i].buffer(rules.hole_to_edge_t * t) for i in flagged]) if flagged else None
+    relief_margin = max((b.ba or 0) / 2 + b.r_in + 2 * t for b in bends.values()) if bends else 0.0
     opened = part.buffer(-rad, join_style="round").buffer(rad, join_style="round")
     closed = part.buffer(rad, join_style="round").buffer(-rad, join_style="round")
     for what, diff in (("web", part.difference(opened)), ("slot", closed.difference(part))):
@@ -346,17 +422,20 @@ def check(
                 continue
             if near_flagged is not None and piece.within(near_flagged):
                 continue  # the same narrow web as a hole-to-edge / hole-to-hole finding
-            if what == "slot" and near_bend_end(piece, max((b.ba or 0) / 2 + b.r_in + 2 * t for b in bends.values())
-                                                if bends else 0.0):  # fmt: skip
+            if what == "slot" and any(Point(e).distance(piece) <= relief_margin for e, _, _ in sheet.ends):
                 continue  # a relief: judged by the relief rule, not as a slot
             c = piece.representative_point()
             add(Code.DFM_FEATURE_TOO_SMALL, f"{what} narrower than {2 * rad:.2f} mm"
                 + (" (or a very acute corner)" if what == "web" else ""), (c.x, c.y), area=piece.area)  # fmt: skip
 
-    # ---- reliefs at bend ends (not at corners where two bends meet: those need a corner relief)
-    corner_ends = {(id(bl), e) for e, bl, corner in ends if corner}
-    for bl, _ls in all_lines:
-        b = bends[bl.bend_id]
+
+def _relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
+    """Reliefs at bend ends (not at corners where two bends meet: those need a corner relief)."""
+    add = out.add
+    t, part = sheet.t, sheet.part
+    corner_ends = {(id(bl), e) for e, bl, corner in sheet.ends if corner}
+    for bl, _ls in sheet.all_lines:
+        b = sheet.bends[bl.bend_id]
         ba = b.ba or 0.0
         u, _ = _unit(bl.p0, bl.p1)
         n = (-u[1], u[0])
@@ -365,7 +444,7 @@ def check(
         for end, sign in ((bl.p1, 1.0), (bl.p0, -1.0)):
             if (id(bl), end) in corner_ends:
                 continue
-            if any(h.exterior.distance(Point(end)) < 1e-3 for h in holes):
+            if any(h.exterior.distance(Point(end)) < 1e-3 for h in sheet.holes):
                 continue  # the bend line stops at a hole in the bend zone: DFM_CUT_IN_BEND_ZONE
             q0 = (end[0] + sign * u[0] * 1e-3, end[1] + sign * u[1] * 1e-3)
             q1 = (end[0] + sign * u[0] * width, end[1] + sign * u[1] * width)
@@ -386,8 +465,6 @@ def check(
             if fill > rules.relief_fill:
                 add(Code.DFM_RELIEF_MISSING, f"bend {b.id} ends in material: needs a relief ≥ {width:g} mm wide, "
                     f"≥ {b.r_in + t:g} mm deep past the tangent line", end, b.id)  # fmt: skip
-
-    return DfmReport(mat, v, tuple(out), tuple(checks), rules)
 
 
 def _beside(h: Polygon, bl) -> bool:
