@@ -116,7 +116,7 @@ def test_curved_louvre(flats):
     _, sheet, pat = flats["louvre_arc"]
     (f,) = pat.features
     assert f.kind == "louvre" and f.height == pytest.approx(5.0)
-    assert sheet._ctx.feature_gap[f.id] == pytest.approx(0.5, abs=1e-6)
+    assert sheet._ctx.features[f.id].gap == pytest.approx(0.5, abs=1e-6)
     (slot,) = (pat.holes[i] for i in f.holes)
     arcs = [s for s in slot.segments if isinstance(s, Arc)]
     # the sheet's edge (r 24.5), the hood's edge projected (r 25), and the rim between them: exact arcs

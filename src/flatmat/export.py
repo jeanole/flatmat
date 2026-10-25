@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -13,7 +14,8 @@ import ezdxf
 
 from . import __version__
 from ._occ import OCP_VERSION
-from .model import Arc, FlatPattern, Line, Loop2D, Spline
+from .geom2d import heading, midpoint
+from .model import SAMPLE_TOL, Arc, Feature, FlatPattern, Line, Loop2D, Spline
 
 Labels = Literal["delem", "plain"] | None
 
@@ -85,7 +87,7 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
         _add_loop(msp, sl, layers.inner)
     for f in pattern.features:
         if f.outline is not None:
-            _add_loop(msp, f.outline, layers.engrave if f.kind == "engraving" else layers.form)
+            _add_loop(msp, f.outline, layers.engrave if f.kind_info.rim_layer == "engrave" else layers.form)
     w, h = pattern.size
     th = text_height or max(1.0, min(5.0, 0.02 * max(w, h)))
     for bl in pattern.bend_lines:
@@ -98,8 +100,8 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
                 continue
             done.add(bl.bend_id)
             b = next(b for b in pattern.bends if b.id == bl.bend_id)
-            mid = ((bl.p0[0] + bl.p1[0]) / 2, (bl.p0[1] + bl.p1[1]) / 2)
-            ang = math.degrees(math.atan2(bl.p1[1] - bl.p0[1], bl.p1[0] - bl.p0[0]))
+            mid = midpoint(bl.p0, bl.p1)
+            ang = math.degrees(heading(bl.p0, bl.p1))
             if ang > 90 or ang <= -90:
                 ang -= 180 if ang > 0 else -180
             msp.add_text(
@@ -107,7 +109,7 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
                 dxfattribs={"layer": layers.text, "height": th, "rotation": ang},
             ).set_placement(mid)
         for f in pattern.features:
-            if f.center is None or f.kind == "engraving":  # its rim says it all; text is often many rims
+            if f.center is None or not f.kind_info.label:  # an engraving's rim says it all (text is many rims)
                 continue
             x, y = f.center
             msp.add_text(_feature_label(f), dxfattribs={"layer": layers.text, "height": th * 0.6}).set_placement(
@@ -141,22 +143,34 @@ def _step_prefix(dfm, bend_id: int) -> str:
     return f"({n}) " if n is not None else ""
 
 
-def _feature_label(f) -> str:
-    side = f.side.upper()
-    if f.kind == "countersink":
-        return f"CSK {f.angle_deg:.0f}° Ø{f.outer_diameter:g} {side}"
-    if f.kind == "counterbore":
-        depth = f" T{f.depth:g}" if f.depth else ""
-        return f"CBORE Ø{f.outer_diameter:g}{depth} {side}"
-    if f.kind == "extruded_hole":
-        return f"EXTR Ø{f.outer_diameter:.4g} H{f.height:.4g} {side} (PRE Ø{f.through_diameter:.3f})"
-    if f.kind in ("louvre", "bridge", "lance"):
-        size = f"{f.size[0]:.4g}x{f.size[1]:.4g} " if f.size else ""
-        angle = f"A{f.orientation_deg:.4g} " if f.orientation_deg is not None else ""
-        return f"{f.kind.upper()} {size}{angle}H{f.height:.4g} {side}"
-    if f.kind == "engraving":
-        return f"ENGRAVE T{f.depth:.3g} {side}"
-    return f"EMBOSS H{f.height:.4g} {side}"
+def _feature_label(f: Feature) -> str:
+    return _LABELS[f.kind](f, f.side.upper())
+
+
+def _counterbore_label(f: Feature, side: str) -> str:
+    depth = f" T{f.depth:g}" if f.depth else ""
+    return f"CBORE Ø{f.outer_diameter:g}{depth} {side}"
+
+
+def _oriented_label(f: Feature, side: str) -> str:
+    size = f"{f.size[0]:.4g}x{f.size[1]:.4g} " if f.size else ""
+    angle = f"A{f.orientation_deg:.4g} " if f.orientation_deg is not None else ""
+    return f"{f.kind.upper()} {size}{angle}H{f.height:.4g} {side}"
+
+
+# the DXF text next to each kind of feature (one entry per kind in model.FEATURE_KINDS)
+_LABELS: dict[str, Callable[[Feature, str], str]] = {
+    "countersink": lambda f, side: f"CSK {f.angle_deg:.0f}° Ø{f.outer_diameter:g} {side}",
+    "counterbore": _counterbore_label,
+    "emboss": lambda f, side: f"EMBOSS H{f.height:.4g} {side}",
+    "extruded_hole": lambda f, side: (
+        f"EXTR Ø{f.outer_diameter:.4g} H{f.height:.4g} {side} (PRE Ø{f.through_diameter:.3f})"
+    ),
+    "louvre": _oriented_label,
+    "bridge": _oriented_label,
+    "lance": _oriented_label,
+    "engraving": lambda f, side: f"ENGRAVE T{f.depth:.3g} {side}",
+}
 
 
 def _add_loop(msp, loop: Loop2D, layer: str) -> None:
@@ -219,7 +233,7 @@ def bend_table(pattern: FlatPattern) -> dict:
             "depth": f.depth,
             "height": f.height,
             "radius": f.radius,
-            "rim": [list(p) for p in f.outline.polyline(0.01)] if f.outline is not None else None,
+            "rim": [list(p) for p in f.outline.polyline(SAMPLE_TOL)] if f.outline is not None else None,
             "orientation_deg": f.orientation_deg,
             "size": list(f.size) if f.size else None,
             "holes": list(f.holes),
@@ -236,7 +250,7 @@ def bend_table(pattern: FlatPattern) -> dict:
         "flat_area": pattern.area,
         "bends": bends,
         "features": features,
-        "slits": [[list(p) for p in sl.polyline(0.01)] for sl in pattern.slits],
+        "slits": [[list(p) for p in sl.polyline(SAMPLE_TOL)] for sl in pattern.slits],
         "generator": {"flatmat": __version__, "ocp": OCP_VERSION},
         "diagnostics": [d.to_dict() for d in pattern.diagnostics],
     }
@@ -290,13 +304,16 @@ def write_bend_table(pattern: FlatPattern, path: str | os.PathLike, *, dfm=None)
 # ------------------------------------------------------------------------------ SVG
 
 
+_SVG_TOL = 0.02  # chord error of the SVG preview, mm (a picture, not geometry)
+
+
 def write_svg(pattern: FlatPattern, path: str | os.PathLike, *, margin: float = 5.0) -> None:
     """A quick visual check (not for production): outline, holes, bend lines."""
     w, h = pattern.size
     W, H = w + 2 * margin, h + 2 * margin
 
     def pts(loop: Loop2D) -> str:
-        return " ".join(f"{x + margin:.4f},{H - (y + margin):.4f}" for x, y in loop.polyline(0.02))
+        return " ".join(f"{x + margin:.4f},{H - (y + margin):.4f}" for x, y in loop.polyline(_SVG_TOL))
 
     sw = max(w, h) / 800
     out = [

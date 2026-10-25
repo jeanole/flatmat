@@ -27,7 +27,8 @@ import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
-from .model import FlatPattern
+from .geom2d import cut_slits, midpoint, offset, perp, unit
+from .model import SAMPLE_TOL, Bend, BendLine, FlatPattern
 
 
 @dataclass(frozen=True)
@@ -49,104 +50,32 @@ class Hinge:
     p1: tuple[float, float]
 
 
+@dataclass(frozen=True)
+class _Crossing:
+    """A bend line segment whose strip separates two regions: a hinge before the tree picks its parent."""
+
+    bend: Bend
+    line: BendLine
+    region_a: int  # on the -n side
+    region_b: int  # on the +n side
+    mid: tuple[float, float]  # middle of the segment
+    u: tuple[float, float]  # along it
+    n: tuple[float, float]  # across it, from region_a to region_b
+
+
 class FoldModel:
     """Regions of a flat pattern and the hinges between them."""
 
-    def __init__(self, pattern: FlatPattern, tol: float = 0.01):
-        t = pattern.thickness
-        self.t = t
+    def __init__(self, pattern: FlatPattern, tol: float = SAMPLE_TOL):
+        self.t = pattern.thickness
         self.pattern = pattern
-        bends = {b.id: b for b in pattern.bends}
-        part = Polygon(pattern.outer.polyline(tol), [h.polyline(tol) for h in pattern.holes]).buffer(0)
-        for sl in pattern.slits:  # cut lines without width still separate what they cut
-            part = part.difference(LineString(sl.polyline(tol)).buffer(1e-3))
-        strips = []
-        for bl in pattern.bend_lines:
-            b = bends[bl.bend_id]
-            u, length = _unit(bl.p0, bl.p1)
-            if length <= 1e-9:
-                continue
-            ext = t  # past the line's ends, so the strip separates its two sides in the corners too
-            half = max((b.ba or 0.0) / 2, 1e-3)
-            n = (-u[1], u[0])
-            q0 = (bl.p0[0] - u[0] * ext, bl.p0[1] - u[1] * ext)
-            q1 = (bl.p1[0] + u[0] * ext, bl.p1[1] + u[1] * ext)
-            strips.append(
-                Polygon(
-                    [
-                        (q[0] + s * n[0] * half, q[1] + s * n[1] * half)
-                        for q, s in ((q0, -1), (q1, -1), (q1, 1), (q0, 1))
-                    ]
-                )
-            )
-        rest = part.difference(unary_union(strips)) if strips else part
-        pieces = [g for g in getattr(rest, "geoms", [rest]) if isinstance(g, Polygon) and g.area > 1e-6 * part.area]
-        self.regions: list[Polygon] = pieces
-        self.unseparated: set[int] = set()  # bends whose two sides are one region (no relief?)
-
-        def region_at(p) -> int | None:
-            pt = Point(p)
-            best = min(range(len(pieces)), key=lambda i: pieces[i].distance(pt), default=None)
-            if best is None or pieces[best].distance(pt) > 0.05 + 0.05 * t:
-                return None
-            return best
-
-        raw = []
-        for bl in pattern.bend_lines:
-            b = bends[bl.bend_id]
-            u, length = _unit(bl.p0, bl.p1)
-            if length <= 1e-9:
-                continue
-            n = (-u[1], u[0])
-            m = ((bl.p0[0] + bl.p1[0]) / 2, (bl.p0[1] + bl.p1[1]) / 2)
-            d = (b.ba or 0.0) / 2 + 0.02 + 0.01 * t
-            ra = region_at((m[0] - n[0] * d, m[1] - n[1] * d))
-            rb = region_at((m[0] + n[0] * d, m[1] + n[1] * d))
-            if ra is None or rb is None:
-                continue
-            if ra == rb:
-                self.unseparated.add(b.id)
-                continue
-            raw.append((b, bl, ra, rb, m, u, n))
-        self.base = max(range(len(pieces)), key=lambda i: pieces[i].area) if pieces else 0
-        # spanning tree from the base
-        by_region: dict[int, list] = {}
-        for h in raw:
-            by_region.setdefault(h[2], []).append(h)
-            by_region.setdefault(h[3], []).append(h)
-        self.hinges: list[Hinge] = []
-        self.parent: dict[int, int] = {}  # region -> index of the hinge to its parent
-        self.depth: dict[int, int] = {self.base: 0}
-        q = deque([self.base])
-        while q:
-            r = q.popleft()
-            for b, bl, ra, rb, m, u, n in by_region.get(r, []):
-                c = rb if ra == r else ra
-                if c in self.depth:
-                    continue
-                nn = n if ra == r else (-n[0], -n[1])
-                ba = b.ba or 0.0
-                a = (m[0] - nn[0] * ba / 2, m[1] - nn[1] * ba / 2)
-                self.hinges.append(
-                    Hinge(
-                        b.id,
-                        r,
-                        c,
-                        a,
-                        u,
-                        nn,
-                        ba,
-                        math.radians(b.angle_deg),
-                        1.0 if b.direction == "up" else -1.0,
-                        b.r_in,
-                        t,
-                        bl.p0,
-                        bl.p1,
-                    )  # fmt: skip
-                )
-                self.parent[c] = len(self.hinges) - 1
-                self.depth[c] = self.depth[r] + 1
-                q.append(c)
+        self.regions: list[Polygon] = _regions(pattern, tol)
+        crossings, self.unseparated = _crossings(pattern, self.regions)  # unseparated: bends with no relief?
+        self.base = max(range(len(self.regions)), key=lambda i: self.regions[i].area) if self.regions else 0
+        self.hinges: list[Hinge]
+        self.parent: dict[int, int]  # region -> index of the hinge to its parent
+        self.depth: dict[int, int]
+        self.hinges, self.parent, self.depth = _spanning_tree(crossings, self.base, self.t)
         self.reached = set(self.depth)
 
     # ------------------------------------------------------------------ structure
@@ -245,12 +174,6 @@ def apply(M: np.ndarray, pts2: np.ndarray) -> np.ndarray:
     return pts2 @ M[:3, :2].T + M[:3, 3]
 
 
-def _unit(p0, p1):
-    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-    n = math.hypot(dx, dy)
-    return ((dx / n, dy / n) if n > 0 else (1.0, 0.0)), n
-
-
 def boundary_points(poly: Polygon, step: float) -> np.ndarray:
     """Points along a polygon's outline, at most ``step`` apart."""
     ring = LineString(poly.exterior.coords).segmentize(step)
@@ -258,3 +181,106 @@ def boundary_points(poly: Polygon, step: float) -> np.ndarray:
 
 
 __all__ = ["FoldModel", "Hinge", "apply", "boundary_points", "fold_matrix", "hinge_frame"]
+
+
+# ------------------------------------------------------------------------------ building the model
+
+
+def _regions(pattern: FlatPattern, tol: float) -> list[Polygon]:
+    """The flat cut along the bend zones (the BA strips): the flanges, as polygons."""
+    t = pattern.thickness
+    bends = {b.id: b for b in pattern.bends}
+    part = Polygon(pattern.outer.polyline(tol), [h.polyline(tol) for h in pattern.holes]).buffer(0)
+    part = cut_slits(part, pattern.slits, tol)
+    strips = []
+    for bl in pattern.bend_lines:
+        b = bends[bl.bend_id]
+        u, length = unit(bl.p0, bl.p1)
+        if length <= 1e-9:
+            continue
+        ext = t  # past the line's ends, so the strip separates its two sides in the corners too
+        half = max((b.ba or 0.0) / 2, 1e-3)
+        n = perp(u)
+        q0, q1 = offset(bl.p0, u, -ext), offset(bl.p1, u, ext)
+        strips.append(Polygon([offset(q, n, s * half) for q, s in ((q0, -1), (q1, -1), (q1, 1), (q0, 1))]))
+    rest = part.difference(unary_union(strips)) if strips else part
+    return [g for g in getattr(rest, "geoms", [rest]) if isinstance(g, Polygon) and g.area > 1e-6 * part.area]
+
+
+def _crossings(pattern: FlatPattern, regions: list[Polygon]) -> tuple[list[_Crossing], set[int]]:
+    """The bend line segments with a region on each side, and the bends whose two sides are
+    one region (no relief separates them)."""
+    t = pattern.thickness
+    bends = {b.id: b for b in pattern.bends}
+
+    def region_at(p) -> int | None:
+        pt = Point(p)
+        best = min(range(len(regions)), key=lambda i: regions[i].distance(pt), default=None)
+        if best is None or regions[best].distance(pt) > 0.05 + 0.05 * t:
+            return None
+        return best
+
+    out: list[_Crossing] = []
+    unseparated: set[int] = set()
+    for bl in pattern.bend_lines:
+        b = bends[bl.bend_id]
+        u, length = unit(bl.p0, bl.p1)
+        if length <= 1e-9:
+            continue
+        n = perp(u)
+        m = midpoint(bl.p0, bl.p1)
+        d = (b.ba or 0.0) / 2 + 0.02 + 0.01 * t
+        ra = region_at(offset(m, n, -d))
+        rb = region_at(offset(m, n, d))
+        if ra is None or rb is None:
+            continue
+        if ra == rb:
+            unseparated.add(b.id)
+            continue
+        out.append(_Crossing(b, bl, ra, rb, m, u, n))
+    return out, unseparated
+
+
+def _spanning_tree(
+    crossings: list[_Crossing], base: int, t: float
+) -> tuple[list[Hinge], dict[int, int], dict[int, int]]:
+    """Breadth-first from the base: the hinges (each crossing that reaches a new region, with
+    the nearer region as parent), region -> index of its parent hinge, region -> depth."""
+    by_region: dict[int, list[_Crossing]] = {}
+    for x in crossings:
+        by_region.setdefault(x.region_a, []).append(x)
+        by_region.setdefault(x.region_b, []).append(x)
+    hinges: list[Hinge] = []
+    parent: dict[int, int] = {}
+    depth: dict[int, int] = {base: 0}
+    q = deque([base])
+    while q:
+        r = q.popleft()
+        for x in by_region.get(r, []):
+            c = x.region_b if x.region_a == r else x.region_a
+            if c in depth:
+                continue
+            b = x.bend
+            nn = x.n if x.region_a == r else (-x.n[0], -x.n[1])
+            ba = b.ba or 0.0
+            hinges.append(
+                Hinge(
+                    bend_id=b.id,
+                    parent=r,
+                    child=c,
+                    a=offset(x.mid, nn, -ba / 2),
+                    u=x.u,
+                    n=nn,
+                    ba=ba,
+                    angle=math.radians(b.angle_deg),
+                    sigma=1.0 if b.direction == "up" else -1.0,
+                    r_in=b.r_in,
+                    t=t,
+                    p0=x.line.p0,
+                    p1=x.line.p1,
+                )
+            )
+            parent[c] = len(hinges) - 1
+            depth[c] = depth[r] + 1
+            q.append(c)
+    return hinges, parent, depth

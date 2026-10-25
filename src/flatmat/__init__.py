@@ -16,7 +16,20 @@ from .diagnostics import Code, Diagnostic, FlatmatError, Severity
 from .export import LayerMap, bend_table, write_bend_table, write_dxf, write_svg
 from .fold import FoldModel
 from .io import StepModel, load_step
-from .model import Arc, Bend, BendLine, Feature, FlatPattern, Line, Loop2D, SheetPart, Spline, Tolerances
+from .model import (
+    FEATURE_KINDS,
+    Arc,
+    Bend,
+    BendLine,
+    Feature,
+    FeatureKind,
+    FlatPattern,
+    Line,
+    Loop2D,
+    SheetPart,
+    Spline,
+    Tolerances,
+)
 from .recognize import recognize
 from .sequence import BendPlan, BendStep, Collision, plan_bends
 from .tooling import DIES, PUNCHES, Die, Punch, Tooling
@@ -45,7 +58,9 @@ __all__ = [
     "Material",
     "Diagnostic",
     "Die",
+    "FEATURE_KINDS",
     "Feature",
+    "FeatureKind",
     "FlatPattern",
     "FlatmatError",
     "FoldModel",

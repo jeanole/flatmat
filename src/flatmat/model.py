@@ -11,6 +11,11 @@ from .diagnostics import Diagnostic
 
 Point = tuple[float, float]
 
+# How finely curves become polylines where a polygon is needed: the largest chord error,
+# in mm. One value for every geometry check, so the places that must agree do: the flat's
+# bounding box and its shift to the origin, and the DFM rules and the folding model.
+SAMPLE_TOL = 0.01
+
 
 # ---------------------------------------------------------------------------- 2D geometry
 
@@ -32,7 +37,7 @@ class Line:
     def reversed(self) -> Line:
         return replace(self, p0=self.p1, p1=self.p0)
 
-    def sample(self, tol: float = 0.01) -> list[Point]:
+    def sample(self, tol: float = SAMPLE_TOL) -> list[Point]:
         return [self.p0, self.p1]
 
     def length(self) -> float:
@@ -75,7 +80,7 @@ class Arc:
     def reversed(self) -> Arc:
         return replace(self, a0=self.a1, a1=self.a0, ccw=not self.ccw)
 
-    def sample(self, tol: float = 0.01) -> list[Point]:
+    def sample(self, tol: float = SAMPLE_TOL) -> list[Point]:
         # chord error r(1 - cos(d/2)) <= tol
         step = 2 * math.acos(max(-1.0, 1 - tol / self.radius)) if self.radius > tol else math.pi / 4
         n = max(4, math.ceil(self.sweep / max(step, 1e-6)))
@@ -149,7 +154,7 @@ class Spline:
             weights=tuple(reversed(self.weights)) if self.weights else None,
         )
 
-    def sample(self, tol: float = 0.01) -> list[Point]:
+    def sample(self, tol: float = SAMPLE_TOL) -> list[Point]:
         # control polygon length bounds the curve length; dense enough for checks
         ctrl = sum(math.dist(a, b) for a, b in zip(self.poles, self.poles[1:], strict=False))
         n = max(8 * len(self.poles), min(4000, math.ceil(ctrl / max(tol, 1e-6) ** 0.5 * 2)))
@@ -206,7 +211,7 @@ Seg2D = Line | Arc | Spline
 class Loop2D:
     segments: tuple[Seg2D, ...]
 
-    def polyline(self, tol: float = 0.01) -> list[Point]:
+    def polyline(self, tol: float = SAMPLE_TOL) -> list[Point]:
         pts: list[Point] = []
         for s in self.segments:
             sp = s.sample(tol)
@@ -296,6 +301,44 @@ class Flange:
     area: float
 
 
+FeatureKindName = Literal[
+    "countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance", "engraving"
+]
+
+
+@dataclass(frozen=True)
+class FeatureKind:
+    """How the stages after recognition treat one kind of :class:`Feature`.
+
+    :data:`FEATURE_KINDS` is the one place that says this: unfold(), check(),
+    plan_bends() and the exports ask it instead of comparing kind names.
+    """
+
+    name: str  # in messages: "extruded hole"
+    # what the flat pattern shows: its through hole (countersink, counterbore), a pre-hole
+    # inside a marked rim (extruded hole), slits or an opening cut inside a marked rim
+    # (louvre, bridge, lance), or only a marked rim (emboss, engraving)
+    flat: Literal["hole", "pre_hole", "slits", "rim"]
+    formed: bool = False  # pressed out of the sheet: the DFM distance rules for formed features apply
+    owns_holes: bool = False  # the holes it cuts (pre-hole, slits, opening) are judged with it, not as holes
+    tool_bent: bool = False  # its tab is bent in the punching tool with the blank, not on the press brake
+    oriented: bool = False  # has a direction and a size in the flat instead of diameters
+    rim_layer: Literal["form", "engrave"] = "form"  # the LayerMap layer its rim is drawn on
+    label: bool = True  # a text label next to it in the DXF (an engraving's rim says it all)
+
+
+FEATURE_KINDS: dict[str, FeatureKind] = {
+    "countersink": FeatureKind("countersink", "hole"),
+    "counterbore": FeatureKind("counterbore", "hole"),
+    "emboss": FeatureKind("emboss", "rim", formed=True),
+    "extruded_hole": FeatureKind("extruded hole", "pre_hole", formed=True, owns_holes=True),
+    "louvre": FeatureKind("louvre", "slits", formed=True, owns_holes=True, oriented=True),
+    "bridge": FeatureKind("bridge", "slits", formed=True, owns_holes=True, oriented=True),
+    "lance": FeatureKind("lance", "slits", formed=True, owns_holes=True, tool_bent=True, oriented=True),
+    "engraving": FeatureKind("engraving", "rim", rim_layer="engrave", label=False),
+}
+
+
 @dataclass(frozen=True)
 class Feature:
     """A feature the flat outline cannot show: countersink, counterbore, emboss or extruded hole.
@@ -329,7 +372,7 @@ class Feature:
     """
 
     id: int
-    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance", "engraving"]
+    kind: FeatureKindName
     through_diameter: float
     outer_diameter: float
     side: Literal["top", "bottom"]  # top = the reference skin, facing the viewer of the flat
@@ -344,6 +387,11 @@ class Feature:
     size: tuple[float, float] | None = None  # louvre, bridge, lance; set by unfold()
     holes: tuple[int, ...] = ()  # set by unfold()
     bend_id: int | None = None  # lance
+
+    @property
+    def kind_info(self) -> FeatureKind:
+        """What this kind of feature is, for the stages that treat kinds differently."""
+        return FEATURE_KINDS[self.kind]
 
 
 @dataclass(frozen=True)
@@ -397,7 +445,7 @@ class FlatPattern:
 
     @cached_property
     def bbox(self) -> tuple[float, float, float, float]:
-        pts = self.outer.polyline(0.01)
+        pts = self.outer.polyline(SAMPLE_TOL)
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         return (min(xs), min(ys), max(xs), max(ys))
 

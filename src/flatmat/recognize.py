@@ -35,12 +35,12 @@ from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS_Compound
 
 from ._occ import EdgeFaceMap, ShapeMap, as_edge, as_face, as_vertex, as_wire
-from ._topology import BendFace, Context, Face, SharpEdge, edge_vertices, inner_uv, pcurve, surface_props
+from ._topology import BendFace, Context, Face, FeatureData, SharpEdge, edge_vertices, inner_uv, pcurve, surface_props
 from .bendmodel import extruded_hole_prehole
 from .canonical import canonicalize
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .io import StepModel
-from .model import Bend, BendSegment, FaceInfo, Feature, Flange, SheetPart, Tolerances
+from .model import FEATURE_KINDS, Bend, BendSegment, FaceInfo, Feature, Flange, SheetPart, Tolerances
 
 # ------------------------------------------------------------------------------ tables
 
@@ -484,23 +484,19 @@ def _between_skins(
 
 @dataclass
 class _Features:
-    """Feature records as they are found, and the per-feature data unfold() needs."""
+    """Features as they are found: the public records and, by id, what unfold() needs of each."""
 
     items: list[Feature] = field(default_factory=list)
-    faces: dict[int, tuple[int, ...]] = field(default_factory=dict)  # faces the outline cuts as a hole
-    through_r: dict[int, float] = field(default_factory=dict)
-    on_a: dict[int, bool] = field(default_factory=dict)
-    edges: dict[int, set[int]] = field(default_factory=dict)
-    cuts: dict[int, list[list[int]]] = field(default_factory=dict)
-    gap: dict[int, float] = field(default_factory=dict)
-    free: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
-    developed: set[int] = field(default_factory=set)
-    projected_rims: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
+    data: dict[int, FeatureData] = field(default_factory=dict)
     diags: list[Diagnostic] = field(default_factory=list)
 
     @property
     def next_id(self) -> int:
         return len(self.items) + 1
+
+    def add(self, feat: Feature, data: FeatureData) -> None:
+        self.items.append(feat)
+        self.data[feat.id] = data
 
 
 def _hole_features(table: _Features, feature_groups, faces: list[Face], g: _Graph, skin_a: set[int]) -> None:
@@ -510,12 +506,10 @@ def _hole_features(table: _Features, feature_groups, faces: list[Face], g: _Grap
         # the side carrying the large rim: the skin touched by the face holding the largest circle
         big_face = max(grp, key=lambda i: max((r for r, _ in _circle_radii(faces[i - 1])), default=0))
         on_a = any(nb in skin_a for nb in g.nb_all[big_face])
-        table.items.append(
-            Feature(fid, fkind, 2 * rmin, 2 * rmax, "top" if on_a else "bottom", angle, depth, tuple(grp))
+        table.add(
+            Feature(fid, fkind, 2 * rmin, 2 * rmax, "top" if on_a else "bottom", angle, depth, tuple(grp)),
+            FeatureData(fkind, outline_faces=tuple(grp), through_r=rmin, on_a=on_a),
         )
-        table.faces[fid] = tuple(grp)
-        table.through_r[fid] = rmin
-        table.on_a[fid] = on_a
         if fkind == "countersink" and on_a:
             table.diags.append(
                 warn(Code.COUNTERSINK_PROJECTED, f"countersink ⌀{2 * rmax:g} cut as ⌀{2 * rmin:g}", faces=grp)
@@ -529,20 +523,22 @@ def _formed_features(
     for reg in (r for r in regions if r.skin == a_side):
         fid = table.next_id
         feat = _formed_feature(fid, reg, faces, edges, t, table.diags)
-        table.gap[fid] = reg.gap
-        table.free[fid] = (reg.host, reg.free)  # type: ignore[assignment]
+        assert reg.host is not None  # a region without one was refused (FORMED_FEATURE)
+        data = FeatureData(
+            feat.kind,
+            edges=frozenset(reg.wire),
+            cuts=tuple(tuple(c) for c in reg.cuts),
+            gap=reg.gap,
+            free=(reg.host, tuple(reg.free)),
+        )
         if reg.developed:
             hinge = next((b for b in bends for sg in b.segments if sg.face_id in reg.faces
                           and reg.host in g.smooth_nb[sg.face_id]), None)  # fmt: skip
             feat = replace(feat, bend_id=hinge.id if hinge else None)
-            table.developed.add(fid)
-        else:
-            table.faces[fid] = tuple(sorted(reg.faces))
-            table.through_r[fid] = feat.through_diameter / 2
-            table.on_a[fid] = True
-        table.items.append(feat)
-        table.edges[fid] = set(reg.wire)
-        table.cuts[fid] = reg.cuts
+            data = replace(data, developed=True)
+        else:  # left out of the development: its border with the skin is its rim
+            data = replace(data, outline_faces=tuple(sorted(reg.faces)), through_r=feat.through_diameter / 2, on_a=True)
+        table.add(feat, data)
 
 
 def _engravings(table: _Features, recesses: list[_Recess], skin_a: set[int], partners: dict[int, int], edges) -> None:
@@ -559,12 +555,12 @@ def _engravings(table: _Features, recesses: list[_Recess], skin_a: set[int], par
                          faces=rec.faces)  # fmt: skip
         for face, rim in rec.rims:
             fid = table.next_id
-            table.items.append(Feature(fid, "engraving", 0.0, _rim_diameter(rim, edges), "top" if on_a else "bottom",
-                                       depth=rec.depth, face_ids=tuple(rec.faces)))  # fmt: skip
+            feat = Feature(fid, "engraving", 0.0, _rim_diameter(rim, edges), "top" if on_a else "bottom",
+                           depth=rec.depth, face_ids=tuple(rec.faces))  # fmt: skip
             if face in skin_a:
-                table.edges[fid] = set(rim)
+                table.add(feat, FeatureData("engraving", edges=frozenset(rim)))
             else:
-                table.projected_rims[fid] = (behind, rim)
+                table.add(feat, FeatureData("engraving", projected_rim=(behind, tuple(rim))))
     if recesses:
         deepest = max(r.depth for r in recesses)
         table.diags.append(warn(Code.ENGRAVED_RECESS,
@@ -903,7 +899,7 @@ def _formed_feature(fid: int, reg: _Formed, faces: list[Face], edges, t: float, 
     up = hi >= -lo  # displaced towards the reference skin's outside: towards the viewer of the flat
     h = hi if up else -lo
     side: Literal["top", "bottom"] = "top" if up else "bottom"
-    if reg.kind in ("louvre", "bridge", "lance"):
+    if FEATURE_KINDS[reg.kind].oriented:  # type: ignore[index]
         return Feature(fid, reg.kind, 0.0, 0.0, side, face_ids=tuple(sorted(reg.faces)), height=h)  # type: ignore[arg-type]
     circ = _host_circle(reg, faces, edges)
     if reg.kind == "emboss":
@@ -1225,17 +1221,8 @@ def recognize(
         t,
         bend_faces,
         sharp_edges,
-        features=table.faces,
-        feature_through_r=table.through_r,
-        feature_on_a=table.on_a,
-        feature_kind={f.id: f.kind for f in features},
-        feature_edges=table.edges,
-        feature_cuts=table.cuts,
-        feature_gap=table.gap,
-        developed=table.developed,
-        feature_free=table.free,
-        projected_rims=table.projected_rims,
-        tol=tol,
+        table.data,
+        tol,
     )
     return SheetPart(
         thickness=t,
