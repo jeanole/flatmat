@@ -14,13 +14,17 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 
 from OCP.BRep import BRep_Tool
-from OCP.Geom2d import Geom2d_TrimmedCurve
+from OCP.Geom2d import Geom2d_Line, Geom2d_TrimmedCurve
+from OCP.Geom2dAPI import Geom2dAPI_InterCurveCurve
 from OCP.Geom2dConvert import Geom2dConvert
 from OCP.GeomAbs import GeomAbs_BSplineCurve, GeomAbs_Circle, GeomAbs_Line
+from OCP.gp import gp_Dir2d, gp_Pnt2d
+from OCP.TopAbs import TopAbs_EDGE
+from OCP.TopExp import TopExp_Explorer
 from shapely.geometry import Polygon
 from shapely.validation import explain_validity
 
-from ._occ import OCP_VERSION
+from ._occ import OCP_VERSION, as_edge
 from ._topology import Context, Face, edge_vertices, inner_uv, pcurve
 from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
 from .diagnostics import Code, Diagnostic, refuse, warn
@@ -918,17 +922,26 @@ def _move_loop(L: Loop2D, T: Rigid) -> Loop2D:
 def _bend_line(f: Face, dev: _Dev, T: Rigid, steps: int = 200) -> list[tuple[Point, Point]]:
     """The iso-u line at mid angle, clipped to the face.
 
-    Coarse scan along v for inside/outside, then bisection on each transition so the
-    end points are exact to ~1e-9 of the bend length.
+    Coarse scan along v for inside/outside; each transition ends where the line crosses
+    the face boundary between the two samples. That crossing is intersected exactly, or,
+    where the two samples hold none or several, found by bisection to ~1e-9 of the bend length
+    (each probe near a boundary costs the classifier ~1 ms on a face with holes).
     """
     u0, u1, v0, v1 = f.uv
     um = 0.5 * (u0 + u1)
     eps = (v1 - v0) * 1e-9
+    crossings: list[float] | None = None
 
     def ins(v: float) -> bool:
         return f.inside(um, v)
 
     def edge(lo: float, hi: float) -> float:  # ins(lo) != ins(hi)
+        nonlocal crossings
+        if crossings is None:
+            crossings = _iso_u_crossings(f, um, v0 - 1.0, v1 + 1.0, eps) or []
+        xs = [x for x in crossings if lo <= x <= hi]
+        if xs and xs[-1] - xs[0] < eps:  # one crossing (twice where it is a vertex)
+            return xs[0]
         want = ins(lo)
         for _ in range(60):
             mid = 0.5 * (lo + hi)
@@ -956,3 +969,23 @@ def _bend_line(f: Face, dev: _Dev, T: Rigid, steps: int = 200) -> list[tuple[Poi
     if start is not None:
         segs.append((start, vs[-1]))
     return [(transform(T, dev(um, a)), transform(T, dev(um, b))) for a, b in segs if b - a > eps]
+
+
+def _iso_u_crossings(f: Face, u: float, va: float, vb: float, tol: float) -> list[float] | None:
+    """The v where the line u = const, va <= v <= vb, crosses an edge of f, ascending.
+
+    None if an edge runs along the line, so it has no single crossing.
+    """
+    line = Geom2d_TrimmedCurve(Geom2d_Line(gp_Pnt2d(u, 0.0), gp_Dir2d(0.0, 1.0)), va, vb)
+    out = []
+    ex = TopExp_Explorer(f.shape, TopAbs_EDGE)
+    while ex.More():
+        e = as_edge(ex.Current())
+        ex.Next()
+        c2 = pcurve(e, f.shape)
+        curve = BRep_Tool.CurveOnSurface_s(e, f.shape, 0.0, 0.0)
+        hit = Geom2dAPI_InterCurveCurve(line, Geom2d_TrimmedCurve(curve, c2.FirstParameter(), c2.LastParameter()), tol)
+        if hit.NbSegments():
+            return None
+        out += [hit.Point(i).Y() for i in range(1, hit.NbPoints() + 1)]
+    return sorted(out)

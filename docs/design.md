@@ -387,8 +387,10 @@ matrix); ruff, mypy, pytest.
      circles into halves);
    - periodic B-spline pcurves are clamped with `SetNotPeriodic()` before
      export (DXF needs a clamped knot vector);
-   - bend-line end points are found by bisection on the face classifier
-     (to ~1e-9 of the bend length).
+   - bend-line end points: a coarse scan of the face classifier along the
+     line finds the transitions, each ends where the line intersects the
+     boundary pcurve between the two samples (bisection on the classifier,
+     to ~1e-9 of the bend length, where that is not one crossing).
 
    Tests: 77 in total, including hypothesis profiles, the BenDFM samples
    and private parts via environment variables.
