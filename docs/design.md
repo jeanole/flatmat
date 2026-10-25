@@ -415,6 +415,7 @@ All in `src/flatmat/`:
 | `tooling.py` | punches, dies and the die-opening rule (§7.5) |
 | `fold.py`, `sequence.py` | the folded part, tool collisions and a bend order (§7.4) → `BendPlan` |
 | `export.py` | DXF, bend table (JSON/CSV), SVG (§2) |
+| `geom2d.py` | 2D vectors, rigid transforms and slit cutting, shared by `unfold`, `fold`, `dfm` and `export` |
 | `model.py`, `diagnostics.py` | the public dataclasses, `FEATURE_KINDS` (how each stage treats each kind of feature) and the diagnostic codes |
 | `_occ.py` | the differences between OCP 7.8 and 8.0 |
 | `cli.py` | `flatmat unfold` |

@@ -22,6 +22,7 @@ from shapely.ops import unary_union
 
 from .diagnostics import Code, Diagnostic, Severity
 from .fold import FoldModel, apply, boundary_points
+from .geom2d import cross, cut_slits, dot, midpoint, offset, perp, sub, unit
 from .model import Arc, Bend, BendLine, FlatPattern
 from .sequence import BendPlan, plan_bends
 from .tooling import Tooling, die_opening
@@ -160,12 +161,6 @@ def _setback(b: Bend, t: float) -> float:
     return b.ossb if b.ossb is not None else b.r_in + t
 
 
-def _unit(p0, p1):
-    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-    n = math.hypot(dx, dy)
-    return (dx / n, dy / n), n
-
-
 # ------------------------------------------------------------------------------- check
 
 
@@ -280,9 +275,7 @@ def check(
     outer = Polygon(pattern.outer.polyline(0.01))
     holes = [Polygon(h.polyline(0.01)) for h in pattern.holes]
     part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes])
-    for sl in pattern.slits:
-        stop = LineString(sl.polyline(0.01))
-        part = part.difference(stop.buffer(1e-3))
+    part = cut_slits(part, pattern.slits, 0.01)
     lines_by_bend: dict[int, list] = {}
     for bl in pattern.bend_lines:
         lines_by_bend.setdefault(bl.bend_id, []).append(bl)
@@ -356,8 +349,8 @@ def _bend_rules(
         legs: list[list[float]] = [[], []]
         worst: list[tuple[float, tuple]] = [(math.inf, (0, 0)), (math.inf, (0, 0))]
         for bl in bls:
-            u, length = _unit(bl.p0, bl.p1)
-            n = (-u[1], u[0])
+            u, length = unit(bl.p0, bl.p1)
+            n = perp(u)
             for k in range(11):
                 s = 0.05 + 0.9 * k / 10
                 p = (bl.p0[0] + s * length * u[0], bl.p0[1] + s * length * u[1])
@@ -388,11 +381,11 @@ def _bend_rules(
             if not mat.hem_allowed or (mat.hem_max_t is not None and t > mat.hem_max_t):
                 add(Code.DFM_HEM_MATERIAL, f"bend {bid}: no hems in {mat.name} at t={t:g} mm", bls[0].p0, bid)
         # radius vs material (grain-aware) and vs what air bending gives
-        u, _ = _unit(bls[0].p0, bls[0].p1)
+        u, _ = unit(bls[0].p0, bls[0].p1)
         along = False  # unknown grain: the normal minimum; the along-the-grain one needs the direction
         if rolling_direction_deg is not None:
             rd = (math.cos(math.radians(rolling_direction_deg)), math.sin(math.radians(rolling_direction_deg)))
-            along = abs(u[0] * rd[0] + u[1] * rd[1]) > math.cos(math.radians(45))
+            along = abs(dot(u, rd)) > math.cos(math.radians(45))
         r_min = (mat.min_r_over_t_parallel if along else mat.min_r_over_t) * t
         if b.r_in < r_min - 1e-9 and b.kind != "hem":
             add(Code.DFM_RADIUS_TOO_SMALL, f"bend {bid}: r={b.r_in:g} < {r_min:g} mm for {mat.name}"
@@ -524,8 +517,8 @@ def _relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
     for bl, _ls in sheet.all_lines:
         b = sheet.bends[bl.bend_id]
         ba = b.ba or 0.0
-        u, _ = _unit(bl.p0, bl.p1)
-        n = (-u[1], u[0])
+        u, _ = unit(bl.p0, bl.p1)
+        n = perp(u)
         depth = ba / 2 + b.r_in + t
         width = rules.relief_width_t * t
         for end, sign in ((bl.p1, 1.0), (bl.p0, -1.0)):
@@ -535,8 +528,8 @@ def _relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
                 sheet.holes[j].exterior.distance(Point(end)) < 1e-3 for j in _near(sheet.hole_tree, (*end, *end), 1e-3)
             ):
                 continue  # the bend line stops at a hole in the bend zone: DFM_CUT_IN_BEND_ZONE
-            q0 = (end[0] + sign * u[0] * 1e-3, end[1] + sign * u[1] * 1e-3)
-            q1 = (end[0] + sign * u[0] * width, end[1] + sign * u[1] * width)
+            q0 = offset(end, u, sign * 1e-3)
+            q1 = offset(end, u, sign * width)
             # one band per side beyond the end: from the bend line to r + t past the tangent line.
             # A real missing relief fills a band; an outline that merely flares out at an
             # angle from the end touches a thin wedge of it.
@@ -546,8 +539,8 @@ def _relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
                     [
                         q0,
                         q1,
-                        (q1[0] + sg * n[0] * depth, q1[1] + sg * n[1] * depth),
-                        (q0[0] + sg * n[0] * depth, q0[1] + sg * n[1] * depth),
+                        offset(q1, n, sg * depth),
+                        offset(q0, n, sg * depth),
                     ]
                 )
                 fill = max(fill, part.intersection(band).area / band.area)
@@ -565,8 +558,8 @@ def _tool_limits(b: Bend, bls, tooling: Tooling, rules: DfmRules, add) -> None:
             add(Code.DFM_TOOL_ANGLE, f"bend {b.id}: {b.angle_deg:.1f}° (opening {opening:.1f}°) is beyond the "
                 f"{angle:g}° {name}; needs an acute tool", bls[0].p0, b.id, tool=name, tool_angle=angle)  # fmt: skip
     pts = [p for bl in bls for p in (bl.p0, bl.p1)]
-    u, _ = _unit(bls[0].p0, bls[0].p1)
-    s = [p[0] * u[0] + p[1] * u[1] for p in pts]
+    u, _ = unit(bls[0].p0, bls[0].p1)
+    s = [dot(p, u) for p in pts]
     extent = max(s) - min(s)
     for name, length in (("punch", tooling.punch.length), ("die", tooling.die.length)):
         if length is not None and extent > length + 1e-9:
@@ -620,8 +613,8 @@ def _corner_reliefs(ends, all_lines, bends, part: Polygon, rules: DfmRules, t: f
         if not corner:
             continue
         b = bends[bl.bend_id]
-        u, _ = _unit(bl.p0, bl.p1)
-        n = (-u[1], u[0])
+        u, _ = unit(bl.p0, bl.p1)
+        n = perp(u)
         others = [
             (o, ls)
             for o, ls in all_lines
@@ -630,10 +623,8 @@ def _corner_reliefs(ends, all_lines, bends, part: Polygon, rules: DfmRules, t: f
         if not others:
             continue
         o, _ = min(others, key=lambda ol: ol[1].distance(Point(e)))
-        om = ((o.p0[0] + o.p1[0]) / 2, (o.p0[1] + o.p1[1]) / 2)
-        sg = 1.0 if (om[0] - e[0]) * n[0] + (om[1] - e[1]) * n[1] > 0 else -1.0
-        half = (b.ba or 0.0) / 2
-        q = (e[0] + sg * n[0] * half, e[1] + sg * n[1] * half)
+        sg = 1.0 if dot(sub(midpoint(o.p0, o.p1), e), n) > 0 else -1.0
+        q = offset(e, n, sg * ((b.ba or 0.0) / 2))
         if any(math.dist(q, s) < rho for s in seen):
             continue
         seen.append(q)
@@ -684,7 +675,7 @@ def _parallel_neighbours(a: int, b: int, model: FoldModel, hinge_pairs) -> bool:
             continue
         mid = h1.child if h1.parent == a else h1.parent
         h2 = hinge_pairs.get(frozenset((mid, b)))
-        if h2 is not None and abs(h1.u[0] * h2.u[1] - h1.u[1] * h2.u[0]) < math.sin(math.radians(10)):
+        if h2 is not None and abs(cross(h1.u, h2.u)) < math.sin(math.radians(10)):
             return True
     return False
 
@@ -719,10 +710,10 @@ def _flat_of(at, region: int) -> tuple[float, float]:
 
 def _beside(h: Polygon, bl) -> bool:
     """Is the hole beside the bend line (projects onto it), not off its end?"""
-    u, length = _unit(bl.p0, bl.p1)
+    u, length = unit(bl.p0, bl.p1)
     minx, miny, maxx, maxy = h.bounds
     corners = [(minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy)]
-    s = [(p[0] - bl.p0[0]) * u[0] + (p[1] - bl.p0[1]) * u[1] for p in corners]
+    s = [dot(sub(p, bl.p0), u) for p in corners]
     return max(s) > 0 and min(s) < length
 
 
@@ -733,7 +724,7 @@ def _leg(p, d, sheet: _Sheet, this_line: BendLine, ba: float, b: Bend) -> float:
     the next bend line, whichever comes first.
     """
     far = 1e6
-    ray = LineString([p, (p[0] + d[0] * far, p[1] + d[1] * far)])
+    ray = LineString([p, offset(p, d, far)])
     best = math.inf
     stop_bend: Bend | None = None
     t, bends = sheet.t, sheet.bends
@@ -783,12 +774,11 @@ def _u_channels(
             if A.direction != B.direction or abs(A.angle_deg - 90) > 15 or abs(B.angle_deg - 90) > 15:
                 continue
             la, lb = lines[a], lines[b]
-            ua, _ = _unit(la.p0, la.p1)
-            ub, _ = _unit(lb.p0, lb.p1)
-            if abs(abs(ua[0] * ub[0] + ua[1] * ub[1]) - 1) > 1e-6:
+            ua, _ = unit(la.p0, la.p1)
+            ub, _ = unit(lb.p0, lb.p1)
+            if abs(abs(dot(ua, ub)) - 1) > 1e-6:
                 continue
-            n = (-ua[1], ua[0])
-            base = abs((lb.p0[0] - la.p0[0]) * n[0] + (lb.p0[1] - la.p0[1]) * n[1])
+            base = abs(dot(sub(lb.p0, la.p0), perp(ua)))
             # base outer mould line between the two bends
             base_oml = (
                 base
@@ -802,9 +792,8 @@ def _u_channels(
 
             def leg_away(line, other, check) -> float:
                 # flanges[0] is on the +normal side of the line; the leg is the side away from the other bend
-                u, _ = _unit(line.p0, line.p1)
-                nn = (-u[1], u[0])
-                towards = (other.p0[0] - line.p0[0]) * nn[0] + (other.p0[1] - line.p0[1]) * nn[1] > 0
+                u, _ = unit(line.p0, line.p1)
+                towards = dot(sub(other.p0, line.p0), perp(u)) > 0
                 return check.flanges[1] if towards else check.flanges[0]
 
             flange = max(leg_away(la, lb, by_id[a]), leg_away(lb, la, by_id[b]))

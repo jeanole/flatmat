@@ -23,22 +23,8 @@ from ._occ import OCP_VERSION
 from ._topology import Context, Face, edge_vertices, inner_uv, pcurve
 from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
 from .diagnostics import Code, Diagnostic, refuse, warn
+from .geom2d import IDENTITY, Rigid, cross, dot, heading, offset, perp, rigid_fit, sub, transform, unit
 from .model import FEATURE_KINDS, Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
-
-Rigid = tuple[float, float, float, float]  # cos, sin, tx, ty
-_IDENTITY: Rigid = (1.0, 0.0, 0.0, 0.0)
-
-
-def _apply(T: Rigid, p: Point) -> Point:
-    c, s, tx, ty = T
-    return (c * p[0] - s * p[1] + tx, s * p[0] + c * p[1] + ty)
-
-
-def _rigid(a1: Point, a2: Point, b1: Point, b2: Point) -> Rigid:
-    """Rotation + translation taking b1 -> a1 and b2 -> a2 (never a reflection)."""
-    ang = math.atan2(a2[1] - a1[1], a2[0] - a1[0]) - math.atan2(b2[1] - b1[1], b2[0] - b1[0])
-    c, s = math.cos(ang), math.sin(ang)
-    return (c, s, a1[0] - (c * b1[0] - s * b1[1]), a1[1] - (s * b1[0] + c * b1[1]))
 
 
 class _Dev:
@@ -172,8 +158,7 @@ def unfold(
         for seg in b.segments:
             if seg.edge_id is not None:  # sharp bend: the middle of the inserted strip
                 a1, a2, n, d = sharp_geo[seg.edge_id]
-                h = d / 2
-                p0, p1 = (a1[0] + h * n[0], a1[1] + h * n[1]), (a2[0] + h * n[0], a2[1] + h * n[1])
+                p0, p1 = offset(a1, n, d / 2), offset(a2, n, d / 2)
                 lines.append(BendLine(b.id, 0, p0, p1, b.direction, b.angle_deg, r, b.kind))
                 continue
             f = faces[seg.face_id - 1]
@@ -186,13 +171,13 @@ def unfold(
     shift = (1.0, 0.0, dx, dy)
     outer = _move_loop(outer, shift)
     holes = [_move_loop(h, shift) for h in holes]
-    lines = [_with(bl, p0=_apply(shift, bl.p0), p1=_apply(shift, bl.p1)) for bl in lines]
+    lines = [_with(bl, p0=transform(shift, bl.p0), p1=transform(shift, bl.p1)) for bl in lines]
     slit_loops = [(_move_loop(L, shift), fid) for L, fid in slits]
     features = tuple(
         _cut_feature(
             _with(
                 f,
-                center=_apply(shift, feature_centers[f.id][0]) if f.id in feature_centers else None,
+                center=transform(shift, feature_centers[f.id][0]) if f.id in feature_centers else None,
                 outline=_move_loop(outlines[f.id], shift) if f.id in outlines else None,
                 holes=tuple(i for i, fid in enumerate(hole_fid) if fid == f.id),
             ),
@@ -239,7 +224,7 @@ def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | N
         pts = [p for i in f.holes for p in holes[i].polyline(0.01)]
         bl = next((b for b in lines if b.bend_id == f.bend_id), None)
         if bl is not None:
-            angle = math.atan2(bl.p1[1] - bl.p0[1], bl.p1[0] - bl.p0[0])
+            angle = heading(bl.p0, bl.p1)
     if not pts or angle is None:
         return f
     deg = math.degrees(angle) % 180.0
@@ -247,8 +232,8 @@ def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | N
         deg = 0.0
     a = math.radians(deg)
     u, v = (math.cos(a), math.sin(a)), (-math.sin(a), math.cos(a))
-    pa = [x * u[0] + y * u[1] for x, y in pts]
-    pb = [x * v[0] + y * v[1] for x, y in pts]
+    pa = [dot(p, u) for p in pts]
+    pb = [dot(p, v) for p in pts]
     if f.center is None:  # a lance: the middle of its opening
         ca, cb = (max(pa) + min(pa)) / 2, (max(pb) + min(pb)) / 2
         f = _with(f, center=(ca * u[0] + cb * v[0], ca * u[1] + cb * v[1]))
@@ -267,7 +252,7 @@ def _with(obj, **kw):
 def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
     """Rigid placement of every reference-skin face; a sharp edge inserts a strip of shifts[ei]."""
     faces, edges = ctx.faces, ctx.edges
-    place = {ctx.root: _IDENTITY}
+    place = {ctx.root: IDENTITY}
     sharp_geo: dict[int, tuple[Point, Point, Point, float]] = {}
     q = deque([ctx.root])
     seen = set()
@@ -283,7 +268,7 @@ def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
             if len(vs) < 2 or vs[0].IsSame(vs[-1]):
                 continue  # closed edge: carries no placement information
             fp, fc = faces[p - 1].shape, faces[c - 1].shape
-            a1, a2 = (_apply(place[p], devs[p](*_vertex_uv(v, e, fp))) for v in (vs[0], vs[-1]))
+            a1, a2 = (transform(place[p], devs[p](*_vertex_uv(v, e, fp))) for v in (vs[0], vs[-1]))
             b1, b2 = (devs[c](*_vertex_uv(v, e, fc)) for v in (vs[0], vs[-1]))
             if abs(math.dist(a1, a2) - math.dist(b1, b2)) > ctx.tol.flat:
                 raise refuse(
@@ -292,20 +277,20 @@ def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
                     faces=(p, c),
                     edges=(ei,),
                 )
-            Tc = _rigid(a1, a2, b1, b2)
+            Tc = rigid_fit(a1, a2, b1, b2)
             if ei in shifts:
                 # move C away from P, perpendicular to the edge, by the strip width
-                L = math.dist(a1, a2)
-                n = (-(a2[1] - a1[1]) / L, (a2[0] - a1[0]) / L)
+                u, _ = unit(a1, a2)
+                n = perp(u)
                 fc_rec = faces[c - 1]
-                qc = _apply(Tc, devs[c](*(inner_uv(fc_rec) or fc_rec.uv_centre)))
-                if (qc[0] - a1[0]) * n[0] + (qc[1] - a1[1]) * n[1] < 0:
+                qc = transform(Tc, devs[c](*(inner_uv(fc_rec) or fc_rec.uv_centre)))
+                if dot(sub(qc, a1), n) < 0:
                     n = (-n[0], -n[1])
                 d = shifts[ei]
                 Tc = (Tc[0], Tc[1], Tc[2] + d * n[0], Tc[3] + d * n[1])
                 sharp_geo[ei] = (a1, a2, n, d)
             if c in place:
-                worst = max(worst, *(math.dist(_apply(place[c], b), _apply(Tc, b)) for b in (b1, b2)))
+                worst = max(worst, *(math.dist(transform(place[c], b), transform(Tc, b)) for b in (b1, b2)))
                 if worst > ctx.tol.flat:
                     raise refuse(
                         Code.CYCLE_INCONSISTENT,
@@ -332,7 +317,7 @@ def _edge_segment(e, ei: int, f: Face, dev: _Dev, T: Rigid):
     a, b = c2.FirstParameter(), c2.LastParameter()
 
     def m(p) -> Point:
-        return _apply(T, dev(p.X(), p.Y()))
+        return transform(T, dev(p.X(), p.Y()))
 
     kind = c2.GetType()
     if kind == GeomAbs_Line:
@@ -341,8 +326,7 @@ def _edge_segment(e, ei: int, f: Face, dev: _Dev, T: Rigid):
         circ = c2.Circle()
         cen = m(circ.Location())
         p0, pm = m(c2.Value(a)), m(c2.Value((a + b) / 2))
-        a0 = math.atan2(p0[1] - cen[1], p0[0] - cen[0])
-        am = math.atan2(pm[1] - cen[1], pm[0] - cen[0])
+        a0, am = heading(cen, p0), heading(cen, pm)
         sweep = abs(b - a)
         # direction: does the arc reach the mid point turning counter-clockwise?
         ccw = ((am - a0) % (2 * math.pi)) < math.pi if sweep < 2 * math.pi - 1e-9 else _circle_ccw(m, c2, a, b, cen)
@@ -380,8 +364,7 @@ def _downcast_bspline(h):
 
 def _circle_ccw(m, c2, a, b, cen) -> bool:
     p0, p1 = m(c2.Value(a)), m(c2.Value(a + (b - a) * 0.25))
-    cross = (p0[0] - cen[0]) * (p1[1] - cen[1]) - (p0[1] - cen[1]) * (p1[0] - cen[0])
-    return cross > 0
+    return cross(sub(p0, cen), sub(p1, cen)) > 0
 
 
 def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, pre_r: dict[int, float]):
@@ -403,7 +386,7 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
         seg = _edge_segment(e, ei, f, devs[i], place[i])
         vs = edge_vertices(e)
         va, vb = ctx.vmap.FindIndex(vs[0]), ctx.vmap.FindIndex(vs[-1])
-        pa = _apply(place[i], devs[i](*_vertex_uv(vs[0], e, f.shape)))
+        pa = transform(place[i], devs[i](*_vertex_uv(vs[0], e, f.shape)))
         if va != vb and math.dist(seg.start, pa) > math.dist(seg.end, pa):
             seg = seg.reversed()
         pieces.append((va, vb, seg))
@@ -443,7 +426,7 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
             runs = _cut_runs(rim, cut_edges)
             if runs:
                 c = max(runs, key=lambda ch: math.dist(ch[0].start, ch[-1].end))
-                orient[fid] = math.atan2(c[-1].end[1] - c[0].start[1], c[-1].end[0] - c[0].start[0])
+                orient[fid] = heading(c[0].start, c[-1].end)
             host, free = fd.free
             if fd.gap <= 1e-6 or not free:
                 slits.extend((Loop2D(tuple(chain)), fid) for chain in runs)  # no width: cut lines
@@ -536,7 +519,7 @@ def _on_host_point(ctx: Context, devs, place, host: int, p) -> Point:
     o, xd, yd = pos.Location(), pos.XDirection(), pos.YDirection()
     d = (p.X() - o.X(), p.Y() - o.Y(), p.Z() - o.Z())
     uv = (d[0] * xd.X() + d[1] * xd.Y() + d[2] * xd.Z(), d[0] * yd.X() + d[1] * yd.Y() + d[2] * yd.Z())
-    return _apply(place[host], devs[host](*uv))
+    return transform(place[host], devs[host](*uv))
 
 
 def _on_host(ctx: Context, devs, place, host: int, e) -> list:
@@ -544,24 +527,12 @@ def _on_host(ctx: Context, devs, place, host: int, e) -> list:
     from OCP.BRepAdaptor import BRepAdaptor_Curve
     from OCP.GCPnts import GCPnts_QuasiUniformDeflection
 
-    f = ctx.faces[host - 1]
-    pos = f.ad.Plane().Position()
-    o, xd, yd = pos.Location(), pos.XDirection(), pos.YDirection()
     c = BRepAdaptor_Curve(e)
     sampler = GCPnts_QuasiUniformDeflection(c, 1e-4)
     params = [sampler.Parameter(i) for i in range(1, sampler.NbPoints() + 1)] if sampler.IsDone() else []
     if len(params) < 2:
         params = [c.FirstParameter(), c.LastParameter()]
-    out = []
-    for u in params:
-        p = c.Value(u)
-        d = (p.X() - o.X(), p.Y() - o.Y(), p.Z() - o.Z())
-        uv = (
-            d[0] * xd.X() + d[1] * xd.Y() + d[2] * xd.Z(),
-            d[0] * yd.X() + d[1] * yd.Y() + d[2] * yd.Z(),
-        )
-        out.append(_apply(place[host], devs[host](*uv)))
-    return _fit(out)
+    return _fit([_on_host_point(ctx, devs, place, host, c.Value(u)) for u in params])
 
 
 def _fit(pts: list[Point], tol: float = 1e-7) -> list:
@@ -570,7 +541,7 @@ def _fit(pts: list[Point], tol: float = 1e-7) -> list:
         return []
     a, m, b = pts[0], pts[len(pts) // 2], pts[-1]
     ab = math.dist(a, b)
-    if ab > 1e-12 and all(abs((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / ab <= tol for p in pts):
+    if ab > 1e-12 and all(abs(cross(sub(b, a), sub(p, a))) / ab <= tol for p in pts):
         return [Line(a, b)]
     den = 2 * (a[0] * (m[1] - b[1]) + m[0] * (b[1] - a[1]) + b[0] * (a[1] - m[1]))
     if abs(den) > 1e-12:
@@ -581,8 +552,8 @@ def _fit(pts: list[Point], tol: float = 1e-7) -> list:
         c = (ux, uy)
         r = math.dist(c, a)
         if all(abs(math.dist(c, p) - r) <= tol for p in pts):
-            a0 = math.atan2(a[1] - c[1], a[0] - c[0])
-            angles = [math.atan2(p[1] - c[1], p[0] - c[0]) for p in pts]
+            a0 = heading(c, a)
+            angles = [heading(c, p) for p in pts]
             sweep = 0.0
             for u, v in zip(angles, angles[1:], strict=False):
                 sweep += (v - u + math.pi) % (2 * math.pi) - math.pi
@@ -788,18 +759,15 @@ def _close(segs: list, jv: list[int], sharp_v: dict[int, float], tol: float) -> 
 
 
 def _along(line: Line, p: Point) -> float:
-    d = (line.p1[0] - line.p0[0], line.p1[1] - line.p0[1])
-    return (p[0] - line.p0[0]) * d[0] + (p[1] - line.p0[1]) * d[1]
+    return dot(sub(p, line.p0), sub(line.p1, line.p0))
 
 
 def _intersect(a: Line, b: Line) -> Point | None:
-    d1 = (a.p1[0] - a.p0[0], a.p1[1] - a.p0[1])
-    d2 = (b.p1[0] - b.p0[0], b.p1[1] - b.p0[1])
-    den = d1[0] * d2[1] - d1[1] * d2[0]
+    d1, d2 = sub(a.p1, a.p0), sub(b.p1, b.p0)
+    den = cross(d1, d2)
     if abs(den) <= 1e-9 * (math.hypot(*d1) * math.hypot(*d2) or 1.0):
         return None
-    u = ((b.p0[0] - a.p0[0]) * d2[1] - (b.p0[1] - a.p0[1]) * d2[0]) / den
-    return (a.p0[0] + u * d1[0], a.p0[1] + u * d1[1])
+    return offset(a.p0, d1, cross(sub(b.p0, a.p0), d2) / den)
 
 
 def _merge_collinear(L: Loop2D, tol: float = 1e-9, keep_apart: set[int] | None = None) -> Loop2D:
@@ -856,11 +824,11 @@ def _move_loop(L: Loop2D, T: Rigid) -> Loop2D:
     out = []
     for s in L.segments:
         if isinstance(s, Line):
-            out.append(_with(s, p0=_apply(T, s.p0), p1=_apply(T, s.p1)))
+            out.append(_with(s, p0=transform(T, s.p0), p1=transform(T, s.p1)))
         elif isinstance(s, Arc):
-            out.append(_with(s, center=_apply(T, s.center)))
+            out.append(_with(s, center=transform(T, s.center)))
         else:
-            out.append(_with(s, poles=tuple(_apply(T, p) for p in s.poles)))
+            out.append(_with(s, poles=tuple(transform(T, p) for p in s.poles)))
     return Loop2D(tuple(out))
 
 
@@ -907,4 +875,4 @@ def _bend_line(f: Face, dev: _Dev, T: Rigid, steps: int = 200) -> list[tuple[Poi
             start = None
     if start is not None:
         segs.append((start, vs[-1]))
-    return [(_apply(T, dev(um, a)), _apply(T, dev(um, b))) for a, b in segs if b - a > eps]
+    return [(transform(T, dev(um, a)), transform(T, dev(um, b))) for a, b in segs if b - a > eps]

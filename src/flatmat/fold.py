@@ -27,6 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
+from .geom2d import cut_slits, midpoint, offset, perp, unit
 from .model import FlatPattern
 
 
@@ -58,27 +59,18 @@ class FoldModel:
         self.pattern = pattern
         bends = {b.id: b for b in pattern.bends}
         part = Polygon(pattern.outer.polyline(tol), [h.polyline(tol) for h in pattern.holes]).buffer(0)
-        for sl in pattern.slits:  # cut lines without width still separate what they cut
-            part = part.difference(LineString(sl.polyline(tol)).buffer(1e-3))
+        part = cut_slits(part, pattern.slits, tol)
         strips = []
         for bl in pattern.bend_lines:
             b = bends[bl.bend_id]
-            u, length = _unit(bl.p0, bl.p1)
+            u, length = unit(bl.p0, bl.p1)
             if length <= 1e-9:
                 continue
             ext = t  # past the line's ends, so the strip separates its two sides in the corners too
             half = max((b.ba or 0.0) / 2, 1e-3)
-            n = (-u[1], u[0])
-            q0 = (bl.p0[0] - u[0] * ext, bl.p0[1] - u[1] * ext)
-            q1 = (bl.p1[0] + u[0] * ext, bl.p1[1] + u[1] * ext)
-            strips.append(
-                Polygon(
-                    [
-                        (q[0] + s * n[0] * half, q[1] + s * n[1] * half)
-                        for q, s in ((q0, -1), (q1, -1), (q1, 1), (q0, 1))
-                    ]
-                )
-            )
+            n = perp(u)
+            q0, q1 = offset(bl.p0, u, -ext), offset(bl.p1, u, ext)
+            strips.append(Polygon([offset(q, n, s * half) for q, s in ((q0, -1), (q1, -1), (q1, 1), (q0, 1))]))
         rest = part.difference(unary_union(strips)) if strips else part
         pieces = [g for g in getattr(rest, "geoms", [rest]) if isinstance(g, Polygon) and g.area > 1e-6 * part.area]
         self.regions: list[Polygon] = pieces
@@ -94,14 +86,14 @@ class FoldModel:
         raw = []
         for bl in pattern.bend_lines:
             b = bends[bl.bend_id]
-            u, length = _unit(bl.p0, bl.p1)
+            u, length = unit(bl.p0, bl.p1)
             if length <= 1e-9:
                 continue
-            n = (-u[1], u[0])
-            m = ((bl.p0[0] + bl.p1[0]) / 2, (bl.p0[1] + bl.p1[1]) / 2)
+            n = perp(u)
+            m = midpoint(bl.p0, bl.p1)
             d = (b.ba or 0.0) / 2 + 0.02 + 0.01 * t
-            ra = region_at((m[0] - n[0] * d, m[1] - n[1] * d))
-            rb = region_at((m[0] + n[0] * d, m[1] + n[1] * d))
+            ra = region_at(offset(m, n, -d))
+            rb = region_at(offset(m, n, d))
             if ra is None or rb is None:
                 continue
             if ra == rb:
@@ -126,7 +118,7 @@ class FoldModel:
                     continue
                 nn = n if ra == r else (-n[0], -n[1])
                 ba = b.ba or 0.0
-                a = (m[0] - nn[0] * ba / 2, m[1] - nn[1] * ba / 2)
+                a = offset(m, nn, -ba / 2)
                 self.hinges.append(
                     Hinge(
                         b.id,
@@ -243,12 +235,6 @@ def hinge_frame(h: Hinge, phi: float, t: float) -> tuple[np.ndarray, float]:
 def apply(M: np.ndarray, pts2: np.ndarray) -> np.ndarray:
     """4x4 transform of flat points (N x 2, z = 0) -> N x 3."""
     return pts2 @ M[:3, :2].T + M[:3, 3]
-
-
-def _unit(p0, p1):
-    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-    n = math.hypot(dx, dy)
-    return ((dx / n, dy / n) if n > 0 else (1.0, 0.0)), n
 
 
 def boundary_points(poly: Polygon, step: float) -> np.ndarray:

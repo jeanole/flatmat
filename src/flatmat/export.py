@@ -14,6 +14,7 @@ import ezdxf
 
 from . import __version__
 from ._occ import OCP_VERSION
+from .geom2d import heading, midpoint
 from .model import Arc, Feature, FlatPattern, Line, Loop2D, Spline
 
 Labels = Literal["delem", "plain"] | None
@@ -99,8 +100,8 @@ def _write_dxf(pattern, path, layers, labels, version, text_height, dfm=None) ->
                 continue
             done.add(bl.bend_id)
             b = next(b for b in pattern.bends if b.id == bl.bend_id)
-            mid = ((bl.p0[0] + bl.p1[0]) / 2, (bl.p0[1] + bl.p1[1]) / 2)
-            ang = math.degrees(math.atan2(bl.p1[1] - bl.p0[1], bl.p1[0] - bl.p0[0]))
+            mid = midpoint(bl.p0, bl.p1)
+            ang = math.degrees(heading(bl.p0, bl.p1))
             if ang > 90 or ang <= -90:
                 ang -= 180 if ang > 0 else -180
             msp.add_text(
