@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict, deque
+from dataclasses import dataclass, replace
 
 from OCP.BRep import BRep_Tool
 from OCP.Geom2d import Geom2d_TrimmedCurve
@@ -121,7 +122,8 @@ def unfold(
             for f in sheet_features
         ]
     pre_r = {f.id: f.through_diameter / 2 for f in sheet_features if f.kind_info.flat == "pre_hole"}
-    outer, holes, feature_centers, outlines, hole_fid, slits, orient = _outline(ctx, devs, place, sharp_v, diags, pre_r)
+    ol = _outline(ctx, devs, place, sharp_v, diags, pre_r)
+    outer, holes = ol.outer, ol.holes
 
     # self-checks
     area = outer.area() - sum(-h.area() for h in holes)
@@ -130,7 +132,7 @@ def unfold(
         f = faces[i - 1]
         expected += f.area * (devs[i].s / f.radius if i in ctx.bend_faces else 1.0)
     expected += sum(shifts[ei] * se.length for ei, se in ctx.sharp_edges.items())
-    expected += sum(extra for _, extra in feature_centers.values())  # rims replaced by through holes
+    expected += sum(extra for _, extra in ol.centers.values())  # rims replaced by through holes
     rel = abs(area - expected) / expected
     if rel > ctx.tol.area_rel:
         raise refuse(Code.AREA_MISMATCH, f"flat area {area:.4f} vs developed {expected:.4f}", rel_err=rel)
@@ -172,18 +174,18 @@ def unfold(
     outer = _move_loop(outer, shift)
     holes = [_move_loop(h, shift) for h in holes]
     lines = [_with(bl, p0=transform(shift, bl.p0), p1=transform(shift, bl.p1)) for bl in lines]
-    slit_loops = [(_move_loop(L, shift), fid) for L, fid in slits]
+    slit_loops = [(_move_loop(L, shift), fid) for L, fid in ol.slits]
     features = tuple(
         _cut_feature(
             _with(
                 f,
-                center=transform(shift, feature_centers[f.id][0]) if f.id in feature_centers else None,
-                outline=_move_loop(outlines[f.id], shift) if f.id in outlines else None,
-                holes=tuple(i for i, fid in enumerate(hole_fid) if fid == f.id),
+                center=transform(shift, ol.centers[f.id][0]) if f.id in ol.centers else None,
+                outline=_move_loop(ol.outlines[f.id], shift) if f.id in ol.outlines else None,
+                holes=tuple(i for i, fid in enumerate(ol.hole_feature) if fid == f.id),
             ),
             holes,
             lines,
-            orient.get(f.id),
+            ol.orient.get(f.id),
         )
         for f in sheet_features
     )
@@ -241,8 +243,6 @@ def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | N
 
 
 def _with(obj, **kw):
-    from dataclasses import replace
-
     return replace(obj, **kw)
 
 
@@ -367,7 +367,20 @@ def _circle_ccw(m, c2, a, b, cen) -> bool:
     return cross(sub(p0, cen), sub(p1, cen)) > 0
 
 
-def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, pre_r: dict[int, float]):
+@dataclass
+class _Outline:
+    """The flat's outline and holes, and what chaining them found about the features."""
+
+    outer: Loop2D
+    holes: list[Loop2D]
+    hole_feature: list[int | None]  # per hole: the feature that cuts it
+    centers: dict[int, tuple[Point, float]]  # feature id -> (centre, area its rim gives back to the flat)
+    outlines: dict[int, Loop2D]  # feature id -> its rim
+    slits: list[tuple[Loop2D, int]]  # cut lines without width, with their feature
+    orient: dict[int, float]  # louvres, bridges: direction of the slits
+
+
+def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, pre_r: dict[int, float]) -> _Outline:
     faces = ctx.faces
     feature_of_face = {i: fid for fid, fd in ctx.features.items() for i in fd.outline_faces}
     feature_of_edge: dict[int, int] = {}
@@ -478,8 +491,7 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
     if outer.area() < 0:
         outer = _reverse_loop(outer)
     holes = [_reverse_loop(h) if h.area() > 0 else h for h, _ in out[1:]]
-    hole_fid = [f for _, f in out[1:]]
-    return outer, holes, centers, outlines, hole_fid, slits, orient
+    return _Outline(outer, holes, [f for _, f in out[1:]], centers, outlines, slits, orient)
 
 
 def _projected_rim(ctx: Context, devs, place, host: int, rim: tuple[int, ...]) -> Loop2D:

@@ -296,14 +296,14 @@ def check(
 
     checks = _bend_rules(sheet, mat, rules, out, tooling, rolling_direction_deg, machine_max_force_kn)
     if out.on(Code.DFM_U_CHANNEL):
-        _u_channels(pattern, sheet.bends, checks, rules, out.add, skip=sheet.lance_bends)
+        _u_channel_rules(sheet, checks, rules, out)
     if out.on(Code.DFM_FORM_NEAR_EDGE, Code.DFM_FORM_NEAR_BEND):
-        _formed(pattern, outer, holes, sheet.all_lines, sheet.bends, rules, t, out.add)
+        _formed_rules(sheet, rules, out)
     flagged = _hole_rules(sheet, rules, out)
     if out.on(Code.DFM_FEATURE_TOO_SMALL):
         _web_and_slot_rules(sheet, rules, out, flagged)
     if out.on(Code.DFM_CORNER_RELIEF):
-        _corner_reliefs(sheet.ends, sheet.all_lines, sheet.bends, part, rules, t, out.add)
+        _corner_relief_rules(sheet, rules, out)
     if out.on(Code.DFM_RELIEF_MISSING):
         _relief_rules(sheet, rules, out)
 
@@ -311,7 +311,7 @@ def check(
     gaps = out.on(Code.DFM_CORNER_GAP, Code.DFM_CORNER_OVERLAP)
     model = FoldModel(pattern) if pattern.bend_lines and (gaps or sequence is not False) else None
     if model is not None and gaps:
-        _corner_gaps(model, rules, t, out.add)
+        _corner_gap_rules(sheet, model, rules, out)
     plan = None
     if sequence is not False and model is not None:
         tl = tooling or Tooling.default(t).with_die(name=f"V{v:g}", v=v)
@@ -567,12 +567,14 @@ def _tool_limits(b: Bend, bls, tooling: Tooling, rules: DfmRules, add) -> None:
                 bls[0].p0, b.id, tool=name, length=extent)  # fmt: skip
 
 
-def _formed(pattern: FlatPattern, outer: Polygon, holes, all_lines, bends, rules: DfmRules, t: float, add) -> None:
+def _formed_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
     """Formed features: their rims (a lance: its opening) to the bends and to the outline.
 
     A lance's own bend is not counted.
     """
-    for f in pattern.features:
+    add = out.add
+    t, outer, holes, bends = sheet.t, sheet.outer, sheet.holes, sheet.bends
+    for f in sheet.pattern.features:
         if not f.kind_info.formed or f.center is None:
             continue
         if f.outline is not None:
@@ -587,7 +589,7 @@ def _formed(pattern: FlatPattern, outer: Polygon, holes, all_lines, bends, rules
             add(Code.DFM_FORM_NEAR_EDGE, f"{name} {d_edge:.2f} mm from the edge < {rules.form_to_edge_t * t:g}",
                 f.center, distance=d_edge, feature=f.id)  # fmt: skip
         done: set[int] = set()
-        for bl, ls in all_lines:
+        for bl, ls in sheet.all_lines:
             b = bends[bl.bend_id]
             if b.id in done or b.id == f.bend_id:
                 continue
@@ -599,17 +601,19 @@ def _formed(pattern: FlatPattern, outer: Polygon, holes, all_lines, bends, rules
                     f"needs {need:.2f}", f.center, b.id, distance=d, required=need, feature=f.id)  # fmt: skip
 
 
-def _corner_reliefs(ends, all_lines, bends, part: Polygon, rules: DfmRules, t: float, add) -> None:
+def _corner_relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
     """At a bend end that runs into another bend: material around the point where the bend
     zone's edge meets the unbent sheet tears unless a relief clears it.
 
     The point is the end of the bend's tangent line on the side towards the other bend
     (for a square corner of a box: where both tangent lines cross).
     """
+    add = out.add
+    t, part, bends, all_lines = sheet.t, sheet.part, sheet.bends, sheet.all_lines
     rho = rules.corner_relief_t * t
     disc_area = math.pi * rho * rho
     seen: list[tuple[float, float]] = []
-    for e, bl, corner in ends:
+    for e, bl, corner in sheet.ends:
         if not corner:
             continue
         b = bends[bl.bend_id]
@@ -635,12 +639,13 @@ def _corner_reliefs(ends, all_lines, bends, part: Polygon, rules: DfmRules, t: f
                 fill=fill)  # fmt: skip
 
 
-def _corner_gaps(model: FoldModel, rules: DfmRules, t: float, add) -> None:
+def _corner_gap_rules(sheet: _Sheet, model: FoldModel, rules: DfmRules, out: _Findings) -> None:
     """Folded flanges that come closer than ``corner_gap`` (or overlap), e.g. at a box corner.
 
     Each region is a plate t thick around its mid-surface. Regions joined by a bend,
     and regions two parallel bends apart (a joggle, a U), are skipped.
     """
+    add, t = out.add, sheet.t
     T = model.folded()
     hinge_pairs = {frozenset((h.parent, h.child)): h for h in model.hinges}
     step = min(0.25, max(0.05, t / 4))
@@ -759,13 +764,14 @@ def _leg(p, d, sheet: _Sheet, this_line: BendLine, ba: float, b: Bend) -> float:
     return leg
 
 
-def _u_channels(
-    pattern: FlatPattern, bends: dict[int, Bend], checks: list[BendCheck], rules: DfmRules, add, skip=frozenset()
-) -> None:
+def _u_channel_rules(sheet: _Sheet, checks: list[BendCheck], rules: DfmRules, out: _Findings) -> None:
+    """Two parallel bends of the same direction close together: base < ratio * flange (gooseneck punch?)."""
+    add = out.add
+    pattern, bends = sheet.pattern, sheet.bends
     by_id = {c.bend_id: c for c in checks}
     lines: dict[int, BendLine] = {}
     for bl in pattern.bend_lines:
-        if bl.bend_id not in skip:
+        if bl.bend_id not in sheet.lance_bends:
             lines.setdefault(bl.bend_id, bl)
     ids = sorted(lines)
     for i, a in enumerate(ids):

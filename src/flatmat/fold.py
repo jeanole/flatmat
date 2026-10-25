@@ -28,7 +28,7 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 from .geom2d import cut_slits, midpoint, offset, perp, unit
-from .model import FlatPattern
+from .model import Bend, BendLine, FlatPattern
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,19 @@ class Hinge:
     t: float
     p0: tuple[float, float]  # the bend line segment
     p1: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class _Crossing:
+    """A bend line segment whose strip separates two regions: a hinge before the tree picks its parent."""
+
+    bend: Bend
+    line: BendLine
+    region_a: int  # on the -n side
+    region_b: int  # on the +n side
+    mid: tuple[float, float]  # middle of the segment
+    u: tuple[float, float]  # along it
+    n: tuple[float, float]  # across it, from region_a to region_b
 
 
 class FoldModel:
@@ -99,26 +112,27 @@ class FoldModel:
             if ra == rb:
                 self.unseparated.add(b.id)
                 continue
-            raw.append((b, bl, ra, rb, m, u, n))
+            raw.append(_Crossing(b, bl, ra, rb, m, u, n))
         self.base = max(range(len(pieces)), key=lambda i: pieces[i].area) if pieces else 0
         # spanning tree from the base
         by_region: dict[int, list] = {}
-        for h in raw:
-            by_region.setdefault(h[2], []).append(h)
-            by_region.setdefault(h[3], []).append(h)
+        for x in raw:
+            by_region.setdefault(x.region_a, []).append(x)
+            by_region.setdefault(x.region_b, []).append(x)
         self.hinges: list[Hinge] = []
         self.parent: dict[int, int] = {}  # region -> index of the hinge to its parent
         self.depth: dict[int, int] = {self.base: 0}
         q = deque([self.base])
         while q:
             r = q.popleft()
-            for b, bl, ra, rb, m, u, n in by_region.get(r, []):
-                c = rb if ra == r else ra
+            for x in by_region.get(r, []):
+                b, bl, u = x.bend, x.line, x.u
+                c = x.region_b if x.region_a == r else x.region_a
                 if c in self.depth:
                     continue
-                nn = n if ra == r else (-n[0], -n[1])
+                nn = x.n if x.region_a == r else (-x.n[0], -x.n[1])
                 ba = b.ba or 0.0
-                a = offset(m, nn, -ba / 2)
+                a = offset(x.mid, nn, -ba / 2)
                 self.hinges.append(
                     Hinge(
                         b.id,
