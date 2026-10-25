@@ -16,16 +16,14 @@ from OCP.BRep import BRep_Tool
 from OCP.Geom2d import Geom2d_TrimmedCurve
 from OCP.Geom2dConvert import Geom2dConvert
 from OCP.GeomAbs import GeomAbs_BSplineCurve, GeomAbs_Circle, GeomAbs_Line
-from OCP.TopAbs import TopAbs_VERTEX
-from OCP.TopExp import TopExp_Explorer
 from shapely.geometry import Polygon
 from shapely.validation import explain_validity
 
-from ._occ import OCP_VERSION, as_vertex
+from ._occ import OCP_VERSION
+from ._topology import Context, Face, edge_vertices, inner_uv, pcurve
 from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .model import Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
-from .recognize import Context, _Face, pcurve
 
 Rigid = tuple[float, float, float, float]  # cos, sin, tx, ty
 _IDENTITY: Rigid = (1.0, 0.0, 0.0, 0.0)
@@ -46,7 +44,7 @@ def _rigid(a1: Point, a2: Point, b1: Point, b2: Point) -> Rigid:
 class _Dev:
     """(u, v) on one face of the reference skin -> that face's developed 2D frame."""
 
-    def __init__(self, f: _Face, rn: float | None):
+    def __init__(self, f: Face, rn: float | None):
         self.m = f.mirror
         self.s = rn if (f.kind == "cylinder" and rn is not None) else 1.0
 
@@ -56,15 +54,6 @@ class _Dev:
     @property
     def flips(self) -> bool:  # does the map reverse orientation?
         return self.m < 0
-
-
-def _vertices(e) -> list:
-    out = []
-    ex = TopExp_Explorer(e, TopAbs_VERTEX)
-    while ex.More():
-        out.append(as_vertex(ex.Current()))
-        ex.Next()
-    return out
 
 
 def _vertex_uv(v, e, f) -> tuple[float, float]:
@@ -275,16 +264,6 @@ def _with(obj, **kw):
 # ------------------------------------------------------------------------------ placement
 
 
-def _inner_uv(f: _Face) -> tuple[float, float]:
-    u0, u1, v0, v1 = f.uv
-    for su in (0.5, 0.25, 0.75, 0.1, 0.9):
-        for sv in (0.5, 0.25, 0.75, 0.1, 0.9):
-            u, v = u0 + su * (u1 - u0), v0 + sv * (v1 - v0)
-            if f.inside(u, v):
-                return u, v
-    return 0.5 * (u0 + u1), 0.5 * (v0 + v1)
-
-
 def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
     """Rigid placement of every reference-skin face; a sharp edge inserts a strip of shifts[ei]."""
     faces, edges = ctx.faces, ctx.edges
@@ -300,7 +279,7 @@ def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
                 continue
             seen.add(ei)
             e = edges[ei][0]
-            vs = _vertices(e)
+            vs = edge_vertices(e)
             if len(vs) < 2 or vs[0].IsSame(vs[-1]):
                 continue  # closed edge: carries no placement information
             fp, fc = faces[p - 1].shape, faces[c - 1].shape
@@ -318,7 +297,8 @@ def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
                 # move C away from P, perpendicular to the edge, by the strip width
                 L = math.dist(a1, a2)
                 n = (-(a2[1] - a1[1]) / L, (a2[0] - a1[0]) / L)
-                qc = _apply(Tc, devs[c](*_inner_uv(faces[c - 1])))
+                fc_rec = faces[c - 1]
+                qc = _apply(Tc, devs[c](*(inner_uv(fc_rec) or fc_rec.uv_centre)))
                 if (qc[0] - a1[0]) * n[0] + (qc[1] - a1[1]) * n[1] < 0:
                     n = (-n[0], -n[1])
                 d = shifts[ei]
@@ -346,7 +326,7 @@ def _place(ctx: Context, devs: dict[int, _Dev], shifts: dict[int, float]):
 # ------------------------------------------------------------------------------ outline
 
 
-def _edge_segment(e, ei: int, f: _Face, dev: _Dev, T: Rigid):
+def _edge_segment(e, ei: int, f: Face, dev: _Dev, T: Rigid):
     """The developed, placed, exact 2D geometry of edge e on face f."""
     c2 = pcurve(e, f.shape)
     a, b = c2.FirstParameter(), c2.LastParameter()
@@ -421,7 +401,7 @@ def _outline(ctx: Context, devs, place, sharp_v: dict[int, float], diags: list, 
         if other and other[0] in feature_of_face:
             feature_of_edge[ei] = feature_of_face[other[0]]
         seg = _edge_segment(e, ei, f, devs[i], place[i])
-        vs = _vertices(e)
+        vs = edge_vertices(e)
         va, vb = ctx.vmap.FindIndex(vs[0]), ctx.vmap.FindIndex(vs[-1])
         pa = _apply(place[i], devs[i](*_vertex_uv(vs[0], e, f.shape)))
         if va != vb and math.dist(seg.start, pa) > math.dist(seg.end, pa):
@@ -883,7 +863,7 @@ def _move_loop(L: Loop2D, T: Rigid) -> Loop2D:
 # ------------------------------------------------------------------------------ bend lines
 
 
-def _bend_line(f: _Face, dev: _Dev, T: Rigid, steps: int = 200) -> list[tuple[Point, Point]]:
+def _bend_line(f: Face, dev: _Dev, T: Rigid, steps: int = 200) -> list[tuple[Point, Point]]:
     """The iso-u line at mid angle, clipped to the face.
 
     Coarse scan along v for inside/outside, then bisection on each transition so the

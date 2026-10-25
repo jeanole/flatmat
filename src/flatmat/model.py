@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
+from functools import cache, cached_property
 from typing import Any, Literal
 
 from .diagnostics import Diagnostic
@@ -95,12 +96,12 @@ class Spline:
     weights: tuple[float, ...] | None = None
     source_edge: int = 0
 
-    @property
+    @cached_property
     def flat_knots(self) -> list[float]:
         return [k for k, m in zip(self.knots, self.mults, strict=True) for _ in range(m)]
 
-    def point(self, u: float) -> Point:
-        """De Boor evaluation (rational if weighted)."""
+    def _deboor(self, u: float) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """Homogeneous (w·x, w·y, w) point and first derivative at u (de Boor)."""
         p, kv = self.degree, self.flat_knots
         n = len(self.poles)
         u = min(max(u, kv[p]), kv[n])
@@ -109,7 +110,11 @@ class Spline:
             k += 1
         w = self.weights or (1.0,) * n
         d = [(self.poles[j][0] * w[j], self.poles[j][1] * w[j], w[j]) for j in range(k - p, k + 1)]
+        der = (0.0, 0.0, 0.0)
         for r in range(1, p + 1):
+            if r == p:  # the derivative is p·(d[p] - d[p-1]) / (u_k+1 - u_k) on the level before the point
+                f = p / (kv[k + 1] - kv[k])
+                der = tuple(f * (b - a) for a, b in zip(d[p - 1], d[p], strict=True))  # type: ignore[assignment]
             for j in range(p, r - 1, -1):
                 i = j + k - p
                 den = kv[i + p - r + 1] - kv[i]
@@ -119,16 +124,20 @@ class Spline:
                     (1 - a) * d[j - 1][1] + a * d[j][1],
                     (1 - a) * d[j - 1][2] + a * d[j][2],
                 )
-        x, y, ww = d[p]
+        return d[p], der
+
+    def point(self, u: float) -> Point:
+        """De Boor evaluation (rational if weighted)."""
+        (x, y, ww), _ = self._deboor(u)
         return (x / ww, y / ww)
 
     @property
     def start(self) -> Point:
-        return self.point(self.knots[0])
+        return self.poles[0]  # clamped: the curve starts and ends on its end poles
 
     @property
     def end(self) -> Point:
-        return self.point(self.knots[-1])
+        return self.poles[-1]
 
     def reversed(self) -> Spline:
         lo, hi = self.knots[0], self.knots[-1]
@@ -147,6 +156,48 @@ class Spline:
         lo, hi = self.knots[0], self.knots[-1]
         return [self.point(lo + (hi - lo) * i / n) for i in range(n + 1)]
 
+    def green(self) -> float:
+        """The integral of (x dy - y dx) along the curve, by Gauss quadrature per knot span.
+
+        In homogeneous coordinates the integrand is (X·Y' - Y·X') / W². Without weights it
+        is a polynomial of degree 2p - 1, which p + 1 points per span integrate exactly.
+        """
+        nodes = _gauss_legendre(self.degree + 1 if not self.weights else 2 * self.degree + 8)
+        kv, p = self.flat_knots, self.degree
+        total = 0.0
+        for i in range(p, len(self.poles)):
+            a, b = kv[i], kv[i + 1]
+            if b <= a:
+                continue
+            h, m = 0.5 * (b - a), 0.5 * (a + b)
+            for x, wt in nodes:
+                (X, Y, W), (dX, dY, _) = self._deboor(m + h * x)
+                total += wt * h * (X * dY - Y * dX) / (W * W)
+        return total
+
+
+@cache
+def _gauss_legendre(n: int) -> tuple[tuple[float, float], ...]:
+    """Gauss-Legendre nodes and weights on [-1, 1] (Newton on P_n)."""
+    out = []
+    for i in range(1, n + 1):
+        x = math.cos(math.pi * (i - 0.25) / (n + 0.5))
+        for _ in range(100):
+            p0, p1 = 1.0, x
+            for k in range(2, n + 1):
+                p0, p1 = p1, ((2 * k - 1) * x * p1 - (k - 1) * p0) / k
+            dp = n * (x * p1 - p0) / (x * x - 1)
+            dx = p1 / dp
+            x -= dx
+            if abs(dx) < 1e-15:
+                break
+        p0, p1 = 1.0, x
+        for k in range(2, n + 1):
+            p0, p1 = p1, ((2 * k - 1) * x * p1 - (k - 1) * p0) / k
+        dp = n * (x * p1 - p0) / (x * x - 1)
+        out.append((x, 2 / ((1 - x * x) * dp * dp)))
+    return tuple(out)
+
 
 Seg2D = Line | Arc | Spline
 
@@ -163,11 +214,14 @@ class Loop2D:
         return pts[:-1] if len(pts) > 1 and math.dist(pts[0], pts[-1]) < 1e-9 else pts
 
     def area(self) -> float:
-        """Signed area (counter-clockwise positive), exact for lines and arcs.
+        """Signed area (counter-clockwise positive), exact for lines, arcs and splines.
 
-        Green's theorem per segment: 0.5 * integral of (x dy - y dx). Splines are
-        integrated on a dense sampling of the exact curve.
+        Green's theorem per segment: 0.5 * integral of (x dy - y dx). Computed once.
         """
+        return self._area
+
+    @cached_property
+    def _area(self) -> float:
         total = 0.0
         for s in self.segments:
             if isinstance(s, Line):
@@ -177,8 +231,7 @@ class Loop2D:
                 (cx, cy), (xs, ys), (xe, ye) = s.center, s.start, s.end
                 total += s.radius**2 * (s.a1 - s.a0) + cx * (ye - ys) - cy * (xe - xs)
             else:
-                p = s.sample(1e-5)
-                total += sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(p, p[1:], strict=False))
+                total += s.green()
         return 0.5 * total
 
 
@@ -342,7 +395,7 @@ class FlatPattern:
     features: tuple[Feature, ...] = ()
     slits: tuple[Loop2D, ...] = ()  # open cut paths with no width (slits of louvres, bridges)
 
-    @property
+    @cached_property
     def bbox(self) -> tuple[float, float, float, float]:
         pts = self.outer.polyline(0.01)
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]

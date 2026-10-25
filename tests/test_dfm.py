@@ -65,6 +65,19 @@ def test_rules_are_configurable(flats):
     assert fm.check(flats["dfm_short_flange"], rules=fm.DfmRules(disabled=frozenset({"DFM_FLANGE_TOO_SHORT"}))).ok
 
 
+@pytest.mark.parametrize("name", list(EXPECT))
+def test_disabling_a_rule_removes_only_its_findings(flats, name):
+    # a switched-off rule skips its work; that must not change what the other rules find
+    # (e.g. a hole near the edge is still not reported again as a narrow web)
+    def found(report):
+        return [(d.code.value, d.message) for d in report.findings]
+
+    every = found(fm.check(flats[name]))
+    for code in sorted(c.value for c in fm.Code if c.value.startswith("DFM_")):
+        report = fm.check(flats[name], rules=fm.DfmRules(disabled=frozenset({code})))
+        assert found(report) == [f for f in every if f[0] != code], code
+
+
 def test_die_opening_rule():
     assert die_opening(1.0) == 6.0 and die_opening(2.9999) == pytest.approx(8 * 2.9999) and die_opening(10) == 100.0
     assert bending_force_kn(450, 2, 1000, 16) == pytest.approx(159.75)
@@ -75,6 +88,8 @@ def test_tonnage_and_material(flats):
     assert "DFM_TONNAGE" in fm.check(pat, machine_max_force_kn=10).codes()
     hem = flats["dfm_short_hem"]
     assert "DFM_HEM_MATERIAL" in fm.check(hem, material="aluminium_6061_t6").codes()
+    with pytest.raises(ValueError, match="unknown material 'steel304'"):
+        fm.check(pat, material="steel304")
 
 
 def test_grain_direction(flats):

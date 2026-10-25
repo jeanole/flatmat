@@ -13,11 +13,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
-from OCP.BRep import BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Curve2d, BRepAdaptor_Surface
+from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp
-from OCP.BRepLProp import BRepLProp_SLProps
-from OCP.BRepTools import BRepTools
+from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
 from OCP.GeomAbs import (
     GeomAbs_Circle,
     GeomAbs_Cone,
@@ -27,119 +28,24 @@ from OCP.GeomAbs import (
     GeomAbs_Sphere,
     GeomAbs_Torus,
 )
-from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec
+from OCP.gp import gp_Pnt, gp_Vec
 from OCP.GProp import GProp_GProps
-from OCP.IntTools import IntTools_FClass2d
-from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_REVERSED, TopAbs_VERTEX
-from OCP.TopExp import TopExp
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE
+from OCP.TopExp import TopExp, TopExp_Explorer
+from OCP.TopoDS import TopoDS_Compound
 
-from ._occ import EdgeFaceMap, ShapeMap, as_edge, as_face
+from ._occ import EdgeFaceMap, ShapeMap, as_edge, as_face, as_vertex, as_wire
+from ._topology import BendFace, Context, Face, SharpEdge, edge_vertices, inner_uv, pcurve, surface_props
 from .bendmodel import extruded_hole_prehole
 from .canonical import canonicalize
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .io import StepModel
 from .model import Bend, BendSegment, FaceInfo, Feature, Flange, SheetPart, Tolerances
 
-# ------------------------------------------------------------------------------ internals
+# ------------------------------------------------------------------------------ tables
 
 
-@dataclass
-class _Face:
-    idx: int
-    shape: Any
-    kind: str
-    area: float
-    normal: gp_Vec  # outward (face orientation applied), at the UV centre
-    mirror: float  # +1 if the surface normal equals the outward normal, else -1
-    uv: tuple[float, float, float, float]
-    ad: Any  # BRepAdaptor_Surface, one per face
-    radius: float = 0.0
-    axis_p: Any = None  # gp_Pnt for cylinders
-    axis_d: Any = None  # gp_Vec for cylinders and cones
-    semi_angle: float = 0.0  # cones
-    minor: float = 0.0  # tori
-    _cls: Any = None
-
-    def inside(self, u: float, v: float) -> bool:
-        # one classifier per face: BRepClass_FaceClassifier rebuilds per call (~9 ms on
-        # a face with 1000 holes against 0.8 ms here)
-        if self._cls is None:
-            self._cls = IntTools_FClass2d(self.shape, 1e-7)
-        return self._cls.Perform(gp_Pnt2d(u, v)) == TopAbs_IN
-
-
-@dataclass
-class _BendFace:
-    face: int
-    bend_id: int
-    r_in: float
-    concave: bool  # reference skin is the inside of the bend at this face
-    angle: float  # rad
-
-
-@dataclass
-class _SharpEdge:
-    """A sharp bend edge between two faces of the reference skin."""
-
-    edge: int
-    faces: tuple[int, int]
-    angle: float  # deflection, rad
-    concave: bool  # reference skin is the inside of the bend here
-    length: float
-    vertices: tuple[int, int]  # vertex map indices
-    bend_id: int = 0
-
-
-@dataclass
-class Context:
-    """Everything unfold() needs; kept out of the public model."""
-
-    solid: Any
-    fmap: Any
-    vmap: Any
-    faces: list[_Face]
-    edges: list[tuple[Any, tuple[int, ...]]]
-    adj: dict[int, list[tuple[int, int]]]  # face -> [(neighbour, edge index)] over SMOOTH edges
-    skin_a: set[int]
-    root: int
-    thickness: float
-    bend_faces: dict[int, _BendFace] = field(default_factory=dict)
-    sharp_edges: dict[int, _SharpEdge] = field(default_factory=dict)
-    features: dict[int, tuple[int, ...]] = field(default_factory=dict)  # feature id -> faces
-    feature_through_r: dict[int, float] = field(default_factory=dict)
-    feature_on_a: dict[int, bool] = field(default_factory=dict)
-    feature_kind: dict[int, str] = field(default_factory=dict)
-    feature_edges: dict[int, set[int]] = field(default_factory=dict)  # edges of a formed feature's opening
-    feature_cuts: dict[int, list[list[int]]] = field(default_factory=dict)  # its slits, as runs of edges
-    feature_gap: dict[int, float] = field(default_factory=dict)  # their width
-    developed: set[int] = field(default_factory=set)  # lances laid flat by bending
-    feature_free: dict[int, tuple[int, list[int]]] = field(default_factory=dict)  # host face, free edges
-    # rims of engravings not in a face of the reference skin (the far skin, islands):
-    # feature id -> (the reference-skin plane to project onto, edges of the rim in wire order)
-    projected_rims: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
-    tol: Tolerances = field(default_factory=Tolerances)
-
-
-def _props(face, ad, u, v):
-    pr = BRepLProp_SLProps(ad, u, v, 1, 1e-7)
-    n = gp_Vec(pr.Normal())
-    sn = pr.D1U().Crossed(pr.D1V())
-    if face.Orientation() == TopAbs_REVERSED:
-        n.Reverse()
-    return n, (1.0 if sn.Dot(n) > 0 else -1.0)
-
-
-def pcurve(e, f) -> BRepAdaptor_Curve2d:
-    """BRepAdaptor_Curve2d, refusing instead of crashing when the pcurve is missing.
-
-    On a missing pcurve the adaptor raises on OCP 7.8 and segfaults on 8.0.
-    """
-    if BRep_Tool.CurveOnSurface_s(e, f, 0.0, 0.0) is None:
-        raise refuse(Code.MISSING_PCURVE, "an edge has no pcurve on its face")
-    return BRepAdaptor_Curve2d(e, f)
-
-
-def _face_table(solid) -> tuple[Any, list[_Face]]:
+def _face_table(solid) -> tuple[Any, list[Face]]:
     fmap = ShapeMap()
     TopExp.MapShapes_s(solid, TopAbs_FACE, fmap)
     faces = []
@@ -147,7 +53,7 @@ def _face_table(solid) -> tuple[Any, list[_Face]]:
         f = as_face(fmap.FindKey(i))
         ad = BRepAdaptor_Surface(f, True)
         u0, u1, v0, v1 = BRepTools.UVBounds_s(f)
-        n, mirror = _props(f, ad, (u0 + u1) / 2, (v0 + v1) / 2)
+        n, mirror = surface_props(f, ad, (u0 + u1) / 2, (v0 + v1) / 2)
         g = GProp_GProps()
         BRepGProp.SurfaceProperties_s(f, g)
         kind = {
@@ -157,7 +63,7 @@ def _face_table(solid) -> tuple[Any, list[_Face]]:
             GeomAbs_Torus: "torus",
             GeomAbs_Sphere: "sphere",
         }.get(ad.GetType(), "other")
-        rec = _Face(i, f, kind, g.Mass(), n, mirror, (u0, u1, v0, v1), ad)
+        rec = Face(i, f, kind, g.Mass(), n, mirror, (u0, u1, v0, v1), ad)
         if kind == "cylinder":
             c = ad.Cylinder()
             rec.radius = c.Radius()
@@ -200,7 +106,20 @@ def _edge_table(solid, fmap) -> list[tuple[Any, tuple[int, ...]]]:
     return edges
 
 
-def _is_smooth(e, f1: _Face, f2: _Face, tol: Tolerances) -> bool:
+# ------------------------------------------------------------------------------ graph
+
+
+@dataclass
+class _Graph:
+    """Face adjacency over the manifold edges, split by how the two faces meet."""
+
+    smooth: list[tuple[int, int, int]]  # (face, face, edge) where the faces meet tangentially
+    smooth_nb: dict[int, set[int]]
+    sharp_nb: dict[int, set[int]]
+    nb_all: dict[int, set[int]]
+
+
+def _is_smooth(e, f1: Face, f2: Face, tol: Tolerances) -> bool:
     c = BRepAdaptor_Curve(e)
     a, b = c.FirstParameter(), c.LastParameter()
     worst = 0.0
@@ -209,9 +128,34 @@ def _is_smooth(e, f1: _Face, f2: _Face, tol: Tolerances) -> bool:
         n = []
         for f in (f1, f2):
             uv = pcurve(e, f.shape).Value(tm)
-            n.append(_props(f.shape, f.ad, uv.X(), uv.Y())[0])
+            n.append(surface_props(f.shape, f.ad, uv.X(), uv.Y())[0])
         worst = max(worst, n[0].Angle(n[1]))
     return worst < tol.smooth_angle
+
+
+def _graph(faces: list[Face], edges, tol: Tolerances) -> _Graph:
+    """The adjacency graph; refuses open shells and non-manifold edges."""
+    g = _Graph([], defaultdict(set), defaultdict(set), defaultdict(set))
+    for ei, (e, fi) in enumerate(edges):
+        if BRep_Tool.Degenerated_s(e):
+            continue
+        if len(fi) == 1:
+            if not BRep_Tool.IsClosed_s(e, faces[fi[0] - 1].shape):
+                raise refuse(Code.OPEN_SHELL, "an edge borders only one face", faces=fi, edges=(ei,))
+            continue
+        if len(fi) > 2:
+            raise refuse(Code.NON_MANIFOLD, "an edge borders more than two faces", faces=fi, edges=(ei,))
+        a, b = fi
+        g.nb_all[a].add(b)
+        g.nb_all[b].add(a)
+        if _is_smooth(e, faces[a - 1], faces[b - 1], tol):
+            g.smooth.append((a, b, ei))
+            g.smooth_nb[a].add(b)
+            g.smooth_nb[b].add(a)
+        else:
+            g.sharp_nb[a].add(b)
+            g.sharp_nb[b].add(a)
+    return g
 
 
 def _components(n: int, links) -> list[list[int]]:
@@ -229,6 +173,25 @@ def _components(n: int, links) -> list[list[int]]:
     for i in range(1, n + 1):
         groups[find(i)].append(i)
     return list(groups.values())
+
+
+def _skins(faces: list[Face], links) -> tuple[list[list[int]], list[set[int]]]:
+    """Face groups by area (largest first) and the two skins."""
+    comps = sorted(_components(len(faces), links), key=lambda c: -sum(faces[i - 1].area for i in c))
+    if len(comps) < 3:
+        raise refuse(Code.NOT_TWO_SKINS, f"{len(comps)} face groups; a sheet has two skins and edge faces")
+    return comps, [set(comps[0]), set(comps[1])]
+
+
+def _check_skin_surfaces(faces: list[Face], skins: list[set[int]], formed: set[int]) -> None:
+    """Outside formed features, the skins must be planes or cylinders."""
+    for sk in skins:
+        bad = [i for i in sk if faces[i - 1].kind in _FORM_KINDS and i not in formed]
+        if bad:
+            raise refuse(Code.UNSUPPORTED_SURFACE, "skin faces must be planes or cylinders", faces=bad)
+
+
+# ------------------------------------------------------------------------------ geometry keys
 
 
 def _canonical_dir(v: gp_Vec, digits: int = 4) -> tuple[tuple[float, float, float], gp_Vec]:
@@ -250,27 +213,76 @@ def _line_key(p: gp_Pnt, v: gp_Vec) -> tuple[float, ...]:
     return (*key, *(round(c, 3) + 0.0 for c in (foot.X(), foot.Y(), foot.Z())))
 
 
-def _axis_key(f: _Face) -> tuple[float, ...]:
+def _axis_key(f: Face) -> tuple[float, ...]:
     return _line_key(f.axis_p, f.axis_d)
 
 
-def _plane_uv(f: _Face, p: gp_Pnt) -> tuple[float, float]:
+def _plane_uv(f: Face, p: gp_Pnt) -> tuple[float, float]:
     pos = f.ad.Plane().Position()
     d = gp_Vec(pos.Location(), p)
     return d.Dot(gp_Vec(pos.XDirection())), d.Dot(gp_Vec(pos.YDirection()))
 
 
-def _inner_point(f: _Face):
-    u0, u1, v0, v1 = f.uv
-    for su in (0.5, 0.25, 0.75, 0.1, 0.9):
-        for sv in (0.5, 0.25, 0.75, 0.1, 0.9):
-            u, v = u0 + su * (u1 - u0), v0 + sv * (v1 - v0)
-            if f.inside(u, v):
-                return f.ad.Value(u, v)
-    return None
+def _inner_point(f: Face):
+    uv = inner_uv(f)
+    return None if uv is None else f.ad.Value(*uv)
 
 
-def _thickness(faces: list[_Face], skins: list[set[int]], tol: Tolerances, max_planes: int = 12):
+# ------------------------------------------------------------------------------ thickness
+
+
+def _mode(cands: list[tuple[float, float]], tol: Tolerances) -> tuple[float, float]:
+    """The (value, weight) bin with the most weight, and the band around it that counts as equal."""
+    bins: dict[float, float] = defaultdict(float)
+    for v, w in cands:
+        bins[round(v, 3)] += w
+    t0 = max(bins, key=lambda k: bins[k])
+    return t0, max(0.01, tol.thickness_rel * t0)
+
+
+def _plane_partners(faces: list[Face], tol: Tolerances) -> dict[int, tuple[float, int]]:
+    """For every plane, the opposite plane: plane -> (distance, partner).
+
+    Planes are bucketed by their (unsigned) normal direction; the partner of f is the
+    nearest antiparallel plane *behind* f (into the material) whose face contains the
+    foot of an inner point of f. Skins are not known yet: sharp bends split them.
+    """
+    buckets: dict[tuple, list[Face]] = defaultdict(list)
+    for f in faces:
+        if f.kind == "plane":
+            buckets[_canonical_dir(f.normal)[0]].append(f)
+    found: dict[int, tuple[float, int]] = {}
+    for group in buckets.values():
+        if len(group) < 2:
+            continue
+        for f in group:
+            p = _inner_point(f)
+            if p is None:
+                continue
+            nf = f.normal.Normalized()
+            best = None
+            for g in group:
+                if g is f or g.normal.Angle(f.normal) < math.pi - 1e-3:
+                    continue
+                d = gp_Vec(g.ad.Plane().Location(), p).Dot(nf)  # > 0: g lies behind f
+                if d <= tol.linear or (best is not None and d >= best[0]):
+                    continue
+                foot = gp_Pnt(p.XYZ() - nf.XYZ() * d)
+                if g.inside(*_plane_uv(g, foot)):
+                    best = (d, g.idx)
+            if best is not None:
+                found[f.idx] = best
+    return found
+
+
+def _thickness(faces: list[Face], skins: list[set[int]], tol: Tolerances, max_planes: int = 12):
+    """Thickness and the share of the sheet (by area) that agrees with it.
+
+    Candidates: coaxial cylinders on opposite skins, and the largest planes of each skin
+    with the nearest antiparallel plane of the other skin. (Not the partners from
+    _plane_partners: their distance is measured along the other plane's normal, which can
+    differ in the last bit and moves t off a round value on some OCP builds.)
+    """
     cands: list[tuple[float, float]] = []
     # coaxial cylinder pairs, bucketed by axis line (all pairs was O(n^2) on hole walls)
     buckets = defaultdict(list)
@@ -306,60 +318,26 @@ def _thickness(faces: list[_Face], skins: list[set[int]], tol: Tolerances, max_p
                 cands.append((best, f.area))
     if not cands:
         raise refuse(Code.NO_THICKNESS, "no pair of opposite faces found")
-    bins: dict[float, float] = defaultdict(float)
-    for v, w in cands:
-        bins[round(v, 3)] += w
-    t0 = max(bins, key=lambda k: bins[k])
-    band = max(0.01, tol.thickness_rel * t0)
+    t0, band = _mode(cands, tol)
     near = [(v, w) for v, w in cands if abs(v - t0) <= band]
     t = sum(v * w for v, w in near) / sum(w for _, w in near)
     conf = sum(w for _, w in near) / sum(w for _, w in cands)
     return t, conf
 
 
-# ------------------------------------------------------------------------------ partners
+def _checked_thickness(t: float, conf: float, given: float | None, tol: Tolerances) -> float:
+    if given is not None:
+        if abs(given - t) > max(0.01, tol.thickness_rel * given):
+            raise refuse(Code.VARIABLE_THICKNESS, f"given thickness {given} but measured {t:.4f}", measured=t)
+        t = given
+    if conf < tol.thickness_confidence:
+        raise refuse(
+            Code.VARIABLE_THICKNESS, f"only {conf:.0%} of the sheet agrees on t = {t:.4f}", thickness=t, confidence=conf
+        )
+    return t
 
 
-def _plane_partners(faces: list[_Face], tol: Tolerances) -> tuple[float | None, dict[int, int]]:
-    """Global thickness estimate and, for every plane, the opposite plane at that distance.
-
-    Planes are bucketed by their (unsigned) normal direction; the partner of f is the
-    nearest antiparallel plane *behind* f (into the material) whose face contains the
-    foot of an inner point of f. Skins are not known yet: sharp bends split them.
-    """
-    planes = [f for f in faces if f.kind == "plane"]
-    buckets: dict[tuple, list[_Face]] = defaultdict(list)
-    for f in planes:
-        buckets[_canonical_dir(f.normal)[0]].append(f)
-    found: dict[int, tuple[float, int]] = {}
-    for group in buckets.values():
-        if len(group) < 2:
-            continue
-        for f in group:
-            p = _inner_point(f)
-            if p is None:
-                continue
-            nf = f.normal.Normalized()
-            best = None
-            for g in group:
-                if g is f or g.normal.Angle(f.normal) < math.pi - 1e-3:
-                    continue
-                d = gp_Vec(g.ad.Plane().Location(), p).Dot(nf)  # > 0: g lies behind f
-                if d <= tol.linear or (best is not None and d >= best[0]):
-                    continue
-                foot = gp_Pnt(p.XYZ() - nf.XYZ() * d)
-                if g.inside(*_plane_uv(g, foot)):
-                    best = (d, g.idx)
-            if best is not None:
-                found[f.idx] = best
-    if not found:
-        return None, {}
-    bins: dict[float, float] = defaultdict(float)
-    for i, (d, _) in found.items():
-        bins[round(d, 3)] += faces[i - 1].area
-    t0 = max(bins, key=lambda k: bins[k])
-    band = max(0.01, tol.thickness_rel * t0)
-    return t0, {i: g for i, (d, g) in found.items() if abs(d - t0) <= band}
+# ------------------------------------------------------------------------------ sharp bends
 
 
 def _edge_line(e):
@@ -370,7 +348,7 @@ def _edge_line(e):
     return c.Value(a), c.Value(b)
 
 
-def _concave(e, f: _Face, h: _Face, scale: float) -> bool:
+def _concave(e, f: Face, h: Face, scale: float) -> bool:
     """Is the edge between f and h concave (h rises on the outward side of f)?"""
     ends = _edge_line(e)
     p0, p1 = ends
@@ -383,7 +361,7 @@ def _concave(e, f: _Face, h: _Face, scale: float) -> bool:
     return d.Dot(f.normal) > 0
 
 
-def _sharp_bend_edges(faces, edges, partners, nb_all, smooth_nb, t, tol) -> dict[int, tuple]:
+def _sharp_bend_edges(faces, edges, partners, g: _Graph, t, tol) -> dict[int, tuple[int, int]]:
     """Sharp edges between skin faces that are bends (docs/design.md §5.3).
 
     Edge E between planes f, h is a sharp bend if both have partners at distance t and
@@ -396,16 +374,16 @@ def _sharp_bend_edges(faces, edges, partners, nb_all, smooth_nb, t, tol) -> dict
             continue
         a, b = fi
         fa, fb = faces[a - 1], faces[b - 1]
-        if fa.kind != "plane" or fb.kind != "plane" or b in smooth_nb[a]:
+        if fa.kind != "plane" or fb.kind != "plane" or b in g.smooth_nb[a]:
             continue
         if a not in partners or b not in partners or _edge_line(e) is None:
             continue
         pa, pb = partners[a], partners[b]
         if pa in (a, b) or pb in (a, b) or pa == pb:
             continue
-        ok = pb in nb_all[pa]  # sharp on both sides
+        ok = pb in g.nb_all[pa]  # sharp on both sides
         if not ok:  # sharp inside, round (R ~ t) outside
-            for z in smooth_nb[pa] & smooth_nb[pb]:
+            for z in g.smooth_nb[pa] & g.smooth_nb[pb]:
                 fz = faces[z - 1]
                 if fz.kind == "cylinder" and abs(fz.radius - t) <= max(0.01, tol.thickness_rel * t):
                     ok = True
@@ -418,12 +396,9 @@ def _sharp_bend_edges(faces, edges, partners, nb_all, smooth_nb, t, tol) -> dict
 # ------------------------------------------------------------------------------ hole features
 
 
-def _circle_radii(face: _Face) -> list[tuple[float, Any]]:
-    from OCP.TopAbs import TopAbs_EDGE as _E
-    from OCP.TopExp import TopExp_Explorer
-
+def _circle_radii(face: Face) -> list[tuple[float, Any]]:
     out = []
-    ex = TopExp_Explorer(face.shape, _E)
+    ex = TopExp_Explorer(face.shape, TopAbs_EDGE)
     while ex.More():
         c = BRepAdaptor_Curve(as_edge(ex.Current()))
         if c.GetType() == GeomAbs_Circle:
@@ -433,7 +408,7 @@ def _circle_radii(face: _Face) -> list[tuple[float, Any]]:
     return out
 
 
-def _hole_feature(group: list[int], faces: list[_Face], tol: Tolerances, t: float = math.inf):
+def _hole_feature(group: list[int], faces: list[Face], tol: Tolerances, t: float = math.inf):
     """A coaxial stack of cylinders, cones and annular planes -> (kind, through_r, outer_r, angle, depth)."""
     fs = [faces[i - 1] for i in group]
     axial = [f for f in fs if f.kind in ("cylinder", "cone")]
@@ -467,6 +442,138 @@ def _hole_feature(group: list[int], faces: list[_Face], tol: Tolerances, t: floa
     return None
 
 
+def _between_skins(
+    faces: list[Face], edges, comps, skins: list[set[int]], g: _Graph, t: float, engrave: bool, tol: Tolerances
+):
+    """Hole features among the faces between the skins, [(faces, feature tuple)], and with
+    ``engrave`` the recesses.
+
+    The other face groups between the skins must touch both (edge faces); one that
+    touches only one is refused.
+    """
+    in_skin = skins[0] | skins[1]
+    between = [i for i in range(1, len(faces) + 1) if i not in in_skin]
+    groups = _components(len(faces), [(a, b) for a in between for b in g.nb_all[a] if b not in in_skin and a < b])
+    groups = [grp for grp in groups if grp[0] not in in_skin]
+    found: list[tuple[list[int], tuple]] = []
+    recesses: list[_Recess] = []
+    featured: set[int] = set()
+    for grp in groups:
+        touches = {s for s in (0, 1) if any(n in skins[s] for i in grp for n in g.nb_all[i])}
+        hf = _hole_feature(grp, faces, tol, t) if touches == {0, 1} else None
+        if hf is not None:
+            found.append((grp, hf))
+            featured |= set(grp)
+        elif engrave and len(touches) == 1:
+            rec = _recess(grp, skins[next(iter(touches))], faces, edges, t, tol)
+            if rec is not None:
+                recesses.append(rec)
+                featured |= set(grp)
+    for comp in comps[2:]:
+        if set(comp) & featured:
+            continue
+        touches = {s for s in (0, 1) if any(n in skins[s] for i in comp for n in g.sharp_nb[i])}
+        if touches != {0, 1}:
+            raise refuse(
+                Code.EDGE_FEATURE,
+                "a face group between the skins touches only one skin (chamfer, formed feature?)",
+                faces=comp,
+            )
+    return found, recesses
+
+
+@dataclass
+class _Features:
+    """Feature records as they are found, and the per-feature data unfold() needs."""
+
+    items: list[Feature] = field(default_factory=list)
+    faces: dict[int, tuple[int, ...]] = field(default_factory=dict)  # faces the outline cuts as a hole
+    through_r: dict[int, float] = field(default_factory=dict)
+    on_a: dict[int, bool] = field(default_factory=dict)
+    edges: dict[int, set[int]] = field(default_factory=dict)
+    cuts: dict[int, list[list[int]]] = field(default_factory=dict)
+    gap: dict[int, float] = field(default_factory=dict)
+    free: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
+    developed: set[int] = field(default_factory=set)
+    projected_rims: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
+    diags: list[Diagnostic] = field(default_factory=list)
+
+    @property
+    def next_id(self) -> int:
+        return len(self.items) + 1
+
+
+def _hole_features(table: _Features, feature_groups, faces: list[Face], g: _Graph, skin_a: set[int]) -> None:
+    """Countersinks and counterbores, with a warning per projected countersink."""
+    for grp, (fkind, rmin, rmax, angle, depth) in feature_groups:
+        fid = table.next_id
+        # the side carrying the large rim: the skin touched by the face holding the largest circle
+        big_face = max(grp, key=lambda i: max((r for r, _ in _circle_radii(faces[i - 1])), default=0))
+        on_a = any(nb in skin_a for nb in g.nb_all[big_face])
+        table.items.append(
+            Feature(fid, fkind, 2 * rmin, 2 * rmax, "top" if on_a else "bottom", angle, depth, tuple(grp))
+        )
+        table.faces[fid] = tuple(grp)
+        table.through_r[fid] = rmin
+        table.on_a[fid] = on_a
+        if fkind == "countersink" and on_a:
+            table.diags.append(
+                warn(Code.COUNTERSINK_PROJECTED, f"countersink ⌀{2 * rmax:g} cut as ⌀{2 * rmin:g}", faces=grp)
+            )
+
+
+def _formed_features(
+    table: _Features, regions: list[_Formed], a_side: int, faces: list[Face], edges, t: float, bends, g: _Graph
+) -> None:
+    """The formed regions of the reference skin: left out of the development, or (lances) developed."""
+    for reg in (r for r in regions if r.skin == a_side):
+        fid = table.next_id
+        feat = _formed_feature(fid, reg, faces, edges, t, table.diags)
+        table.gap[fid] = reg.gap
+        table.free[fid] = (reg.host, reg.free)  # type: ignore[assignment]
+        if reg.developed:
+            hinge = next((b for b in bends for sg in b.segments if sg.face_id in reg.faces
+                          and reg.host in g.smooth_nb[sg.face_id]), None)  # fmt: skip
+            feat = replace(feat, bend_id=hinge.id if hinge else None)
+            table.developed.add(fid)
+        else:
+            table.faces[fid] = tuple(sorted(reg.faces))
+            table.through_r[fid] = feat.through_diameter / 2
+            table.on_a[fid] = True
+        table.items.append(feat)
+        table.edges[fid] = set(reg.wire)
+        table.cuts[fid] = reg.cuts
+
+
+def _engravings(table: _Features, recesses: list[_Recess], skin_a: set[int], partners: dict[int, int], edges) -> None:
+    """One engraving per rim (a ring-shaped groove has two).
+
+    A rim in a face of the reference skin is chained with the outline; any other is
+    projected onto the plane of that skin behind it.
+    """
+    for rec in recesses:
+        on_a = rec.host in skin_a
+        behind = rec.host if on_a else partners.get(rec.host)
+        if behind is None or behind not in skin_a:
+            raise refuse(Code.EDGE_FEATURE, "a recess in a face with no face of the other skin behind it",
+                         faces=rec.faces)  # fmt: skip
+        for face, rim in rec.rims:
+            fid = table.next_id
+            table.items.append(Feature(fid, "engraving", 0.0, _rim_diameter(rim, edges), "top" if on_a else "bottom",
+                                       depth=rec.depth, face_ids=tuple(rec.faces)))  # fmt: skip
+            if face in skin_a:
+                table.edges[fid] = set(rim)
+            else:
+                table.projected_rims[fid] = (behind, rim)
+    if recesses:
+        deepest = max(r.depth for r in recesses)
+        table.diags.append(warn(Code.ENGRAVED_RECESS,
+                                f"{len(recesses)} recess(es) up to {deepest:.3g} deep engraved along their rims; "
+                                "their depth is not made",
+                                faces=sorted(i for r in recesses for i in r.faces),
+                                recesses=len(recesses), depth=deepest))  # fmt: skip
+
+
 # ------------------------------------------------------------------------------ formed features
 
 
@@ -493,11 +600,8 @@ class _Formed:
 _FORM_KINDS = ("torus", "sphere", "cone", "other")
 
 
-def _wires(face: _Face):
+def _wires(face: Face):
     """(outer wire, [inner wires]) of a face."""
-    from OCP.TopAbs import TopAbs_WIRE
-    from OCP.TopExp import TopExp_Explorer
-
     outer = BRepTools.OuterWire_s(face.shape)
     inner = []
     ex = TopExp_Explorer(face.shape, TopAbs_WIRE)
@@ -508,12 +612,8 @@ def _wires(face: _Face):
     return outer, inner
 
 
-def _wire_edges(wire, face: _Face, host: int, edges) -> list[int]:
+def _wire_edges(wire, face: Face, host: int, edges) -> list[int]:
     """Edge indices of a wire, in order along it."""
-    from OCP.BRepTools import BRepTools_WireExplorer
-
-    from ._occ import as_wire
-
     mine = [(ei, e) for ei, (e, fi) in enumerate(edges) if host in fi]
     out = []
     ex = BRepTools_WireExplorer(as_wire(wire), face.shape)
@@ -558,7 +658,7 @@ def _thin(chain: list[int], edges, t: float) -> bool:
     return max(gp_Vec(p, x).Crossed(d).Magnitude() for x in pts) <= t * 1.01 + 1e-6
 
 
-def _classify(reg: _Formed, faces: list[_Face], edges, nb_all, in_skin, t: float, wire, seeded: bool) -> None:
+def _classify(reg: _Formed, faces: list[Face], edges, nb_all, in_skin, t: float, wire, seeded: bool) -> None:
     assert reg.host is not None
     host = faces[reg.host - 1]
     reg.wire = _wire_edges(wire, host, reg.host, edges)
@@ -607,16 +707,11 @@ def _edge_length(e) -> float:
     return g.Mass()
 
 
-def _slit_width(reg: _Formed, faces: list[_Face], edges, in_skin) -> float:
+def _slit_width(reg: _Formed, faces: list[Face], edges, in_skin) -> float:
     """Width of the slits, seen on the sheet: the region's free edges projected onto the host
     plane, and their distance from the sheet's cut edges (the median, so the ends where the two
     meet do not count).
     """
-    from OCP.BRep import BRep_Builder
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
-    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
-    from OCP.TopoDS import TopoDS_Compound
-
     cut = [ei for c in reg.cuts for ei in c]
     free = [  # the region's edges along thickness faces
         ei
@@ -651,7 +746,7 @@ def _slit_width(reg: _Formed, faces: list[_Face], edges, in_skin) -> float:
 
 
 def _formed_regions(
-    faces: list[_Face], skin: set[int], s: int, smooth_nb, nb_all, edges, in_skin, t: float
+    faces: list[Face], skin: set[int], s: int, smooth_nb, nb_all, edges, in_skin, t: float
 ) -> list[_Formed]:
     """Formed regions and lances of one skin.
 
@@ -736,8 +831,6 @@ def _formed_regions(
 
 
 def _has_edge(wire, e) -> bool:
-    from OCP.TopExp import TopExp_Explorer
-
     ex = TopExp_Explorer(wire, TopAbs_EDGE)
     while ex.More():
         if ex.Current().IsSame(e):
@@ -746,7 +839,7 @@ def _has_edge(wire, e) -> bool:
     return False
 
 
-def _collar(reg: _Formed, faces: list[_Face]):
+def _collar(reg: _Formed, faces: list[Face]):
     """(cylinder, tori) if the region is a coaxial collar on an axis normal to its host."""
     fs = [faces[i - 1] for i in reg.faces]
     if any(f.kind not in ("cylinder", "torus") for f in fs) or reg.host is None:
@@ -766,16 +859,12 @@ def _collar(reg: _Formed, faces: list[_Face]):
     return cyls, tori
 
 
-def _region_extent(reg: _Formed, faces: list[_Face]) -> tuple[float, float]:
+def _region_extent(reg: _Formed, faces: list[Face]) -> tuple[float, float]:
     """Smallest and largest signed distance of the region from its host plane (along its normal)."""
     assert reg.host is not None
     h = faces[reg.host - 1]
     n = h.normal.Normalized()
     o = h.ad.Plane().Location()
-    from OCP.TopExp import TopExp_Explorer
-
-    from ._occ import as_vertex
-
     pts = []
     for i in reg.faces:
         f = faces[i - 1]
@@ -793,7 +882,7 @@ def _region_extent(reg: _Formed, faces: list[_Face]) -> tuple[float, float]:
     return min(0.0, *ds), max(0.0, *ds)
 
 
-def _host_circle(reg: _Formed, faces: list[_Face], edges) -> tuple[float, Any] | None:
+def _host_circle(reg: _Formed, faces: list[Face], edges) -> tuple[float, Any] | None:
     """Radius and centre of the region's boundary on its host, if it is a circle."""
     out = None
     for e, fi in edges:
@@ -808,7 +897,7 @@ def _host_circle(reg: _Formed, faces: list[_Face], edges) -> tuple[float, Any] |
     return out
 
 
-def _formed_feature(fid: int, reg: _Formed, faces: list[_Face], edges, t: float, diags: list) -> Feature:
+def _formed_feature(fid: int, reg: _Formed, faces: list[Face], edges, t: float, diags: list) -> Feature:
     """A Feature for a formed region of the reference skin."""
     lo, hi = _region_extent(reg, faces)
     up = hi >= -lo  # displaced towards the reference skin's outside: towards the viewer of the flat
@@ -863,7 +952,7 @@ class _Recess:
     depth: float
 
 
-def _recess(group: list[int], skin: set[int], faces: list[_Face], edges, t: float, tol: Tolerances):
+def _recess(group: list[int], skin: set[int], faces: list[Face], edges, t: float, tol: Tolerances):
     """The group as a recess into one plane of ``skin``, or None.
 
     It must open into a single plane face of the skin only through inner wires of that face
@@ -924,6 +1013,108 @@ def _rim_diameter(rim: list[int], edges) -> float:
     return 2 * c.Circle().Radius()
 
 
+# ------------------------------------------------------------------------------ bends and flanges
+
+
+def _bend_groups(faces: list[Face], edges, skin_a: set[int], sharp, vmap, t: float, tol: Tolerances):
+    """The bend faces and sharp bend edges of the reference skin, grouped into bends.
+
+    Cylinders group by axis line, radius and angle; sharp edges by edge line and angle.
+    Returns [(kind, members)] in bend id order, the members carrying their bend id.
+    """
+    groups: dict[tuple, list[BendFace | SharpEdge]] = defaultdict(list)
+    for i in sorted(skin_a):
+        f = faces[i - 1]
+        if f.kind != "cylinder":
+            continue
+        u0, u1, v0, v1 = f.uv
+        p = f.ad.Value((u0 + u1) / 2, (v0 + v1) / 2)
+        ap = gp_Vec(f.axis_p, p)
+        radial = ap - f.axis_d.Multiplied(ap.Dot(f.axis_d) / f.axis_d.SquareMagnitude())
+        concave = f.normal.Dot(radial) < 0  # normal points at the axis: A is the inside
+        r_in = f.radius if concave else f.radius - t
+        if abs(r_in) < tol.linear * 10:
+            r_in = 0.0
+        ang = u1 - u0
+        if math.degrees(ang) >= 359.9:
+            raise refuse(Code.BEND_TOO_LARGE, f"bend of {math.degrees(ang):.1f}°", faces=(i,))
+        key = ("cyl", *_axis_key(f), round(r_in, 3), round(math.degrees(ang), 2), concave)
+        groups[key].append(BendFace(i, 0, r_in, concave, ang))
+
+    for ei, (a, b) in sharp.items():
+        if a not in skin_a:
+            continue
+        e = edges[ei][0]
+        p0, p1 = _edge_line(e)
+        fa, fb = faces[a - 1], faces[b - 1]
+        ang = fa.normal.Angle(fb.normal)
+        concave = _concave(e, fa, fb, max(1e-3, 1e-3 * t))
+        vs = edge_vertices(e)
+        se = SharpEdge(ei, (a, b), ang, concave, p0.Distance(p1), (vmap.FindIndex(vs[0]), vmap.FindIndex(vs[-1])))
+        key = ("sharp", *_line_key(p0, gp_Vec(p0, p1)), round(math.degrees(ang), 2), concave)
+        groups[key].append(se)
+
+    def first(members) -> tuple[int, int]:  # bends are numbered by their first face, sharp ones after
+        return min((0, m.face) if isinstance(m, BendFace) else (1, m.edge) for m in members)
+
+    ordered = sorted(groups.items(), key=lambda kv: first(kv[1]))
+    return [(key[0], [replace(m, bend_id=n + 1) for m in members]) for n, (key, members) in enumerate(ordered)]
+
+
+def _flanges(faces: list[Face], skin_a: set[int], bend_faces, smooth) -> tuple[tuple[Flange, ...], dict[int, int]]:
+    """Components of skin A once the bend faces are removed (sharp edges separate too)."""
+    flat_ids = {i for i in skin_a if i not in bend_faces}
+    links = [(a, b) for a, b, _ in smooth if a in flat_ids and b in flat_ids]
+    comps = sorted(sorted(c) for c in _components(len(faces), links) if c[0] in flat_ids)
+    flange_of = {i: n + 1 for n, c in enumerate(comps) for i in c}
+    flanges = tuple(Flange(n + 1, tuple(c), sum(faces[i - 1].area for i in c)) for n, c in enumerate(comps))
+    return flanges, flange_of
+
+
+def _bend(kind: str, members, faces: list[Face], edges, flange_of: dict[int, int], g: _Graph) -> Bend:
+    segs = []
+    adj_flanges: set[int] = set()
+    m0 = members[0]
+    if kind == "cyl":
+        for m in sorted(members, key=lambda m: m.face):
+            f = faces[m.face - 1]
+            u0, u1, v0, v1 = f.uv
+            segs.append(
+                BendSegment(
+                    m.face,
+                    v1 - v0,
+                    (f.axis_p.X(), f.axis_p.Y(), f.axis_p.Z()),
+                    (f.axis_d.X(), f.axis_d.Y(), f.axis_d.Z()),
+                )
+            )
+            adj_flanges |= {flange_of[nb] for nb in g.smooth_nb[m.face] if nb in flange_of}
+        deg = math.degrees(m0.angle)
+        bkind: Literal["bend", "hem", "sharp"] = "sharp" if m0.r_in == 0.0 else ("hem" if deg >= 179.0 else "bend")
+        r_in = m0.r_in
+    else:
+        for m in sorted(members, key=lambda m: m.edge):
+            p0, p1 = _edge_line(edges[m.edge][0])
+            segs.append(
+                BendSegment(0, m.length, (p0.X(), p0.Y(), p0.Z()), tuple(gp_Vec(p0, p1).Normalized().Coord()), m.edge)
+            )
+            adj_flanges |= {flange_of[x] for x in m.faces if x in flange_of}
+        deg, bkind, r_in = math.degrees(m0.angle), "sharp", 0.0
+    return Bend(m0.bend_id, tuple(segs), r_in, deg, "up" if m0.concave else "down", bkind, tuple(sorted(adj_flanges)))
+
+
+def _skin_adjacency(smooth, sharp, skin_a: set[int]) -> dict[int, list[tuple[int, int]]]:
+    """Face -> [(neighbour, edge)] over smooth edges and the sharp bends of the reference skin."""
+    adj: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for a, b, ei in smooth:
+        adj[a].append((b, ei))
+        adj[b].append((a, ei))
+    for ei, (a, b) in sharp.items():
+        if a in skin_a:
+            adj[a].append((b, ei))
+            adj[b].append((a, ei))
+    return adj
+
+
 # ------------------------------------------------------------------------------ public
 
 
@@ -965,92 +1156,33 @@ def recognize(
     edges = _edge_table(shape, fmap)
     vmap = ShapeMap()
     TopExp.MapShapes_s(shape, TopAbs_VERTEX, vmap)
-
-    smooth = []
-    smooth_nb: dict[int, set[int]] = defaultdict(set)
-    nb_all: dict[int, set[int]] = defaultdict(set)
-    sharp_nb: dict[int, set[int]] = defaultdict(set)
-    for ei, (e, fi) in enumerate(edges):
-        if BRep_Tool.Degenerated_s(e):
-            continue
-        if len(fi) == 1:
-            if not BRep_Tool.IsClosed_s(e, faces[fi[0] - 1].shape):
-                raise refuse(Code.OPEN_SHELL, "an edge borders only one face", faces=fi, edges=(ei,))
-            continue
-        if len(fi) > 2:
-            raise refuse(Code.NON_MANIFOLD, "an edge borders more than two faces", faces=fi, edges=(ei,))
-        a, b = fi
-        nb_all[a].add(b)
-        nb_all[b].add(a)
-        if _is_smooth(e, faces[a - 1], faces[b - 1], tol):
-            smooth.append((a, b, ei))
-            smooth_nb[a].add(b)
-            smooth_nb[b].add(a)
-        else:
-            sharp_nb[a].add(b)
-            sharp_nb[b].add(a)
+    g = _graph(faces, edges, tol)
 
     # sharp bends join faces of one skin across a non-tangent edge
-    t_est, partners = _plane_partners(faces, tol)
-    sharp = _sharp_bend_edges(faces, edges, partners, nb_all, smooth_nb, t_est, tol) if t_est else {}
-    links = [(a, b) for a, b, _ in smooth] + list(sharp.values())
+    plane_partners = _plane_partners(faces, tol)
+    t_est: float | None = None
+    partners: dict[int, int] = {}
+    sharp: dict[int, tuple[int, int]] = {}
+    if plane_partners:
+        t_est, band = _mode([(d, faces[i - 1].area) for i, (d, _) in plane_partners.items()], tol)
+        partners = {i: p for i, (d, p) in plane_partners.items() if abs(d - t_est) <= band}
+        sharp = _sharp_bend_edges(faces, edges, partners, g, t_est, tol)
 
-    comps = sorted(_components(len(faces), links), key=lambda c: -sum(faces[i - 1].area for i in c))
-    if len(comps) < 3:
-        raise refuse(Code.NOT_TWO_SKINS, f"{len(comps)} face groups; a sheet has two skins and edge faces")
-    skins = [set(comps[0]), set(comps[1])]
+    comps, skins = _skins(faces, [(a, b) for a, b, _ in g.smooth] + list(sharp.values()))
     in_skin = skins[0] | skins[1]
     regions: list[_Formed] = []
     t_guess = thickness or t_est or 1.0  # to tell a slit from an opening; refined below
     for s, sk in enumerate(skins):
-        regions += _formed_regions(faces, sk, s, smooth_nb, nb_all, edges, in_skin, t_guess)
+        regions += _formed_regions(faces, sk, s, g.smooth_nb, g.nb_all, edges, in_skin, t_guess)
     for reg in regions:
         if reg.kind is None:
             raise refuse(Code.FORMED_FEATURE, reg.reason, faces=sorted(reg.faces))
     formed = {i for reg in regions if not reg.developed for i in reg.faces}
-    for sk in skins:
-        bad = [i for i in sk if faces[i - 1].kind in _FORM_KINDS and i not in formed]
-        if bad:
-            raise refuse(Code.UNSUPPORTED_SURFACE, "skin faces must be planes or cylinders", faces=bad)
+    _check_skin_surfaces(faces, skins, formed)
 
     t, conf = _thickness(faces, skins, tol)
-    if thickness is not None:
-        if abs(thickness - t) > max(0.01, tol.thickness_rel * thickness):
-            raise refuse(Code.VARIABLE_THICKNESS, f"given thickness {thickness} but measured {t:.4f}", measured=t)
-        t = thickness
-    if conf < tol.thickness_confidence:
-        raise refuse(
-            Code.VARIABLE_THICKNESS, f"only {conf:.0%} of the sheet agrees on t = {t:.4f}", thickness=t, confidence=conf
-        )
-
-    # faces between the skins: hole features (coaxial stacks) or edge faces touching both skins
-    between = [i for i in range(1, len(faces) + 1) if i not in in_skin]
-    groups = _components(len(faces), [(a, b) for a in between for b in nb_all[a] if b not in in_skin and a < b])
-    groups = [g for g in groups if g[0] not in in_skin]
-    feature_groups: list[tuple[list[int], tuple]] = []
-    recesses: list[_Recess] = []
-    featured: set[int] = set()
-    for g in groups:
-        touches = {s for s in (0, 1) if any(n in skins[s] for i in g for n in nb_all[i])}
-        hf = _hole_feature(g, faces, tol, t) if touches == {0, 1} else None
-        if hf is not None:
-            feature_groups.append((g, hf))
-            featured |= set(g)
-        elif engrave and len(touches) == 1:
-            rec = _recess(g, skins[next(iter(touches))], faces, edges, t, tol)
-            if rec is not None:
-                recesses.append(rec)
-                featured |= set(g)
-    for comp in comps[2:]:
-        if set(comp) & featured:
-            continue
-        touches = {s for s in (0, 1) if any(n in skins[s] for i in comp for n in sharp_nb[i])}
-        if touches != {0, 1}:
-            raise refuse(
-                Code.EDGE_FEATURE,
-                "a face group between the skins touches only one skin (chamfer, formed feature?)",
-                faces=comp,
-            )
+    t = _checked_thickness(t, conf, thickness, tol)
+    feature_groups, recesses = _between_skins(faces, edges, comps, skins, g, t, engrave, tol)
 
     planes = [f for f in faces if f.kind == "plane" and f.idx in in_skin and f.idx not in formed]
     if not planes:
@@ -1059,165 +1191,17 @@ def recognize(
     a_side = 0 if root.idx in skins[0] else 1
     skin_a = skins[a_side] - formed
 
-    # bends: cylinders of the reference skin, grouped by axis line, radius and angle
-    groups_b: dict[tuple, list] = defaultdict(list)
-    bend_faces: dict[int, _BendFace] = {}
-    for i in sorted(skin_a):
-        f = faces[i - 1]
-        if f.kind != "cylinder":
-            continue
-        u0, u1, v0, v1 = f.uv
-        p = f.ad.Value((u0 + u1) / 2, (v0 + v1) / 2)
-        ap = gp_Vec(f.axis_p, p)
-        radial = ap - f.axis_d.Multiplied(ap.Dot(f.axis_d) / f.axis_d.SquareMagnitude())
-        concave = f.normal.Dot(radial) < 0  # normal points at the axis: A is the inside
-        r_in = f.radius if concave else f.radius - t
-        if abs(r_in) < tol.linear * 10:
-            r_in = 0.0
-        ang = u1 - u0
-        if math.degrees(ang) >= 359.9:
-            raise refuse(Code.BEND_TOO_LARGE, f"bend of {math.degrees(ang):.1f}°", faces=(i,))
-        bf = _BendFace(i, 0, r_in, concave, ang)
-        key = ("cyl", *_axis_key(f), round(r_in, 3), round(math.degrees(ang), 2), concave)
-        groups_b[key].append(bf)
-        bend_faces[i] = bf
-
-    # sharp bends on the reference skin, grouped by edge line and angle
-    sharp_edges: dict[int, _SharpEdge] = {}
-    for ei, (a, b) in sharp.items():
-        if a not in skin_a:
-            continue
-        e = edges[ei][0]
-        p0, p1 = _edge_line(e)
-        fa, fb = faces[a - 1], faces[b - 1]
-        ang = fa.normal.Angle(fb.normal)
-        concave = _concave(e, fa, fb, max(1e-3, 1e-3 * t))
-        vs = _edge_vertex_ids(e, vmap)
-        se = _SharpEdge(ei, (a, b), ang, concave, p0.Distance(p1), vs)
-        key = ("sharp", *_line_key(p0, gp_Vec(p0, p1)), round(math.degrees(ang), 2), concave)
-        groups_b[key].append(se)
-        sharp_edges[ei] = se
-
-    # flanges: components of skin A once the bend faces are removed (sharp edges separate too)
-    flat_ids = {i for i in skin_a if i not in bend_faces}
-    flange_links = [(a, b) for a, b, _ in smooth if a in flat_ids and b in flat_ids]
-    flange_comps = sorted(sorted(c) for c in _components(len(faces), flange_links) if c[0] in flat_ids)
-    flange_of = {i: n + 1 for n, c in enumerate(flange_comps) for i in c}
-    flanges = tuple(Flange(n + 1, tuple(c), sum(faces[i - 1].area for i in c)) for n, c in enumerate(flange_comps))
-
-    def first_id(members) -> int:
-        return min(m.face if isinstance(m, _BendFace) else 100000 + m.edge for m in members)
-
-    bends = []
-    for n, (key, members) in enumerate(sorted(groups_b.items(), key=lambda kv: first_id(kv[1]))):
-        bid = n + 1
-        segs = []
-        adj_flanges: set[int] = set()
-        if key[0] == "cyl":
-            for m in sorted(members, key=lambda m: m.face):
-                m.bend_id = bid
-                f = faces[m.face - 1]
-                u0, u1, v0, v1 = f.uv
-                segs.append(
-                    BendSegment(
-                        m.face,
-                        v1 - v0,
-                        (f.axis_p.X(), f.axis_p.Y(), f.axis_p.Z()),
-                        (f.axis_d.X(), f.axis_d.Y(), f.axis_d.Z()),
-                    )
-                )
-                adj_flanges |= {flange_of[nb] for nb in smooth_nb[m.face] if nb in flange_of}
-            m0 = members[0]
-            deg = math.degrees(m0.angle)
-            kind: Literal["bend", "hem", "sharp"] = "sharp" if m0.r_in == 0.0 else ("hem" if deg >= 179.0 else "bend")
-            bends.append(Bend(bid, tuple(segs), m0.r_in, deg, "up" if m0.concave else "down", kind,
-                              tuple(sorted(adj_flanges))))  # fmt: skip
-        else:
-            for m in sorted(members, key=lambda m: m.edge):
-                m.bend_id = bid
-                p0, p1 = _edge_line(edges[m.edge][0])
-                segs.append(
-                    BendSegment(
-                        0, m.length, (p0.X(), p0.Y(), p0.Z()), tuple(gp_Vec(p0, p1).Normalized().Coord()), m.edge
-                    )  # fmt: skip
-                )
-                adj_flanges |= {flange_of[x] for x in m.faces if x in flange_of}
-            m0 = members[0]
-            bends.append(Bend(bid, tuple(segs), 0.0, math.degrees(m0.angle), "up" if m0.concave else "down",
-                              "sharp", tuple(sorted(adj_flanges))))  # fmt: skip
-
-    features = []
-    feat_faces: dict[int, tuple[int, ...]] = {}
-    feat_r: dict[int, float] = {}
-    feat_a: dict[int, bool] = {}
-    for n, (g, (fkind, rmin, rmax, angle, depth)) in enumerate(feature_groups):
-        fid = n + 1
-        # the side carrying the large rim: the skin touched by the face holding the largest circle
-        big_face = max(g, key=lambda i: max((r for r, _ in _circle_radii(faces[i - 1])), default=0))
-        on_a = any(nb in skin_a for nb in nb_all[big_face])
-        features.append(Feature(fid, fkind, 2 * rmin, 2 * rmax, "top" if on_a else "bottom", angle, depth, tuple(g)))
-        feat_faces[fid] = tuple(g)
-        feat_r[fid] = rmin
-        feat_a[fid] = on_a
-        if fkind == "countersink" and on_a:
-            diags.append(warn(Code.COUNTERSINK_PROJECTED, f"countersink ⌀{2 * rmax:g} cut as ⌀{2 * rmin:g}", faces=g))
-
-    feat_edges: dict[int, set[int]] = {}
-    feat_cuts: dict[int, list[list[int]]] = {}
-    feat_gap: dict[int, float] = {}
-    feat_free: dict[int, tuple[int, list[int]]] = {}
-    developed: set[int] = set()
-    for reg in (r for r in regions if r.skin == a_side):
-        fid = len(features) + 1
-        feat = _formed_feature(fid, reg, faces, edges, t, diags)
-        feat_gap[fid] = reg.gap
-        feat_free[fid] = (reg.host, reg.free)  # type: ignore[assignment]
-        if reg.developed:
-            hinge = next((b for b in bends for sg in b.segments if sg.face_id in reg.faces
-                          and reg.host in smooth_nb[sg.face_id]), None)  # fmt: skip
-            feat = replace(feat, bend_id=hinge.id if hinge else None)
-            developed.add(fid)
-        else:
-            feat_faces[fid] = tuple(sorted(reg.faces))
-            feat_r[fid] = feat.through_diameter / 2
-            feat_a[fid] = True
-        features.append(feat)
-        feat_edges[fid] = set(reg.wire)
-        feat_cuts[fid] = reg.cuts
-
-    # engravings: one per rim (a ring-shaped groove has two). A rim in a face of the reference
-    # skin is chained with the outline; any other is projected onto the plane of that skin behind it.
-    projected_rims: dict[int, tuple[int, list[int]]] = {}
-    for rec in recesses:
-        on_a = rec.host in skin_a
-        behind = rec.host if on_a else partners.get(rec.host)
-        if behind is None or behind not in skin_a:
-            raise refuse(Code.EDGE_FEATURE, "a recess in a face with no face of the other skin behind it",
-                         faces=rec.faces)  # fmt: skip
-        for face, rim in rec.rims:
-            fid = len(features) + 1
-            features.append(Feature(fid, "engraving", 0.0, _rim_diameter(rim, edges), "top" if on_a else "bottom",
-                                    depth=rec.depth, face_ids=tuple(rec.faces)))  # fmt: skip
-            if face in skin_a:
-                feat_edges[fid] = set(rim)
-            else:
-                projected_rims[fid] = (behind, rim)
-    if recesses:
-        deepest = max(r.depth for r in recesses)
-        diags.append(warn(Code.ENGRAVED_RECESS,
-                          f"{len(recesses)} recess(es) up to {deepest:.3g} deep engraved along their rims; "
-                          "their depth is not made",
-                          faces=sorted(i for r in recesses for i in r.faces),
-                          recesses=len(recesses), depth=deepest))  # fmt: skip
-
-    adj: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    for a, b, ei in smooth:
-        adj[a].append((b, ei))
-        adj[b].append((a, ei))
-    for ei, (a, b) in sharp.items():
-        if a in skin_a:
-            adj[a].append((b, ei))
-            adj[b].append((a, ei))
+    bend_groups = _bend_groups(faces, edges, skin_a, sharp, vmap, t, tol)
+    bend_faces = {m.face: m for kind, ms in bend_groups if kind == "cyl" for m in ms if isinstance(m, BendFace)}
+    sharp_edges = {m.edge: m for kind, ms in bend_groups if kind == "sharp" for m in ms if isinstance(m, SharpEdge)}
+    flanges, flange_of = _flanges(faces, skin_a, bend_faces, g.smooth)
+    bends = tuple(_bend(kind, ms, faces, edges, flange_of, g) for kind, ms in bend_groups)
+    table = _Features()
+    _hole_features(table, feature_groups, faces, g, skin_a)
+    _formed_features(table, regions, a_side, faces, edges, t, bends, g)
+    _engravings(table, recesses, skin_a, partners, edges)
+    diags.extend(table.diags)
+    features = table.items
 
     role = {i: "skin_a" for i in skin_a} | {i: "skin_b" for i in skins[1 - a_side]} | {i: "formed" for i in formed}
     face_infos = tuple(
@@ -1229,18 +1213,35 @@ def recognize(
         )
         for f in faces
     )
-    ctx = Context(shape, fmap, vmap, faces, edges, adj, skin_a, root.idx, t, bend_faces, tol=tol)
-    ctx.sharp_edges = sharp_edges
-    ctx.features, ctx.feature_through_r, ctx.feature_on_a = feat_faces, feat_r, feat_a
-    ctx.feature_kind = {f.id: f.kind for f in features}
-    ctx.feature_edges, ctx.feature_cuts = feat_edges, feat_cuts
-    ctx.feature_gap, ctx.developed, ctx.feature_free = feat_gap, developed, feat_free
-    ctx.projected_rims = projected_rims
+    ctx = Context(
+        shape,
+        fmap,
+        vmap,
+        faces,
+        edges,
+        _skin_adjacency(g.smooth, sharp, skin_a),
+        skin_a,
+        root.idx,
+        t,
+        bend_faces,
+        sharp_edges,
+        features=table.faces,
+        feature_through_r=table.through_r,
+        feature_on_a=table.on_a,
+        feature_kind={f.id: f.kind for f in features},
+        feature_edges=table.edges,
+        feature_cuts=table.cuts,
+        feature_gap=table.gap,
+        developed=table.developed,
+        feature_free=table.free,
+        projected_rims=table.projected_rims,
+        tol=tol,
+    )
     return SheetPart(
         thickness=t,
         thickness_confidence=conf,
         faces=face_infos,
-        bends=tuple(bends),
+        bends=bends,
         flanges=flanges,
         reference_root=root.idx,
         diagnostics=tuple(diags),
@@ -1248,16 +1249,3 @@ def recognize(
         features=tuple(features),
         _ctx=ctx,
     )
-
-
-def _edge_vertex_ids(e, vmap) -> tuple[int, int]:
-    from OCP.TopExp import TopExp_Explorer
-
-    from ._occ import as_vertex
-
-    vs = []
-    ex = TopExp_Explorer(e, TopAbs_VERTEX)
-    while ex.More():
-        vs.append(vmap.FindIndex(as_vertex(ex.Current())))
-        ex.Next()
-    return vs[0], vs[-1]

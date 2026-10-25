@@ -8,6 +8,7 @@ import sys
 
 from . import __version__
 from .bendmodel import KDin6935
+from .dfm import MATERIALS, check
 from .diagnostics import FlatmatError
 from .export import write_bend_table, write_dxf, write_svg
 from .io import load_step
@@ -34,7 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     u.add_argument("--heal", choices=["fast", "full"], default="fast")
     u.add_argument("--labels", choices=["delem", "plain", "none"], default="delem")
     u.add_argument("--check", action="store_true", help="manufacturability checks (laser + press brake)")
-    u.add_argument("--material", default="steel", help="material for --check (steel, galvanised, stainless, ...)")
+    u.add_argument("--material", default="steel", choices=sorted(MATERIALS), help="material for --check")
     u.add_argument("--die-v", type=float, help="die opening V in mm for --check (default: Amada rule)")
     u.add_argument("--rolling-direction", type=float, help="rolling direction in the flat, degrees from +X")
     u.add_argument("--max-force", type=float, help="press brake capacity in kN for --check")
@@ -100,8 +101,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {d.severity.value}: {d.code.value}: {d.message}", file=sys.stderr)
     report = None
     if a.check:
-        from .dfm import check
-
         try:
             tooling = _tooling(a, pat.thickness)
         except (KeyError, ValueError, OSError) as e:

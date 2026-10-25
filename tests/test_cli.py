@@ -1,6 +1,7 @@
 import json
 import os
 
+import pytest
 from parts import Part, make_solid, write_step
 
 from flatmat.cli import main
@@ -21,3 +22,10 @@ def test_cli_refusal(tmp_path, capsys):
     p.write_text("nope")
     assert main(["unfold", str(p)]) == 2
     assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "READ_FAILED"
+
+
+def test_cli_unknown_material(capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["unfold", "part.step", "--check", "--material", "steel304"])
+    assert e.value.code == 2
+    assert "invalid choice: 'steel304'" in capsys.readouterr().err
