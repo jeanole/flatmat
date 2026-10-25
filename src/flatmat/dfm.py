@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 
 from shapely import STRtree
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
 from .diagnostics import Code, Diagnostic, Severity
@@ -184,17 +184,41 @@ class _Sheet:
     all_lines: list[tuple[BendLine, LineString]]
 
     @cached_property
+    def line_tree(self) -> STRtree:
+        return STRtree([ls for _, ls in self.all_lines])
+
+    @cached_property
+    def hole_tree(self) -> STRtree:
+        return STRtree(self.holes)
+
+    @cached_property
     def ends(self) -> list[tuple[tuple[float, float], BendLine, bool]]:
         """Bend-line ends, and whether each sits on another bend (a corner where two bends meet)."""
+        reach = max(((b.ba or 0.0) / 2 + self.t for b in self.bends.values()), default=0.0)
         out = []
         for bl, _ls in self.all_lines:
             for end in (bl.p0, bl.p1):
                 corner = any(
                     other is not bl and ls2.distance(Point(end)) <= (self.bends[other.bend_id].ba or 0.0) / 2 + self.t
-                    for other, ls2 in self.all_lines
+                    for other, ls2 in (self.all_lines[j] for j in _near(self.line_tree, (*end, *end), reach))
                 )
                 out.append((end, bl, corner))
         return out
+
+    @cached_property
+    def end_tree(self) -> STRtree:
+        return STRtree([Point(e) for e, _, _ in self.ends])
+
+
+def _near(tree: STRtree, bounds, margin: float) -> list[int]:
+    """Indices (ascending) of the tree's geometries that can come within margin of the box ``bounds``.
+
+    A box query: the exact test is the caller's. Distances never undercut the distance
+    between bounding boxes, so nothing within the margin is missed.
+    """
+    x0, y0, x1, y1 = bounds
+    m = margin + 1e-6
+    return sorted(int(j) for j in tree.query(box(x0 - m, y0 - m, x1 + m, y1 + m)))
 
 
 class _Findings:
@@ -295,7 +319,7 @@ def _bend_rules(
                 s = 0.05 + 0.9 * k / 10
                 p = (bl.p0[0] + s * length * u[0], bl.p0[1] + s * length * u[1])
                 for side, sg in ((0, 1.0), (1, -1.0)):
-                    leg = _leg(p, (sg * n[0], sg * n[1]), sheet.outer, sheet.all_lines, bl, bends, ba, b, t)
+                    leg = _leg(p, (sg * n[0], sg * n[1]), sheet, bl, ba, b)
                     legs[side].append(leg)
                     if leg < worst[side][0]:
                         worst[side] = (leg, p)
@@ -358,7 +382,15 @@ def _hole_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> set[int]:
     to_edge = webs or out.on(Code.DFM_HOLE_NEAR_EDGE)
     to_holes = webs or out.on(Code.DFM_HOLES_TOO_CLOSE)
     to_bends = out.on(Code.DFM_CUT_IN_BEND_ZONE, Code.DFM_HOLE_NEAR_BEND)
-    tree = STRtree(holes) if holes and to_holes else None
+    tree = sheet.hole_tree if holes and to_holes else None
+    # how far from a bend line a hole can still be reported, for the box query below
+    reach = max(
+        (
+            max(rules.hole_to_bend_t * t + b.r_in + (b.ba or 0.0) / 2, rules.hole_to_bend_v * v, (b.ba or 0.0) / 2)
+            for b in bends.values()
+        ),
+        default=0.0,
+    )
     flagged: set[int] = set()
     for i, h in enumerate(holes):
         c = h.centroid
@@ -388,7 +420,8 @@ def _hole_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> set[int]:
         if not to_bends:
             continue
         in_zone: set[int] = set()
-        for bl, ls in sheet.all_lines:
+        for j in _near(sheet.line_tree, h.bounds, reach):
+            bl, ls = sheet.all_lines[j]
             b = bends[bl.bend_id]
             ba = b.ba or 0.0
             d = h.distance(ls)
@@ -422,7 +455,10 @@ def _web_and_slot_rules(sheet: _Sheet, rules: DfmRules, out: _Findings, flagged:
                 continue
             if near_flagged is not None and piece.within(near_flagged):
                 continue  # the same narrow web as a hole-to-edge / hole-to-hole finding
-            if what == "slot" and any(Point(e).distance(piece) <= relief_margin for e, _, _ in sheet.ends):
+            if what == "slot" and any(
+                Point(sheet.ends[j][0]).distance(piece) <= relief_margin
+                for j in _near(sheet.end_tree, piece.bounds, relief_margin)
+            ):
                 continue  # a relief: judged by the relief rule, not as a slot
             c = piece.representative_point()
             add(Code.DFM_FEATURE_TOO_SMALL, f"{what} narrower than {2 * rad:.2f} mm"
@@ -444,7 +480,9 @@ def _relief_rules(sheet: _Sheet, rules: DfmRules, out: _Findings) -> None:
         for end, sign in ((bl.p1, 1.0), (bl.p0, -1.0)):
             if (id(bl), end) in corner_ends:
                 continue
-            if any(h.exterior.distance(Point(end)) < 1e-3 for h in sheet.holes):
+            if any(
+                sheet.holes[j].exterior.distance(Point(end)) < 1e-3 for j in _near(sheet.hole_tree, (*end, *end), 1e-3)
+            ):
                 continue  # the bend line stops at a hole in the bend zone: DFM_CUT_IN_BEND_ZONE
             q0 = (end[0] + sign * u[0] * 1e-3, end[1] + sign * u[1] * 1e-3)
             q1 = (end[0] + sign * u[0] * width, end[1] + sign * u[1] * width)
@@ -476,7 +514,7 @@ def _beside(h: Polygon, bl) -> bool:
     return max(s) > 0 and min(s) < length
 
 
-def _leg(p, d, outer: Polygon, all_lines, this_line, bends, ba, b: Bend, t: float) -> float:
+def _leg(p, d, sheet: _Sheet, this_line: BendLine, ba: float, b: Bend) -> float:
     """Outer-mould-line length of the flange from bend line point p in direction d.
 
     Stops at the outline or at the next bend line, whichever comes first.
@@ -485,7 +523,8 @@ def _leg(p, d, outer: Polygon, all_lines, this_line, bends, ba, b: Bend, t: floa
     ray = LineString([p, (p[0] + d[0] * far, p[1] + d[1] * far)])
     best = math.inf
     stop_bend: Bend | None = None
-    hit = ray.intersection(outer.exterior)
+    t, bends = sheet.t, sheet.bends
+    hit = ray.intersection(sheet.outer.exterior)
     for g in getattr(hit, "geoms", [hit]):
         if g.is_empty:
             continue
@@ -493,7 +532,8 @@ def _leg(p, d, outer: Polygon, all_lines, this_line, bends, ba, b: Bend, t: floa
             dd = math.dist(p, q)
             if 1e-6 < dd < best:
                 best = dd
-    for bl, ls in all_lines:
+    for j in sorted(int(j) for j in sheet.line_tree.query(ray, predicate="intersects")):
+        bl, ls = sheet.all_lines[j]
         if bl is this_line:
             continue
         x = ray.intersection(ls)
