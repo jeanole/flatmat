@@ -52,3 +52,19 @@ def test_private_part(path):
     pat = fm.unfold_step(path, k=0.44)
     assert pat.meta["area_rel_err"] < 1e-4
     assert pat.bends
+
+
+@pytest.mark.skipif(not BENDFM, reason="FLATMAT_BENDFM_DIR not set")
+@pytest.mark.parametrize("i", _bendfm_ids() or [None])
+def test_bendfm_sequence(i):
+    """A bend order with BenDFM's tools (segmented): found for 0, 1, 3 and 5.
+
+    Not BenDFM's labels: they judge three sections per bend, with a die block of
+    unpublished size, and only for one random order.
+    """
+    pat = fm.unfold_step(os.path.join(BENDFM, f"{i}.stp"), k=0.45)
+    plan = fm.plan_bends(pat, fm.Tooling.bendfm())
+    assert plan.feasible == (i in (0, 1, 3, 5))
+    if plan.feasible:
+        assert sorted(plan.order) == [b.id for b in pat.bends]
+        assert fm.plan_bends(pat, fm.Tooling.bendfm(), order=plan.order).feasible

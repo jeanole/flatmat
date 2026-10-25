@@ -255,7 +255,7 @@ class FaceInfo:
     id: int
     kind: Literal["plane", "cylinder", "other"]
     area: float
-    role: Literal["skin_a", "skin_b", "thickness"]
+    role: Literal["skin_a", "skin_b", "thickness", "formed"]
 
 
 @dataclass(frozen=True)
@@ -298,21 +298,52 @@ class Flange:
 
 @dataclass(frozen=True)
 class Feature:
-    """A hole feature the flat pattern cannot show: countersink or counterbore.
+    """A feature the flat outline cannot show: countersink, counterbore, emboss or extruded hole.
 
-    The flat pattern cuts the through diameter; the feature is reported here (and in
-    the bend table / DXF annotations) for the process that makes it.
+    The flat pattern cuts ``through_diameter`` (the through hole, or the pre-hole of an
+    extruded hole; nothing for an emboss); the feature is reported here (and in the
+    bend table / DXF annotations) for the process that makes it.
+
+    - countersink / counterbore: ``outer_diameter`` is the large rim.
+    - extruded_hole (Durchzug): ``outer_diameter`` is the finished bore, ``height`` the
+      outside height from the far side of the sheet to the rim, ``radius`` the inner
+      radius of the fillet; ``side`` is the side the collar stands out on.
+    - emboss (Prägung: dimple, bead, raised pad): ``height`` is the displacement,
+      ``outer_diameter`` the rim diameter if the rim is a circle (else 0), ``side`` the
+      side it stands out on; ``outline`` is its rim in the flat (a marking, not a cut).
+    - louvre (Kieme) and bridge (Brücke): formed out of the sheet and cut along one or
+      two straight slits; ``outline`` is the rim (a marking), the slits are cut (as
+      narrow holes, or as ``FlatPattern.slits`` if they have no width).
+    - lance (Lasche): a tab bent out of an opening; it is developed like any flange
+      (``bend_id``), the opening around it is cut.
+    - engraving (Gravur), only with ``recognize(engrave=True)``: a recess that does not
+      go through the sheet (a pocket, a groove, engraved text, a blind hole). ``outline``
+      is its rim in the flat, which the laser marks; its depth is not made. ``depth`` is
+      how far it goes into the sheet, ``outer_diameter`` the rim's diameter if it is a
+      circle (else 0), ``side`` the skin it opens into. A recess whose floor leaves an
+      island (a ring groove, an O) is one engraving per rim.
+
+    For the last three, ``orientation_deg`` is the direction of the slits (louvre,
+    bridge) or of the bend line (lance) in the flat, ``size`` the extent along and
+    across it. ``holes`` are the indices of ``FlatPattern.holes`` the feature cuts.
     """
 
     id: int
-    kind: Literal["countersink", "counterbore"]
+    kind: Literal["countersink", "counterbore", "emboss", "extruded_hole", "louvre", "bridge", "lance", "engraving"]
     through_diameter: float
     outer_diameter: float
     side: Literal["top", "bottom"]  # top = the reference skin, facing the viewer of the flat
     angle_deg: float | None = None  # countersink included angle
-    depth: float | None = None  # counterbore depth
+    depth: float | None = None  # counterbore, engraving depth
     face_ids: tuple[int, ...] = ()
     center: tuple[float, float] | None = None  # in the flat pattern, set by unfold()
+    height: float | None = None  # emboss, extruded hole
+    radius: float | None = None  # extruded hole: fillet inner radius
+    outline: Loop2D | None = None  # in the flat pattern, set by unfold(): rim of the formed region or engraving
+    orientation_deg: float | None = None  # louvre, bridge, lance; set by unfold()
+    size: tuple[float, float] | None = None  # louvre, bridge, lance; set by unfold()
+    holes: tuple[int, ...] = ()  # set by unfold()
+    bend_id: int | None = None  # lance
 
 
 @dataclass(frozen=True)
@@ -362,6 +393,7 @@ class FlatPattern:
     diagnostics: tuple[Diagnostic, ...] = ()
     meta: dict = field(default_factory=dict)
     features: tuple[Feature, ...] = ()
+    slits: tuple[Loop2D, ...] = ()  # open cut paths with no width (slits of louvres, bridges)
 
     @cached_property
     def bbox(self) -> tuple[float, float, float, float]:

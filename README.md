@@ -13,7 +13,8 @@ flatmat is meant to take a bent sheet metal part from a STEP file and:
 4. write a DXF for laser cutting and press-brake software, plus a bend table
    (JSON/CSV);
 5. optionally check manufacturability: minimum flange, hole-to-bend
-   distance, reliefs and similar rules.
+   distance, bend and corner reliefs, and similar rules; with punch and die
+   data, tool collisions and a bend order.
 
 Every result carries provenance: each flat edge maps back to the STEP edge it
 came from. Anything flatmat cannot handle is refused with a structured
@@ -22,7 +23,8 @@ diagnostic that names the faces involved, never silently unfolded wrong.
 ## Status
 
 **v0.1 in development.** The package works end to end for planes and
-cylindrical bends. Tested on:
+cylindrical bends, embosses, extruded holes, louvres, bridges and lances.
+Tested on:
 
 - generated parts and random profiles (hypothesis): exact to 1e-9;
 - 6 BenDFM samples: they match BenDFM's own unfolds;
@@ -44,6 +46,10 @@ flatmat unfold part.step -k 0.44 -o part.dxf --table part.json --svg part.svg
 flatmat unfold part.step --din  # K per bend from DIN 6935
 flatmat unfold part.step --sharp-radius 1.6   # radius the die gives on sharp (r = 0) bends
 flatmat unfold part.step --check --material stainless -o part.dxf   # DFM findings, marked in the DXF
+flatmat unfold part.step --check --sequence --punch gooseneck_88 --die V12   # collisions and a bend order
+flatmat unfold part.step --check --sequence 3,1,2 --tooling tools.json       # check this order with your tools
+flatmat unfold part.step --pre-hole 3.2 -o part.dxf   # extruded holes: pre-hole from your table
+flatmat unfold part.step --engrave -o part.dxf   # pockets, grooves, text that do not go through: rim on ENGRAVE
 ```
 
 ```python
@@ -58,6 +64,14 @@ fm.write_bend_table(pat, "part.json")  # or .csv
 report = fm.check(pat, material="steel", die_v=16)  # manufacturability
 for d in report.problems:
     print(d.code, d.message, d.data["at"])
+
+tools = fm.Tooling(fm.PUNCHES["gooseneck_88"], fm.Die(v=12, angle_deg=88, shoulder_radius=1.2))
+plan = fm.plan_bends(pat, tools)        # collision-free order, or what blocks each bend
+print(plan.feasible, plan.order, [c.describe() for c in plan.collisions])
+report = fm.check(pat, tooling=tools, sequence=True)   # the same, as DFM_TOOL_COLLISION findings
+
+for f in pat.features:  # countersinks, counterbores, embosses, extruded holes, louvres, bridges, lances
+    print(f.kind, f.side, f.height, f.orientation_deg, f.size, [pat.holes[i] for i in f.holes])
 ```
 
 A part flatmat cannot handle raises `fm.FlatmatError`. Its `.diagnostic` has a
@@ -93,9 +107,16 @@ today:
   optional tooling radius) — done; countersinks and counterbores — done;
   B-spline faces and edges that are really planes, cylinders, cones, lines
   or circles — done; manufacturability checks (flange, radius, holes, reliefs,
-  slots, hems, U channels, tonnage) — done.
-- **Later:** cones, other formed features, tubes, assemblies, bend-sequence
-  feasibility.
+  slots, hems, U channels, tonnage) — done; embosses and extruded holes
+  (pre-hole from the neutral fibre or your table) — done; louvres, bridges
+  and lances, bent or formed, with straight or curved slits (slits cut, rim
+  marked; a bent lance's tab developed) — done;
+  corner rule (corner
+  relief, gap between folded flanges) — done; punch and die data, tool
+  collisions and a bend order — done; recesses that do not go through
+  (pockets, grooves, engraved text, blind holes) as engravings of their rim,
+  with `recognize(engrave=True)` — done.
+- **Later:** cones, tubes, assemblies.
 
 ## Stack
 

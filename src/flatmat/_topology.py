@@ -35,6 +35,7 @@ class Face:
     axis_p: Any = None  # gp_Pnt for cylinders
     axis_d: Any = None  # gp_Vec for cylinders and cones
     semi_angle: float = 0.0  # cones
+    minor: float = 0.0  # tori
     _cls: Any = None
 
     @property
@@ -90,6 +91,15 @@ class Context:
     features: dict[int, tuple[int, ...]] = field(default_factory=dict)  # feature id -> faces
     feature_through_r: dict[int, float] = field(default_factory=dict)
     feature_on_a: dict[int, bool] = field(default_factory=dict)
+    feature_kind: dict[int, str] = field(default_factory=dict)
+    feature_edges: dict[int, set[int]] = field(default_factory=dict)  # edges of a formed feature's opening
+    feature_cuts: dict[int, list[list[int]]] = field(default_factory=dict)  # its slits, as runs of edges
+    feature_gap: dict[int, float] = field(default_factory=dict)  # their width
+    developed: set[int] = field(default_factory=set)  # lances laid flat by bending
+    feature_free: dict[int, tuple[int, list[int]]] = field(default_factory=dict)  # host face, free edges
+    # rims of engravings not in a face of the reference skin (the far skin, islands):
+    # feature id -> (the reference-skin plane to project onto, edges of the rim in wire order)
+    projected_rims: dict[int, tuple[int, list[int]]] = field(default_factory=dict)
     tol: Tolerances = field(default_factory=Tolerances)
 
 

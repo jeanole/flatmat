@@ -266,7 +266,7 @@ Non-zero exit code on refusal; the diagnostic goes to stderr as JSON.
 | geometry | `EDGE_FEATURE`, `UNSUPPORTED_SURFACE`, `BEND_TOO_LARGE`, `BEND_UNPAIRED`, `FORMED_FEATURE`, `HEM_MERGED` |
 | unfolding | `CYCLE_INCONSISTENT`, `DEVELOP_FAILED`, `DEVELOP_FOLDBACK` |
 | flat checks | `FLAT_OVERLAP`, `AREA_MISMATCH` |
-| warnings | `K_EXTRAPOLATED`, `COUNTERSINK_PROJECTED`, `SHARP_BEND_ASSUMED_RADIUS`, `SURFACE_CONVERTED`, `NEAR_TANGENT_KINK`, `HEM_CONTACT`, `HEM_DEFAULT_ALLOWANCE`, `INSIDE_OUT_FIXED`, `SLIVER_FACE` |
+| warnings | `K_EXTRAPOLATED`, `COUNTERSINK_PROJECTED`, `ENGRAVED_RECESS`, `SHARP_BEND_ASSUMED_RADIUS`, `SURFACE_CONVERTED`, `NEAR_TANGENT_KINK`, `HEM_CONTACT`, `HEM_DEFAULT_ALLOWANCE`, `INSIDE_OUT_FIXED`, `SLIVER_FACE` |
 | DFM (§7) | `DFM_*` — see §7 |
 
 ### Bend table (JSON, versioned schema)
@@ -309,9 +309,11 @@ v0.2), each round-tripped through STEP.
 
 *As built*: `tests/parts.py` builds L, U, Z, hat, obtuse, acute, open hem
 and joggle profiles, holes in a flange and through a bend, sharp bends,
-countersinks and counterbores, and one part per DFM rule (cut-outs as boxes).
-The NURBS variants are made in `tests/test_canonical.py`. Not built yet: the
-box with corner reliefs, a cut-out splitting a bend, and seam-split cylinders.
+countersinks and counterbores, embosses and extruded holes, louvres, bridges
+and lances, one part per DFM rule (cut-outs as boxes), and boxes with and
+without corner reliefs (`box_solid`). The NURBS variants are made in
+`tests/test_canonical.py`, the engraved recesses in `tests/test_engrave.py`.
+Not built yet: a cut-out splitting a bend, and seam-split cylinders.
 
 ### Tests
 
@@ -391,7 +393,9 @@ matrix); ruff, mypy, pytest.
    Tests: 77 in total, including hypothesis profiles, the BenDFM samples
    and private parts via environment variables.
 4. Benchmark and BenDFM evaluation; v0.1 on PyPI (check the name is free).
-5. v0.2: canonical recognition, sharp bends, countersinks, DFM checks.
+5. v0.2: canonical recognition, sharp bends, countersinks, DFM checks;
+   embosses and extruded holes, the corner rule, tooling, collisions and the
+   bend order (done).
 6. Consumers: Snest calls flatmat from its STEP worker where it currently
    refuses bent parts.
 
@@ -403,11 +407,13 @@ All in `src/flatmat/`:
 |---|---|
 | `io.py` | STEP import and healing (§1.0, §6.1) → `StepModel` |
 | `canonical.py` | B-spline faces and edges that are really planes, cylinders, cones, lines or circles → analytic (§5.5) |
-| `recognize.py` | face graph, skins, thickness, sharp bends, bends, flanges, hole features (§1.1–1.3, §5.3–5.4) → `SheetPart` |
-| `_topology.py` | internal: the OCP-side context `recognize()` hands to `unfold()` (faces, bend faces, sharp edges, pcurves) |
+| `recognize.py` | face graph, skins, thickness, sharp bends, bends, flanges, hole and formed features, engravings (§1.1–1.3, §5.3–5.4) → `SheetPart` |
+| `_topology.py` | internal: the OCP-side context `recognize()` hands to `unfold()` (faces, bend faces, sharp edges, pcurves, feature data) |
 | `unfold.py` | per-face development, placement, outline, bend lines, self-checks (§1.4–1.6) → `FlatPattern` |
-| `bendmodel.py` | BA, BD, OSSB, K models, DIN 6935 (§1.7) |
+| `bendmodel.py` | BA, BD, OSSB, K models, DIN 6935, extruded-hole pre-holes (§1.7) |
 | `dfm.py` | manufacturability checks, one function per rule group (§7) → `DfmReport` |
+| `tooling.py` | punches, dies and the die-opening rule (§7.5) |
+| `fold.py`, `sequence.py` | the folded part, tool collisions and a bend order (§7.4) → `BendPlan` |
 | `export.py` | DXF, bend table (JSON/CSV), SVG (§2) |
 | `model.py`, `diagnostics.py` | the public dataclasses and the diagnostic codes |
 | `_occ.py` | the differences between OCP 7.8 and 8.0 |
@@ -419,9 +425,11 @@ All in `src/flatmat/`:
   seam-split bends; holes and cut-outs crossing bends; hems with r > 0; DXF
   + bend table.
 - **v0.2**: canonical recognition of B-spline faces; sharp bends; countersinks
-  and counterbores; warn-and-skip instead of abort; DFM checks (§7).
-- **later**: cones; formed features beyond detection; tubes with a
-  user-chosen seam; assemblies; bend sequence feasibility.
+  and counterbores; embosses, extruded holes, louvres, bridges and lances
+  (§5.4); warn-and-skip instead
+  of abort; DFM checks (§7) with the corner rule, tooling (§7.5), tool
+  collisions and a bend order (§7.4).
+- **later**: cones; tubes with a user-chosen seam; assemblies.
 
 ## 5. Hard geometry
 
@@ -543,27 +551,165 @@ the outer virtual-sharp line L.
 - **Unchanged:** groups that are not hole features still go through the
   per-component rule, so a chamfered outer edge is still `EDGE_FEATURE`.
 
-Formed features (louvres, embosses, extruded holes): still to do, as
-planned below.
+**Embosses and extruded holes: implemented** (`recognize.py`, `unfold.py`).
 
-**Original plan:**
+- **Detection, per skin:**
+  - *Seeds* are the skin's tori, spheres, cones and freeform faces. They grow
+    over cylinders tangent to them (an emboss's wall, a collar's bore).
+  - Removing the seeds leaves the main sheet (the largest part) and what the
+    seeds enclose (an emboss's raised top).
+  - A region is accepted only if it meets the main sheet along inner wires of
+    one plane face (the host). Otherwise `FORMED_FEATURE` names its faces.
+    Cones alone are not seeds, so conical bends still give
+    `UNSUPPORTED_SURFACE`.
+- **Classification:**
+  - no edges to thickness faces → **emboss** (dimple, bead, raised pad);
+  - edges to thickness faces, and every face a torus or cylinder coaxial on
+    an axis normal to the host → **extruded hole** (Durchzug);
+  - anything else with cuts (louvre, lance, bridge) → `FORMED_FEATURE`.
+- **Measures:**
+  - the height comes from the region's vertices and inner sample points,
+    along the host's normal; the side is the side it stands out on;
+  - for a collar: bore, outside height (from the far side of the sheet to
+    the rim) and the fillet's inner radius.
+- **Pre-hole** (`bendmodel.extruded_hole_prehole`):
+  - laid flat, the neutral fibre from the rim of the formed region runs
+    through the fillet and the wall: `d = 2·(ρ − θ·(r + K·t) − h)`;
+  - with K = 0.5 and a 90° fillet this is exactly the published
+    `d = D − 2·(H − 0.43·r − 0.72·t)` (tested);
+  - circumferential stretching of the rim is ignored. `unfold(pre_hole=…)`
+    takes a diameter or `(Feature) -> diameter` for the tool maker's table;
+  - no material left → `PRE_HOLE` warning, pierced (no cut).
+- **Flat output:**
+  - the formed faces leave the reference skin. Their rim becomes a loop of
+    the host face;
+  - an emboss's rim is not cut. The area inside it is material, and it is
+    returned as `Feature.outline`;
+  - an extruded hole cuts its pre-hole; its rim is the outline;
+  - the area self-check adds what lies inside the rims;
+  - DXF: rims on layer `FORM`, text `EMBOSS H5 TOP` or
+    `EXTR Ø6 H4.5 BOTTOM (PRE Ø2.708)`. The bend table has `height`,
+    `radius` and `rim`.
+- **Sharp-edged collars** (no fillet) are not supported. A counterbore
+  deeper than t is not taken for one; they end as `EDGE_FEATURE`.
+- **Tests:** generated by revolving the cross-section: raised pads up and
+  down, collars up, down and two on one part, a collar too tall for a
+  pre-hole. All are exact in area and round-trip through STEP.
 
-For each inner wire of a planar skin face, classify the faces across its
-edges:
+**Louvres, bridges and lances: implemented**, bent or formed, with straight or
+curved slits.
 
-| Pattern | Feature | Flat output |
-|---|---|---|
-| one through-cylinder | hole | the circle (exact) |
-| coaxial cone (half-angle 41–60°) + cylinder | countersink | through-diameter as the cut, annotation (diameter, angle, side), `COUNTERSINK_PROJECTED` |
-| cone through the full thickness | knife-edge countersink | the smaller circle, warning |
-| cylinder + annular plane + cylinder | counterbore | through-diameter, annotation |
-| tangent torus → coaxial cylinder pair with ΔR ≈ t ending in a free edge | extruded hole | pre-hole diameter from a material/tool table (published formulas disagree), else `FORMED_FEATURE` |
-| tangent faces returning to a parallel plane at offset h, no thickness faces | emboss, dimple, bead | marking-layer outline plus tool id, no cut |
-| thickness faces inside a formed region | louvre, lance, bridge | slit lines plus marker plus tool id |
+- **Detection** (`_formed_regions`, `_classify`): the opening's inner wire on
+  the host face is walked in order (`BRepTools_WireExplorer`). Each edge is
+  *attached* (to the region) or *cut* (to a thickness face); runs of each are
+  counted.
+  - **Formed** (seeded, as for embosses: tori, spheres, freeform faces):
+    - held on one side and cut along one run: a **louvre** (Kieme) if the
+      cut is a straight slit (within t of its chord) or takes at most half the
+      rim, else a **lance** (Lasche: a tongue cut free around most of its
+      rim);
+    - held on two sides and cut along two runs: a **bridge** (Brücke).
+  - **Bent** (planes and cylinders only, hanging in an inner wire of a plane
+    face and touching nothing else):
+    - held on one side: a **lance**, developed like any flange;
+    - held on two sides: a **bridge** with bent ramps (its development
+      would not close).
+  - Anything else (held on more sides, cuts inside the region) →
+    `FORMED_FEATURE`.
+- **Slit width** (`_slit_width`):
+  - the region's own cut edges (its edges along thickness faces) are
+    projected onto the host plane;
+  - the median distance to the sheet's cut edges is the width. The ends,
+    where both meet, do not count;
+  - in 3D the two sides only lie in one plane where the slit leaves the
+    sheet, so a plain 3D distance would give 0.
+- **Flat output:**
+  - a formed louvre, bridge or lance is not developed, as for an emboss.
+    Its rim is a marking (`Feature.outline`, layer `FORM`) and the inside is
+    material.
+  - **Slits with width:** each slit is the sheet's cut edge (exact: lines
+    and arcs of the rim) closed by the region's cut edge projected onto the
+    sheet.
+    - Projected edges that are lines or circles (a cut face normal to the
+      sheet) become exact `Line`/`Arc` segments; others stay a polyline
+      within 1e-4 mm.
+    - If no projected edge joins a run's ends, the rim and the projected
+      edges are polygonized, and the faces along the run are the slits.
+    - The projection is where the region's edge lies once formed; for a cut
+      face normal to the sheet, that is also where the blank is cut.
+  - **Slits without width:** cut lines in `FlatPattern.slits` (layer
+    `INNER`); the fold model and the checks treat them as cuts.
+  - **Bent lance:** the tab is developed like any flange
+    (`Feature.bend_id`), and the opening around it is cut as it is.
+  - `Feature.holes` lists the holes each feature cuts (also pre-holes and
+    countersinks). `orientation_deg` is the direction of a bent lance's bend
+    line, otherwise of the chord of the longest slit. `size` is the extent
+    along and across it. DXF text: `LOUVRE 20x10.5 A0 H5 TOP`.
+- **Checks:**
+  - their holes are judged with the feature, not as holes or narrow slots:
+    rim (a bent lance: its opening) to the outline ≥ 3t, to other bends
+    ≥ 4t + r;
+  - a bent lance's flange is measured to its opening;
+  - lances are formed with the blank in a punching tool, not on the press
+    brake. A bent lance's bend gets no press-brake rules (flange to V, air
+    radius, tooling, tonnage, U channel), and the bend order treats it like
+    a hem (made first, `BendPlan.unchecked`). Air-bending a tab inside a
+    frame would push the frame into the die, and the simulation shows
+    exactly that.
+- **Tests** (`tests/test_cut_forms.py`), all slits 0.5 mm wide and
+  round-tripped through STEP:
+  - a raised half pad open along its diameter (straight louvre, up and
+    down);
+  - the hood of a raised round pad outside a circle, slit along it (curved
+    louvre; the slot is four exact arcs);
+  - a tongue and a strip cut from a raised round pad (formed lance, formed
+    bridge);
+  - a strip raised by two joggles at each end (bent bridge);
+  - tabs bent 30° and 90° out of openings as long as their flat (bent
+    lance);
+  - flat areas exact to 1e-9 for straight cuts and to 1e-5 for curved ones
+    against a polygonised reference;
+  - widths, sizes, directions and heights as built;
+  - a synthetic slit without width through DXF, the fold model and the
+    checks.
+- **Not supported:** cuts inside a formed region; regions held on more than
+  two sides of their opening. The material a formed feature stretches is
+  not accounted for: inside its rim the blank is flat.
 
-All of these become `SheetPart.features` (type, faces, parameters, side).
-Unrecognised formed regions give `FORMED_FEATURE` (an error by default, a
-warning with `partial=True`).
+**Engravings: implemented, behind `recognize(engrave=True)`** (`recognize.py`,
+`unfold.py`). A recess that does not go through the sheet — a pocket, a
+groove, engraved text, a blind hole — is machined on a mill; on a laser the
+shop marks its rim instead. Without the switch such a part is refused as
+before (`EDGE_FEATURE`).
+
+- **Detection** (`_recess`): a group of non-skin faces (grouped over all
+  edges, as for hole features) that touches only one skin is a recess when
+  - it opens into a single plane face of that skin (the host), through inner
+    wires of that face only: it reaches no edge of the part and no bend;
+  - every edge of those wires is its own (none is shared with a through
+    cut);
+  - it stays less than t below the host (vertices and inner sample points,
+    along the host's normal); that is its `depth`.
+  Faces of the group flush with the host are islands its floor leaves
+  standing (the middle of an O); their wires are rims too.
+- **Features:** one `engraving` per rim, so a ring groove is two. `side` is
+  the skin it opens into, `outer_diameter` the rim's diameter if it is one
+  circle, `depth` the recess's. One `ENGRAVED_RECESS` warning per part
+  counts them and gives the deepest: the depth is not made.
+- **Flat output:** the rim is `Feature.outline`, never a hole: the flat is
+  that of the part without the recess (area and size tested exact).
+  - a rim in a face of the reference skin is a loop of that face and is
+    chained with the outline, exactly (lines, arcs, splines); the area
+    self-check adds what lies inside it, as for an emboss;
+  - a rim on the far skin, or round an island, is projected along the
+    normal onto the plane of the reference skin behind it
+    (`_projected_rim`): circles stay circles, other edges are fitted as a
+    line or an arc, else polylined at 1e-4 mm;
+  - DXF: rims on layer `ENGRAVE`, no text per rim (text is many rims). The
+    bend table has `depth` and `rim`.
+- **Not supported:** a recess reaching the outline (a rebate) or running
+  into a bend: `EDGE_FEATURE`, as without the switch. A recess so large that
+  its floor outweighs the skin it is cut into is read as a skin.
 
 ### 5.5 B-spline faces (canonical recognition, implemented)
 
@@ -807,7 +953,7 @@ listed.
 - Output metadata records the flatmat, OCP and OCCT versions, the healing
   mode and the tolerances. Golden-file tests run per pinned OCP version.
 
-## 7. Manufacturability checks (`flatmat/dfm.py`, implemented except §7.4)
+## 7. Manufacturability checks (`flatmat/dfm.py`, implemented)
 
 **As built** (`fm.check(pattern, material=, die_v=, rolling_direction_deg=,
 machine_max_force_kn=, rules=DfmRules(...), strict=)`, the CLI `--check`):
@@ -893,18 +1039,88 @@ are a reasonable middle and are documented with their source.
 | `DFM_HOLES_TOO_CLOSE` | web between holes | ≥ 2·t |
 | `DFM_FEATURE_TOO_SMALL` | narrowest gap or slot in the outline | ≥ 1.5·t (laser) |
 | `DFM_RELIEF_MISSING` | a bend end where material continues past the end without a cut-out ≥ t wide and ≥ r + t deep past the tangent | relief width t, depth r + t |
-| `DFM_CORNER_GAP` | two bend zones meeting at a corner | gap ≥ 0.4 mm or a corner relief |
+| `DFM_CORNER_RELIEF` / `DFM_CORNER_GAP` | two bend zones meeting at a corner (§7.6) | relief ⌀ ≥ t clear; folded gap ≥ 0.4 mm |
 | `DFM_HEM_TOO_SHORT` | hem return length | ≥ 4·t |
 | `DFM_HEM_MATERIAL` | hem on a material or thickness where it is not allowed | material table, Protocase maximum thicknesses |
 | `DFM_U_CHANNEL` | U with base < 2 × flange height, or flange taller than the punch clearance or gooseneck throat | — |
-| `DFM_TOOL_COLLISION` | 2D section collision (§7.4) | — |
+| `DFM_TOOL_COLLISION` | collision with punch, die, clamp or beam in every order tried (§7.4) | — |
+| `DFM_TOOL_ANGLE` / `DFM_TOOL_LENGTH` | the bend's opening angle below the punch or die angle; bend longer than a tool (§7.5) | 2° overbend allowed |
+| `DFM_FORM_NEAR_BEND` / `DFM_FORM_NEAR_EDGE` | rim of an emboss, extruded hole, louvre or bridge (a lance: its opening) to the bend tangent line / to the outline | 4·t + r (CADEX: extruded holes 4t) / 3·t |
 | `DFM_BEND_ANGLE` | angle beyond what the shop forms in one bend | 130° (SendCutSend), configurable |
 
 Every finding is a `Diagnostic` with severity `warning` (or `error` if the
 caller sets `strict=True`), pointing to the bends, faces and 2D locations
 involved, so a UI can draw it.
 
-### 7.4 Collision and sequence (later)
+### 7.4 Collision and sequence (implemented: `flatmat/fold.py`, `flatmat/sequence.py`)
+
+**As built** (`fm.plan_bends(pattern, tooling, order=None)`,
+`fm.check(..., sequence=True | [ids])`, CLI `--sequence [ORDER]`):
+
+- **Folding the flat back up** (`FoldModel`):
+  - the flat is cut along the BA strips (extended by t past the bend line's
+    ends, so the corners separate too); what is left are the flanges;
+  - a spanning tree over the bend lines from the largest region fixes which
+    side moves;
+  - a bend at angle φ turns the far side rigidly. Each region is the sheet's
+    mid-surface, so the strip's ends map to the ends of an arc of radius
+    r + t/2 (length kept while the bend is part way). This is exact for any
+    K and either skin inside: folded STEP parts land t/2 inside the original
+    solid to 1e-10 mm (generated parts, a box, the six BenDFM samples);
+  - bends whose two sides are one region (no relief) or that have no
+    flange between them (a joggle with a zero flat) cannot be placed. They
+    are `BendPlan.unchecked`.
+- **Press brake:**
+  - the bend's inside faces the punch; both legs rise by φ/2;
+  - the die is placed so the outside of the legs rests on its shoulders
+    (tangent to the shoulder radius);
+  - the punch's tip radius is limited to the bend's radius.
+- **Tools are prisms along the bend line:**
+  - punch and die: segmented to the bend's length unless a length is
+    given;
+  - the clamp above the punch and the lower beam below the die run the
+    machine's full length.
+- **Test per state:**
+  - every flange's part within a tool's length, seen along the bend line, is
+    an affine image of its outline;
+  - buffered by t/2 minus a clearance (2 % of t, at least 0.02 mm), it must
+    not meet the tool's section;
+  - the bend is swept in 5° steps, the full angle first;
+  - the part may lie either way round (rotated 180°), which matters for a
+    gooseneck: `BendStep.turned`.
+- **Order:**
+  - the backward search follows Duflou, with weights 4 / 2 / 1 for
+    shape-defining (the smaller side's area share), not at a leaf, and
+    length;
+  - results are memoised per (bend, bends done), and sets of remaining
+    bends that dead-end are remembered (no subset is searched twice);
+  - a node limit of 2000;
+  - turning the part over is `BendStep.flip`;
+  - hems (pre-bent, closed with a hemming tool) and lances (formed in a
+    punching tool) are made first and not simulated.
+- **Output:**
+  - a feasible order, or the longest feasible tail plus one `Collision`
+    per bend that could not be placed (tool, angle reached, flange
+    location, bends done);
+  - with `check(sequence=…)`: `DFM_TOOL_COLLISION` findings, the plan in
+    the bend table JSON (`dfm.sequence`), each bend's `step` (JSON and
+    CSV) and `(n)` before the DXF bend labels.
+- **Not modelled:**
+  - the bend zones themselves, formed features standing out of the sheet;
+  - springback, the back gauge, the operator.
+- **Validation:**
+  - textbook cases: a deep U (20 wide, 60 legs) is infeasible with a
+    straight punch and feasible with a gooseneck, one leg turned into the
+    throat;
+  - a Z whose long first flange hangs into the lower beam if bent first;
+  - a U with a lip where some orders fail;
+  - a box with 70 mm walls hits the punch.
+  - BenDFM samples with BenDFM's tools: orders found for 0, 1, 3 and 5 in
+    < 1 s together. BenDFM's labels are not comparable: they judge three
+    sections per bend (a collision only if all three collide), with a die
+    block of unpublished size, for one random order.
+
+**Original plan:**
 
 - **Section test:** for each bend, cut a section perpendicular to the bend
   line. Represent the punch (straight or gooseneck) and the die as
@@ -921,6 +1137,65 @@ involved, so a UI can draw it.
   - collinear bends are grouped
 - **Output:** a feasible order, or the bend that cannot be formed, with
   the reason.
+
+### 7.5 Tooling (`flatmat/tooling.py`, implemented)
+
+No open format exists (research §10.8), so tools are a few catalogue numbers,
+loaded and saved as JSON (`Tooling.load/save`, CLI `--tooling FILE`):
+
+- **`Punch`**: height (tip to clamp), tip angle, tip radius, body width,
+  length (None: segmented to each bend), clamp width.
+  - A **gooseneck** keeps its nose up to `throat_bottom`, then leans back at
+    45° by `throat_depth`, so a 90° bend's leg clears its underside.
+  - The recess on its +y side, up to `throat_top`, is the throat.
+- **`Die`**: V (between the sharp edges, before the shoulder radius), angle,
+  shoulder radius, block width and height, length (None: segmented), and the
+  width of the lower beam below it.
+- **Catalogue** (`PUNCHES`, `DIES`; CLI `--punch`, `--die`, `--die V<v>`):
+  - punches: straight 88°, gooseneck 88°, acute 30°;
+  - dies: V6–V50 at 88°, and a V16 at 30°;
+  - BenDFM's tools: a 90° punch 10 × 300 mm, a V40 die.
+
+  These are typical values entered by hand, not any maker's data.
+  `Tooling.default(t)` is the straight punch and a V from the Amada rule.
+- **In the checks:**
+  - V comes from the die unless `die_v` is given;
+  - the expected air-bend radius is at least the punch's tip radius;
+  - `DFM_TOOL_ANGLE` when the bend's opening angle is below the die's or
+    the punch's angle (2° overbend allowed);
+  - `DFM_TOOL_LENGTH` when a tool with a length is shorter than the bend;
+  - the tools are used by the collision check (§7.4).
+
+### 7.6 Corner rule (implemented)
+
+Where two bends meet (a bend line ends within BA/2 + t of another bend's
+line), the end is judged by the corner rule instead of the end-relief rule:
+
+- **`DFM_CORNER_RELIEF`** (2D):
+  - the point that tears is the end of the bend's tangent line on the side
+    towards the other bend. For a square box corner, that is where both
+    tangent lines cross;
+  - material may fill at most `corner_fill` (60 %) of a disc of radius
+    `corner_relief_t·t` (0.5 t, i.e. a relief ⌀ ≥ t) around it;
+  - a bare square notch fills 75 % and is reported. A relief cut past the
+    tangent lines fills nothing.
+- **`DFM_CORNER_GAP`** / **`DFM_CORNER_OVERLAP`** (3D, on the `FoldModel`):
+  - every two folded flanges are plates t thick around their mid-surface;
+    their smallest distance comes from outline samples (three layers, at
+    most 0.25 mm apart);
+  - closer than `corner_gap` (0.4 mm, SendCutSend's 0.015") is
+    `DFM_CORNER_GAP`, intersecting is `DFM_CORNER_OVERLAP`;
+  - flanges joined by one bend, or by two parallel bends (a joggle, a U),
+    are skipped.
+- **Tests:** a box built from two U profiles:
+  - with square reliefs in the base's corners: clean;
+  - short bends ending 0.2 mm before the long ones: 4 × `DFM_CORNER_RELIEF`;
+  - ending 2 mm before, without a relief: the end-relief rule, as before;
+  - closed corners (tabs on all walls) 0.1 mm apart: 4 × `DFM_CORNER_GAP`
+    at exactly 0.1 mm. At 1 mm: none.
+- **Caveat:** these corner ends were not judged before. On the BenDFM
+  samples the corner rule now reports their bare square corner notches
+  (fill 75 %); the private SolidWorks boxes are still to be re-checked.
 
 ## OCP binding pitfalls (*spike*)
 
@@ -951,7 +1226,11 @@ involved, so a UI can draw it.
 - ~~Fast healing on 7.8~~: resolved via `$CSF_STEPDefaults` (§6.1).
 - Is OCCT 8.0's STEP reader thread-safe? (Irrelevant while we use one
   process per part.)
-- Hem allowance and extruded-hole pre-hole tables: no open data found.
+- Hem allowance and extruded-hole pre-hole tables: no open data found. The
+  pre-hole uses the neutral fibre (§5.4), which matches the one published
+  formula; `unfold(pre_hole=…)` takes a shop's table.
+- Real punch and die dimensions: the built-in catalogue is typical values,
+  not checked against a maker's catalogue.
 - Real STEP exports: one SolidWorks 2023 part tried (missing cylinder
   pcurves, now handled). Inventor, Fusion, Onshape, Creo and Solid Edge are
   still to collect.
