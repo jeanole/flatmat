@@ -25,7 +25,19 @@ from ._topology import Context, Face, edge_vertices, inner_uv, pcurve
 from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .geom2d import IDENTITY, Rigid, cross, dot, heading, offset, perp, rigid_fit, sub, transform, unit
-from .model import FEATURE_KINDS, SAMPLE_TOL, Arc, BendLine, FlatPattern, Line, Loop2D, Point, SheetPart, Spline
+from .model import (
+    FEATURE_KINDS,
+    SAMPLE_TOL,
+    Arc,
+    BendLine,
+    Feature,
+    FlatPattern,
+    Line,
+    Loop2D,
+    Point,
+    SheetPart,
+    Spline,
+)
 
 # chord errors (mm) for the jobs here that need finer polylines than SAMPLE_TOL
 _OVERLAP_TOL = 0.005  # the self-overlap check of the flat
@@ -72,11 +84,65 @@ def unfold(
     if ctx is None:
         raise ValueError("SheetPart has no recognition context; call flatmat.recognize() first")
     kmodel = as_k_model(k)
-    t = ctx.thickness
-    faces = ctx.faces
     diags: list[Diagnostic] = list(sheet.diagnostics)
+    bv = _bend_values(sheet, kmodel, ctx.thickness, sharp_radius, diags)
+    devs, shifts = _developments(ctx, bv)
+    place, sharp_geo = _place(ctx, devs, shifts)
+    sharp_v = {v: shifts[ei] for ei, se in ctx.sharp_edges.items() for v in se.vertices}
+    sheet_features, diags = _with_pre_holes(list(sheet.features), pre_hole, diags)
+    pre_r = {f.id: f.through_diameter / 2 for f in sheet_features if f.kind_info.flat == "pre_hole"}
+    ol = _outline(ctx, devs, place, sharp_v, diags, pre_r)
+    area, rel = _self_check(ctx, devs, shifts, ol, check_overlap)
+    bends, lines = _bends_and_lines(sheet, ctx, bv, devs, place, sharp_geo)
+    flat = _to_origin(ol, lines, sheet_features)
 
-    # K per bend; a sharp bend (r = 0 in the model) is made with sharp_radius
+    return FlatPattern(
+        outer=flat.outer,
+        holes=tuple(flat.holes),
+        bend_lines=tuple(flat.lines),
+        bends=tuple(bends),
+        thickness=ctx.thickness,
+        k_model=kmodel.describe(),
+        area=area,
+        diagnostics=tuple(diags),
+        meta={
+            "source": sheet.source,
+            "ocp": OCP_VERSION,
+            "area_rel_err": rel,
+            "sharp_radius": sharp_radius,
+            "root_face": ctx.root,
+            "root_offset": flat.offset,  # flat = root face (u, v) developed + this
+        },
+        features=flat.features,
+        slits=tuple(flat.slits),
+    )
+
+
+# ------------------------------------------------------------------------------ the steps of unfold()
+
+
+@dataclass(frozen=True)
+class _BendValues:
+    """K and the inner radius each bend is made with (a sharp bend: ``sharp_radius``)."""
+
+    k: dict[int, float]
+    r: dict[int, float]
+    t: float
+
+    def sharp_delta(self, bend_id: int, angle: float, concave: bool) -> float:
+        """Strip width between the two faces of a sharp corner (negative: overlap).
+
+        The faces of the reference skin run to the virtual sharp. A real bend of radius r
+        has BA between tangent points that sit r·tan(φ/2) (reference skin inside) or
+        (r + t)·tan(φ/2) (outside) back from that sharp.
+        """
+        r, t = self.r[bend_id], self.t
+        setback = (r if concave else r + t) * math.tan(angle / 2)
+        return bend_allowance(angle, r, t, self.k[bend_id]) - 2 * setback
+
+
+def _bend_values(sheet: SheetPart, kmodel, t: float, sharp_radius: float, diags: list) -> _BendValues:
+    """K per bend from the K model; its warnings go to ``diags``."""
     k_of_bend: dict[int, float] = {}
     r_of_bend: dict[int, float] = {}
     for b in sheet.bends:
@@ -87,18 +153,11 @@ def unfold(
             diags.append(d)
     if sharp_radius == 0.0 and any(b.kind == "sharp" for b in sheet.bends):
         diags.append(warn(Code.SHARP_BEND_ASSUMED_RADIUS, "sharp bends developed with inner radius 0"))
+    return _BendValues(k_of_bend, r_of_bend, t)
 
-    def sharp_delta(bend_id: int, angle: float, concave: bool) -> float:
-        """Strip width between the two faces of a sharp corner (negative: overlap).
 
-        The faces of the reference skin run to the virtual sharp. A real bend of radius r
-        has BA between tangent points that sit r·tan(φ/2) (reference skin inside) or
-        (r + t)·tan(φ/2) (outside) back from that sharp.
-        """
-        r = r_of_bend[bend_id]
-        setback = (r if concave else r + t) * math.tan(angle / 2)
-        return bend_allowance(angle, r, t, k_of_bend[bend_id]) - 2 * setback
-
+def _developments(ctx: Context, bv: _BendValues) -> tuple[dict[int, _Dev], dict[int, float]]:
+    """How each reference-skin face develops, and the strip each sharp bend edge inserts."""
     # neutral radius per bend face, from its own convexity (joggles: design §5.1)
     devs: dict[int, _Dev] = {}
     for i in ctx.skin_a:
@@ -109,28 +168,33 @@ def unfold(
                 # sharp inside, round (R = t) outside, reference skin outside: the flanges end
                 # at the cylinder's tangent lines, which sit on the inner sharp, so the
                 # cylinder carries the inside-sharp strip BA(r) - 2·r·tan(φ/2)
-                rn = sharp_delta(bf.bend_id, bf.angle, True) / bf.angle
+                rn = bv.sharp_delta(bf.bend_id, bf.angle, True) / bf.angle
             else:
-                rn = bf.r_in + k_of_bend[bf.bend_id] * t
-        devs[i] = _Dev(faces[i - 1], rn)
-    shifts = {ei: sharp_delta(se.bend_id, se.angle, se.concave) for ei, se in ctx.sharp_edges.items()}
+                rn = bf.r_in + bv.k[bf.bend_id] * ctx.thickness
+        devs[i] = _Dev(ctx.faces[i - 1], rn)
+    shifts = {ei: bv.sharp_delta(se.bend_id, se.angle, se.concave) for ei, se in ctx.sharp_edges.items()}
+    return devs, shifts
 
-    place, sharp_geo = _place(ctx, devs, shifts)
-    sharp_v = {v: shifts[ei] for ei, se in ctx.sharp_edges.items() for v in se.vertices}
-    sheet_features = list(sheet.features)
-    if pre_hole is not None:
-        diags = [d for d in diags if d.code != Code.PRE_HOLE]  # the recognised pre-hole is replaced
-        sheet_features = [
-            _with(f, through_diameter=float(pre_hole(f) if callable(pre_hole) else pre_hole))
-            if f.kind_info.flat == "pre_hole"
-            else f
-            for f in sheet_features
-        ]
-    pre_r = {f.id: f.through_diameter / 2 for f in sheet_features if f.kind_info.flat == "pre_hole"}
-    ol = _outline(ctx, devs, place, sharp_v, diags, pre_r)
-    outer, holes = ol.outer, ol.holes
 
-    # self-checks
+def _with_pre_holes(features: list[Feature], pre_hole, diags: list) -> tuple[list[Feature], list]:
+    """The features with ``pre_hole`` applied to the extruded holes, and the diagnostics without
+    the PRE_HOLE warnings it replaces (unchanged if ``pre_hole`` is None)."""
+    if pre_hole is None:
+        return features, diags
+    diags = [d for d in diags if d.code != Code.PRE_HOLE]  # the recognised pre-hole is replaced
+    features = [
+        _with(f, through_diameter=float(pre_hole(f) if callable(pre_hole) else pre_hole))
+        if f.kind_info.flat == "pre_hole"
+        else f
+        for f in features
+    ]
+    return features, diags
+
+
+def _self_check(ctx: Context, devs, shifts, ol: _Outline, check_overlap: bool) -> tuple[float, float]:
+    """The flat's area and its relative error against the developed faces; refuses a mismatch
+    (AREA_MISMATCH) and, with ``check_overlap``, a flat that overlaps itself (FLAT_OVERLAP)."""
+    outer, holes, faces = ol.outer, ol.holes, ctx.faces
     area = outer.area() - sum(-h.area() for h in holes)
     expected = 0.0
     for i in ctx.skin_a:
@@ -145,12 +209,16 @@ def unfold(
         poly = Polygon(outer.polyline(_OVERLAP_TOL), [h.polyline(_OVERLAP_TOL) for h in holes])
         if not poly.is_valid:
             raise refuse(Code.FLAT_OVERLAP, f"the flat pattern overlaps itself: {explain_validity(poly)}")
+    return area, rel
 
-    # bend lines and bend values
+
+def _bends_and_lines(sheet: SheetPart, ctx: Context, bv: _BendValues, devs, place, sharp_geo):
+    """The bends with their K, BA, BD and OSSB, and their bend lines in the flat."""
+    t, faces = ctx.thickness, ctx.faces
     lines: list[BendLine] = []
     bends = []
     for b in sheet.bends:
-        kk, r = k_of_bend[b.id], r_of_bend[b.id]
+        kk, r = bv.k[b.id], bv.r[b.id]
         rad = math.radians(b.angle_deg)
         bends.append(
             _with(
@@ -171,16 +239,31 @@ def unfold(
             f = faces[seg.face_id - 1]
             for p0, p1 in _bend_line(f, devs[seg.face_id], place[seg.face_id]):
                 lines.append(BendLine(b.id, seg.face_id, p0, p1, b.direction, b.angle_deg, r, b.kind))
+    return bends, lines
 
-    # normalise: bbox minimum at the origin
-    pts = outer.polyline(SAMPLE_TOL)  # as FlatPattern.bbox, so the bbox starts at the origin
+
+@dataclass(frozen=True)
+class _Placed:
+    """The flat moved so its bounding box starts at the origin."""
+
+    outer: Loop2D
+    holes: list[Loop2D]
+    lines: list[BendLine]
+    slits: list[Loop2D]
+    features: tuple[Feature, ...]
+    offset: tuple[float, float]  # what was added to every point
+
+
+def _to_origin(ol: _Outline, lines: list[BendLine], features: list[Feature]) -> _Placed:
+    """Move everything so the bounding box starts at the origin, and place the features on it."""
+    pts = ol.outer.polyline(SAMPLE_TOL)  # as FlatPattern.bbox, so the bbox starts at the origin
     dx, dy = -min(p[0] for p in pts), -min(p[1] for p in pts)
     shift = (1.0, 0.0, dx, dy)
-    outer = _move_loop(outer, shift)
-    holes = [_move_loop(h, shift) for h in holes]
+    outer = _move_loop(ol.outer, shift)
+    holes = [_move_loop(h, shift) for h in ol.holes]
     lines = [_with(bl, p0=transform(shift, bl.p0), p1=transform(shift, bl.p1)) for bl in lines]
-    slit_loops = [(_move_loop(L, shift), fid) for L, fid in ol.slits]
-    features = tuple(
+    slits = [_move_loop(L, shift) for L, _ in ol.slits]
+    placed = tuple(
         _cut_feature(
             _with(
                 f,
@@ -192,29 +275,9 @@ def unfold(
             lines,
             ol.orient.get(f.id),
         )
-        for f in sheet_features
+        for f in features
     )
-
-    return FlatPattern(
-        outer=outer,
-        holes=tuple(holes),
-        bend_lines=tuple(lines),
-        bends=tuple(bends),
-        thickness=t,
-        k_model=kmodel.describe(),
-        area=area,
-        diagnostics=tuple(diags),
-        meta={
-            "source": sheet.source,
-            "ocp": OCP_VERSION,
-            "area_rel_err": rel,
-            "sharp_radius": sharp_radius,
-            "root_face": ctx.root,
-            "root_offset": (dx, dy),  # flat = root face (u, v) developed + this
-        },
-        features=features,
-        slits=tuple(L for L, _ in slit_loops),
-    )
+    return _Placed(outer, holes, lines, slits, placed, (dx, dy))
 
 
 def _cut_feature(f, holes: list[Loop2D], lines: list[BendLine], angle: float | None):
