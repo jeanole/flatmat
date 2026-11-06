@@ -19,8 +19,9 @@ A face's flange:
   through the hole's rim edge (the hole wall and a skin plane) is the hole wall.
 - a diameter or radius whose text names a thread (``M6x1.0 - 6H THRU``) is unmapped:
   the tap holds the tapped size, not the laser; the thread is in :attr:`SheetPmi.threads`.
-  Two sides on opposite skins of one flange, as faces or as edges on them, are the
-  sheet thickness, also unmapped.
+  Opposite skins of one flange, as two sides (faces or edges on them) or as one side
+  holding both (a size dimension), are the sheet thickness when the nominal is the
+  sheet's thickness or there is none: unmapped too. Flatness of a cut face is unmapped.
 - a bend face, either skin's, and a hole wall that touches one are "on a bend"; a
   face of a formed feature (emboss, extruded hole, louvre, bridge, lance), of an
   engraving, or a countersink's cone and a counterbore's bore and step, is on that
@@ -38,7 +39,7 @@ checked is decided downstream.
 Threads (``M6``, ``M8x1``, ``M6 THRU``, ``4x M5``) and the general tolerance (``ISO 2768-mK``,
 ``DIN 6930-m``) are parsed from every text the reader yields: dimension callouts,
 presentation names and notes. A thread's count is the larger of the callout's
-``4x`` and the number of holes it points at (coaxial walls are one hole).
+``4x`` and the number of holes it points at (coaxial walls of one flange are one hole).
 """
 
 from __future__ import annotations
@@ -172,6 +173,7 @@ class _Sheet:
         ctx = sheet._ctx
         if ctx is None:
             raise ValueError("the sheet has no recognition context")
+        self.thickness = sheet.thickness
         self.role = {f.id: f.role for f in sheet.faces}
         self.kind = {f.id: f.kind for f in sheet.faces}
         self.flange_of = {i: fl.id for fl in sheet.flanges for i in fl.face_ids}
@@ -210,6 +212,10 @@ class _Sheet:
     def _link(self, a: tuple[str, int], b: tuple[str, int]) -> None:
         self.links[a].add(b)
         self.links[b].add(a)
+
+    def thick(self, nominal: float | None) -> bool:
+        """A nominal that may be the sheet thickness (None: no nominal to tell)."""
+        return nominal is None or abs(nominal - self.thickness) <= max(0.01, 0.01 * self.thickness)
 
     def _on_bend(self, i: int) -> bool:
         return i in self.bend_faces or (self.role.get(i) == "skin_b" and self.kind.get(i) == "cylinder")
@@ -392,6 +398,8 @@ def _path(on: _Sheet, item: PmiItem, datums: dict[str, PmiItem]) -> PmiPath:
             raise _Unmapped(f"a {kind} across flanges")
         return PmiPath("laser_hole", (_one(common),), feature_id=feature)
     if kind == "flatness":
+        if any(s.roles - _SKINS for s in sides):
+            raise _Unmapped("flatness of a cut face")  # a flange's flatness is that of its skins
         common = frozenset.intersection(*(s.flanges for s in sides))
         if len(common) != 1:
             raise _Unmapped("flatness of a face on several flanges")
@@ -409,12 +417,15 @@ def _path(on: _Sheet, item: PmiItem, datums: dict[str, PmiItem]) -> PmiPath:
             return _chain(on, sides[0], sides[0], feature)
         paths = [_chain(on, sides[0], _datum(on, d, datums), feature, f" and datum {d}") for d in item.datums]
         return max(paths, key=lambda p: len(p.bends))  # the farthest datum; the first of equals
-    # linear
+    # linear. Opposite skins of one flange at the sheet thickness (or with no nominal to
+    # tell): the sheet thickness. As two sides, by their faces or by edges on them, or as
+    # one side holding both (a dimensional_size).
     if len(sides) == 1:
+        if _SKINS <= sides[0].roles and on.thick(item.nominal):
+            raise _Unmapped("the sheet thickness")
         return PmiPath("laser", (_one(sides[0].flanges),), feature_id=feature)
     a, b = sides[0], sides[1]
-    # opposite skins of one flange, by their faces or by edges on them: the sheet thickness
-    if {a.roles & _SKINS, b.roles & _SKINS} == {_SKIN_A, _SKIN_B} and a.flanges & b.flanges:
+    if {a.roles & _SKINS, b.roles & _SKINS} == {_SKIN_A, _SKIN_B} and a.flanges & b.flanges and on.thick(item.nominal):
         raise _Unmapped("the sheet thickness")
     return _chain(on, a, b, feature)
 
@@ -434,14 +445,19 @@ def _hole_walls(item: PmiItem, sheet: SheetPart) -> tuple[int, ...]:
     return tuple(sorted({i for s in item.sides for i in s.face_ids if i in walls}))
 
 
-def _holes(walls: tuple[int, ...], sheet: SheetPart) -> int:
-    """How many holes the walls are: coaxial walls are one hole (a wall split into two
-    faces, a counterbore's bore over its through-bore)."""
+def _holes(walls: tuple[int, ...], sheet: SheetPart, on: _Sheet | None) -> int:
+    """How many holes the walls are: coaxial walls of one flange are one hole (a wall split
+    into two faces, a counterbore's bore over its through-bore). Holes on one axis in two
+    flanges (both legs of a U) are two."""
     ctx = sheet._ctx
-    if ctx is None:
+    if ctx is None or on is None:
         return len(walls)
     axes = set()
     for i in walls:
+        try:
+            flanges: frozenset[int] | None = on._edge_flanges(i)
+        except _Unmapped:
+            flanges = None  # on a bend or a form: its axis alone
         f = ctx.faces[i - 1]
         d = f.axis_d.Normalized()
         dx, dy, dz = (round(c, 4) + 0.0 for c in (d.X(), d.Y(), d.Z()))
@@ -449,7 +465,7 @@ def _holes(walls: tuple[int, ...], sheet: SheetPart) -> int:
             dx, dy, dz = -dx, -dy, -dz
         px, py, pz = f.axis_p.X(), f.axis_p.Y(), f.axis_p.Z()
         t = px * dx + py * dy + pz * dz  # the foot of the axis nearest the origin names the line
-        axes.add((dx, dy, dz, *(round(c, 3) + 0.0 for c in (px - t * dx, py - t * dy, pz - t * dz))))
+        axes.add((dx, dy, dz, *(round(c, 3) + 0.0 for c in (px - t * dx, py - t * dy, pz - t * dz)), flanges))
     return len(axes)
 
 
@@ -466,8 +482,8 @@ def _map(sheet: SheetPart, data: PmiData) -> tuple[SheetPmi, list[Exception]]:
     items = [i for i in data.items if i.kind != "note"]
     pairs: list[tuple[PmiItem, PmiPath]] = []
     failed: list[Exception] = []
-    if items:
-        on = _Sheet(sheet)
+    on = _Sheet(sheet) if items else None
+    if on is not None:
         datums: dict[str, PmiItem] = {}
         for i in items:
             if i.kind == "datum" and i.datums:
@@ -489,7 +505,9 @@ def _map(sheet: SheetPart, data: PmiData) -> tuple[SheetPmi, list[Exception]]:
             if got is not None:
                 designation, nominal, pitch, through, count = got
                 walls = _hole_walls(i, sheet)
-                holes = max(count, _holes(walls, sheet), 1)
+                if on is None and sheet._ctx is not None:
+                    on = _Sheet(sheet)
+                holes = max(count, _holes(walls, sheet, on), 1)
                 threads.append(Thread(designation, nominal, pitch, through, walls, holes))
         except Exception as e:
             failed.append(e)

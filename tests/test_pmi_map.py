@@ -549,3 +549,44 @@ def test_side_on_several_flanges_is_unmapped(bracket):
         PmiItem(3, "linear", 50.0, None, None, sides=(end, side)),
     )
     assert _paths(sheet, *items) == [PmiPath("unmapped", reason=reason)] * 3
+
+
+def test_thickness_as_a_size_dimension_is_unmapped(bracket):
+    """A dimensional_size arrives as one side holding both skins: still the sheet thickness."""
+    _, sheet, f = bracket
+    skins = PmiSide((f["base_a"], f["base_b"]))
+    items = (
+        PmiItem(1, "linear", 2.0, 0.1, -0.1, sides=(skins,)),
+        PmiItem(2, "linear", None, None, None, sides=(skins,), tolerance="limits"),  # no nominal: may be it
+    )
+    assert _paths(sheet, *items) == [PmiPath("unmapped", reason="the sheet thickness")] * 2
+
+
+def test_opposite_skins_at_another_distance_are_not_the_thickness(bracket):
+    """An edge on one skin to an edge on the other, 16 apart along the flange: a laser dimension."""
+    _, sheet, f = bracket
+    sides = (PmiSide((f["end"], f["base_a"])), PmiSide((f["hole"], f["base_b"])))
+    assert _paths(sheet, PmiItem(1, "linear", 16.0, 0.1, -0.1, sides=sides)) == [PmiPath("laser", (f["base"],))]
+    thick = PmiItem(2, "linear", 2.0, 0.1, -0.1, sides=(PmiSide((f["base_a"],)), PmiSide((f["base_b"],))))
+    assert _paths(sheet, thick) == [PmiPath("unmapped", reason="the sheet thickness")]
+
+
+def test_flatness_of_a_cut_face_is_unmapped(bracket):
+    """Flatness is the flange's (its skins'): a cut face's flatness is not."""
+    _, sheet, f = bracket
+    items = (
+        PmiItem(1, "flatness", None, 0.1, None, sides=(PmiSide((f["end"],)),)),
+        PmiItem(2, "flatness", None, 0.1, None, sides=(PmiSide((f["base_b"],)),)),
+    )
+    assert _paths(sheet, *items) == [
+        PmiPath("unmapped", reason="flatness of a cut face"),
+        PmiPath("flatness", (f["base"],)),
+    ]
+
+
+def test_aligned_holes_in_two_legs_are_two_holes():
+    """The U with a hole in each leg on one axis: coaxial, but two holes in two flanges."""
+    part = dataclasses.replace(_case("U"), holes=[("flat", 0, 0.5, 40.0, 5.0), ("flat", 2, 0.5, 40.0, 5.0)])
+    shape = parts.make_solid(part)
+    walls = [face_at(shape, (17.5, 0, 40), "cylinder"), face_at(shape, (17.5, 64.5, 40), "cylinder")]
+    assert _note_thread(shape, "M6", walls).count == 2
