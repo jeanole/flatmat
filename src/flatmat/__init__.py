@@ -30,7 +30,7 @@ from .model import (
     Spline,
     Tolerances,
 )
-from .pmi import PmiData, PmiItem, PmiSide
+from .pmi import PmiData, PmiItem, PmiSide, PmiTolerance
 from .pmi_map import GeneralTolerance, PmiPath, SheetPmi, Thread, map_pmi, parse_general_tolerance, parse_thread
 from .recognize import recognize
 from .sequence import BendPlan, BendStep, Collision, plan_bends
@@ -78,6 +78,7 @@ __all__ = [
     "PmiItem",
     "PmiPath",
     "PmiSide",
+    "PmiTolerance",
     "Punch",
     "Severity",
     "SheetPart",

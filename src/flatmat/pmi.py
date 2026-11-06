@@ -100,7 +100,7 @@ PmiKind = Literal[
     "note",
 ]
 Point = tuple[float, float, float]
-Tolerance = Literal["none", "plus_minus", "unreadable", "limits", "fit"]
+PmiTolerance = Literal["none", "plus_minus", "unreadable", "limits", "fit"]
 
 
 @dataclass(frozen=True)
@@ -120,7 +120,7 @@ class PmiItem:
     sides: tuple[PmiSide, ...] = ()  # 1 or 2
     anchor: Point | None = None
     text: str = ""  # raw callout / note text, never lost
-    tolerance: Tolerance = "none"  # what kind of tolerance a dimension has (module docstring)
+    tolerance: PmiTolerance = "none"  # what kind of tolerance a dimension has (module docstring)
 
 
 @dataclass(frozen=True)
@@ -322,7 +322,9 @@ def _xcaf_qualifier(obj) -> str:
     return "" if name == "none" else name
 
 
-def _values(obj, matcher: Matcher | None, unit: str) -> tuple[float | None, float | None, float | None, Tolerance, str]:
+def _values(
+    obj, matcher: Matcher | None, unit: str
+) -> tuple[float | None, float | None, float | None, PmiTolerance, str]:
     """``(nominal, upper, lower, tolerance, value text)`` of a dimension object.
 
     With a matcher (a document read from STEP) the signed bounds, the fit class and the

@@ -98,17 +98,42 @@ can decide which process determines it:
 ```python
 sheet = fm.recognize(fm.load_step("part_mbd.step"))
 for item, path in sheet.pmi.items:  # status: "none", "semantic", "graphical_only", "failed"
-    print(item.kind, item.nominal, item.upper, item.lower, path.kind, path.bends, path.reason)
+    print(item.kind, item.nominal, item.upper, item.lower, item.tolerance, item.text, path.kind, path.bends)
 print(sheet.pmi.general)  # GeneralTolerance("ISO 2768", "m", "K", ...) from a note or a callout
-print([(t.designation, t.through, t.face_ids) for t in sheet.pmi.threads])  # "M6 THRU" -> the hole wall
+print([(t.designation, t.count, t.face_ids, t.pmi_ids) for t in sheet.pmi.threads])  # "M6 THRU" -> the hole
 ```
 
-A tolerance flatmat cannot read (an unknown sign or unit, a limits dimension)
-has `upper` and `lower` set to None. It keeps its path and its raw text. A PMI
-problem is a warning (`PMI_READ_FAILED`, `PMI_GRAPHICAL_ONLY`), never a reason
-to refuse a part. A file without PMI gives `SheetPmi("none")` and the same
-result as before, byte for byte in the DXF. `load_step(path, pmi=False)` skips
-the XCAF read.
+Lengths are in mm and angles in degrees, whatever the file's units.
+`PmiItem.tolerance` says what kind of tolerance a dimension has:
+
+| `tolerance` | means | `nominal`, `upper`, `lower` |
+|---|---|---|
+| `"none"` | no tolerance of its own: the general tolerance applies | the nominal; None, None |
+| `"plus_minus"` | a ± tolerance, signs as the file writes them (+0.1/+0.05 stays) | the nominal and the signed deviations |
+| `"limits"` | a lower and an upper limit, or a max / min qualifier (`max 20`) | None: `text` holds the limits |
+| `"fit"` | an ISO 286 fit: the class is in `text` (`Ø8 H7`) | the nominal; None, None |
+| `"unreadable"` | a sign or unit flatmat cannot read, inverted limits, a dimension not found in the file | None for the bounds: `text` keeps what was read |
+
+GD&T items are `"none"` (the zone is `upper`) or `"unreadable"`. A tolerance
+that cannot be read keeps its path and its raw text: whether it is checked is
+the caller's call, never a guess. OCCT's reader drops a STEP file's signs,
+angle units, max / min qualifiers and fit classes, so flatmat reads these from
+the file's own entities.
+
+Notes (free text) never survive OCCT's STEP reader: its writer drops them and
+its reader fills no notes table. Threads and the general tolerance are parsed
+from every text the reader does yield (dimension callouts, presentation
+names), and from notes of a document built in memory. A thread
+(`Thread.designation`, an ISO 261 size and pitch) counts the larger of the
+callout's `4x` and the holes it points at (coaxial walls in one flange are
+one hole); `Thread.pmi_ids` names the item it came from, empty for a note.
+`SheetPmi.graphical` counts graphical-only annotations beside semantic PMI
+that no semantic item repeats: callouts nobody checks.
+
+A PMI problem is a warning (`PMI_READ_FAILED`, `PMI_GRAPHICAL_ONLY`), never a
+reason to refuse a part: one bad item loses only itself. A file without PMI
+gives `SheetPmi("none")` and the same result as before, byte for byte in the
+DXF. `load_step(path, pmi=False)` skips the XCAF read.
 
 ### Tests
 
