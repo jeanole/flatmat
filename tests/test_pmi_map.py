@@ -66,6 +66,11 @@ def test_parse_thread(text, expected):
         ("ISO 2768-m Kanten gebrochen", ("ISO 2768", "m", None)),
         ("ISO 2768", None),
         ("ISO 9001", None),
+        ("ISO 2768 für Längenmaße m", None),  # "f" of "für" is no class
+        ("ISO 2768-mK für alle Maße", ("ISO 2768", "m", "K")),
+        ("DIN ISO 2768-fH", ("ISO 2768", "f", "H")),
+        ("ISO 2768-c, Kanten gebrochen", ("ISO 2768", "c", None)),
+        ("ISO 2768-mö", None),
     ],
 )
 def test_parse_general_tolerance_variants(text, expected):
@@ -86,6 +91,34 @@ def test_parse_general_tolerance_variants(text, expected):
     ],
 )
 def test_parse_thread_variants(text, expected):
+    assert parse_thread(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Einpressmutter M6", None),  # a press-in nut, not a tapped hole
+        ("Mutter M8", None),
+        ("Schraube M6x20", None),
+        ("PEM M4", None),
+        ("PEM nut M5", None),
+        ("bolt M10", None),
+        ("screw M3", None),
+        ("insert M6", None),
+        ("Fläche 25 M2", None),  # square metres
+        ("Maßstab M1:2", None),  # a scale
+        ("M7.5", None),  # no ISO 261 size
+        ("M13", None),
+        ("M6 x 12 tief", ("M6", 6.0, None, False, 1)),  # a depth, not a pitch: coarse
+        ("M6x20", ("M6", 6.0, None, False, 1)),  # a screw length
+        ("M10x1.25", ("M10x1.25", 10.0, 1.25, False, 1)),  # fine
+        ("M12x1.75 THRU", ("M12x1.75", 12.0, 1.75, True, 1)),  # coarse, written out
+        ("M2.5", ("M2.5", 2.5, None, False, 1)),
+        ("M6-6H", ("M6", 6.0, None, False, 1)),
+        ("2xM4", ("M4", 4.0, None, False, 2)),
+    ],
+)
+def test_parse_thread_rejects_what_is_no_tapped_hole(text, expected):
     assert parse_thread(text) == expected
 
 
@@ -276,6 +309,7 @@ def test_thread_from_hole_callout(bracket):
     assert (thread.designation, thread.nominal_mm, thread.pitch_mm, thread.through) == ("M6", 6.0, None, True)
     assert thread.count == 1
     assert thread.face_ids == (f["hole"],)
+    assert thread.pmi_ids == ()  # from a note: no item to point at
     assert pmi.notes == ("M6 THRU",) and pmi.items == ()
 
 
@@ -295,6 +329,7 @@ def test_thread_in_a_dimension_callout(bracket):
     pmi = map_pmi(sheet, PmiData("semantic", (item,)))
     (thread,) = pmi.threads
     assert (thread.designation, thread.pitch_mm, thread.through, thread.face_ids) == ("M6x1.0", 1.0, True, (f["hole"],))
+    assert thread.pmi_ids == (1,)  # the item it came from
     assert pmi.items == ((item, PmiPath("unmapped", reason="a thread")),)
 
 

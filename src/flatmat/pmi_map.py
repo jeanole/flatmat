@@ -36,9 +36,11 @@ and flatness of one flange. Every other type is unmapped, with the reason in pla
 English. An item whose tolerance could not be read keeps its path: whether it is
 checked is decided downstream.
 
-Threads (``M6``, ``M8x1``, ``M6 THRU``, ``4x M5``) and the general tolerance (``ISO 2768-mK``,
-``DIN 6930-m``) are parsed from every text the reader yields: dimension callouts,
-presentation names and notes. A thread's count is the larger of the callout's
+Threads (``M6``, ``M8x1``, ``M6 THRU``, ``4x M5``: ISO 261 sizes and pitches, see
+:func:`parse_thread`) and the general tolerance (``ISO 2768-mK``, ``DIN 6930-m``) are
+parsed from every text the reader yields: dimension callouts, presentation names and
+notes. :attr:`Thread.pmi_ids` names the item a thread came from (none for a note), so a
+caller can tell a thread's own dimension from the thread. A thread's count is the larger of the callout's
 ``4x`` and the number of holes it points at (coaxial walls of one flange are one hole).
 """
 
@@ -76,6 +78,7 @@ class Thread:
     through: bool
     face_ids: tuple[int, ...]  # the hole walls it points at
     count: int = 1  # how many threads: the callout's "4x", or the holes it points at if more
+    pmi_ids: tuple[int, ...] = ()  # the PmiItem ids it came from; () for a note
 
 
 @dataclass(frozen=True)
@@ -99,17 +102,77 @@ class SheetPmi:
 
 # ------------------------------------------------------------------------------ texts
 
+_NOT_A_LETTER = r"(?![^\W\d_])"  # no letter follows, umlauts included: the "f" of "für" is no class
 _GENERAL = re.compile(
-    r"(?<![A-Za-z0-9])(?:(?:DIN\s*)?(?:EN\s*)?ISO|DIN)\s*(2768|6930)"  # the standard, "DIN ISO 2768" too
+    r"(?<![^\W_])(?:(?:DIN\s*)?(?:EN\s*)?ISO|DIN)\s*(2768|6930)"  # the standard, "DIN ISO 2768" too
     r"(?:\s*-\s*[12](?!\d))?"  # a part number: ISO 2768-1
-    r"\s*[-–:]?\s*([fmcv])(?:[\s-]?([hkl]))?(?![A-Za-z])",  # the classes: m, mK, m-K
+    rf"\s*[-–:]?\s*([fmcv])(?:[\s-]?([hkl]){_NOT_A_LETTER})?{_NOT_A_LETTER}",  # the classes: m, mK, m-K
     re.IGNORECASE,
 )
 _STANDARDS: dict[str, Literal["ISO 2768", "DIN 6930"]] = {"2768": "ISO 2768", "6930": "DIN 6930"}
 _THREAD = re.compile(  # M6, M8x1, 4x M5, 4xM5: an M not inside a word, maybe after a count "4x"
-    r"(?<![A-Za-z0-9.,])(?:(\d+)\s*[xX×]\s*)?M(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?(?![\d.,]*\d)"
+    r"(?<![^\W_])(?<![.,])(?:(\d+)\s*[xX×]\s*)?M(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?(?![\d.,]*\d)"
 )
 _THROUGH = re.compile(r"\b(?:thru|through|durchgehend|durchg\.?)(?![A-Za-z])", re.IGNORECASE)
+# a fastener named before the size: a press-in nut's or a screw's hole is no tapped hole
+_FASTENER = ("mutter", "schraube", "nut", "bolt", "screw", "insert", "pem")
+_WORD_BEFORE = re.compile(r"([^\W\d_]+)[\s\-–/:]*$")
+# ISO 261 metric sizes to M64: (coarse pitch or None for a fine-only size, fine pitches)
+_ISO_261: dict[float, tuple[float | None, tuple[float, ...]]] = {
+    1.0: (0.25, (0.2,)),
+    1.1: (0.25, (0.2,)),
+    1.2: (0.25, (0.2,)),
+    1.4: (0.3, (0.2,)),
+    1.6: (0.35, (0.2,)),
+    1.8: (0.35, (0.2,)),
+    2.0: (0.4, (0.25,)),
+    2.2: (0.45, (0.25,)),
+    2.5: (0.45, (0.35,)),
+    3.0: (0.5, (0.35,)),
+    3.5: (0.6, (0.35,)),
+    4.0: (0.7, (0.5,)),
+    4.5: (0.75, (0.5,)),
+    5.0: (0.8, (0.5,)),
+    5.5: (None, (0.5,)),
+    6.0: (1.0, (0.75,)),
+    7.0: (1.0, (0.75,)),
+    8.0: (1.25, (1.0, 0.75)),
+    9.0: (1.25, (1.0, 0.75)),
+    10.0: (1.5, (1.25, 1.0, 0.75)),
+    11.0: (1.5, (1.0, 0.75)),
+    12.0: (1.75, (1.5, 1.25, 1.0)),
+    14.0: (2.0, (1.5, 1.25, 1.0)),
+    15.0: (None, (1.5, 1.0)),
+    16.0: (2.0, (1.5, 1.0)),
+    17.0: (None, (1.5, 1.0)),
+    18.0: (2.5, (2.0, 1.5, 1.0)),
+    20.0: (2.5, (2.0, 1.5, 1.0)),
+    22.0: (2.5, (2.0, 1.5, 1.0)),
+    24.0: (3.0, (2.0, 1.5, 1.0)),
+    25.0: (None, (2.0, 1.5, 1.0)),
+    26.0: (None, (1.5,)),
+    27.0: (3.0, (2.0, 1.5, 1.0)),
+    28.0: (None, (2.0, 1.5, 1.0)),
+    30.0: (3.5, (3.0, 2.0, 1.5, 1.0)),
+    32.0: (None, (2.0, 1.5)),
+    33.0: (3.5, (3.0, 2.0, 1.5)),
+    35.0: (None, (1.5,)),
+    36.0: (4.0, (3.0, 2.0, 1.5)),
+    38.0: (None, (1.5,)),
+    39.0: (4.0, (3.0, 2.0, 1.5)),
+    40.0: (None, (3.0, 2.0, 1.5)),
+    42.0: (4.5, (4.0, 3.0, 2.0, 1.5)),
+    45.0: (4.5, (4.0, 3.0, 2.0, 1.5)),
+    48.0: (5.0, (4.0, 3.0, 2.0, 1.5)),
+    50.0: (None, (3.0, 2.0, 1.5)),
+    52.0: (5.0, (4.0, 3.0, 2.0, 1.5)),
+    55.0: (None, (4.0, 3.0, 2.0, 1.5)),
+    56.0: (5.5, (4.0, 3.0, 2.0, 1.5)),
+    58.0: (None, (4.0, 3.0, 2.0, 1.5)),
+    60.0: (5.5, (4.0, 3.0, 2.0, 1.5)),
+    62.0: (None, (4.0, 3.0, 2.0, 1.5)),
+    64.0: (6.0, (4.0, 3.0, 2.0, 1.5)),
+}
 
 
 def parse_general_tolerance(text: str) -> GeneralTolerance | None:
@@ -123,15 +186,43 @@ def parse_general_tolerance(text: str) -> GeneralTolerance | None:
 
 def parse_thread(text: str) -> tuple[str, float, float | None, bool, int] | None:
     """``(designation, nominal mm, pitch mm or None for coarse, through, count)`` of a metric
-    thread in a text; the count is the "4x" before it, else 1."""
-    m = _THREAD.search(text)
-    if m is None:
+    thread in a text; the count is the "4x" before it, else 1.
+
+    Only an ISO 261 size is a thread, and not one named after a fastener (``Einpressmutter
+    M6``, ``Schraube M6x20``, ``PEM M4``), after a number (``25 M2``: square metres) or
+    before a colon (``M1:2``: a scale). A pitch is one only if ISO 261 lists it for the
+    size, coarse or fine; any other number after the size (``M6 x 12 tief``, ``M6x20``) is
+    a depth or a length, and the thread is coarse. A fine-only size needs its pitch."""
+    for m in _THREAD.finditer(text):
+        got = _thread(text, m)
+        if got is not None:
+            return got
+    return None
+
+
+def _thread(text: str, m: re.Match[str]) -> tuple[str, float, float | None, bool, int] | None:
+    nominal_text = m.group(2).replace(",", ".")
+    sizes = _ISO_261.get(float(nominal_text))
+    if sizes is None:
         return None
-    nominal = m.group(2).replace(",", ".")
-    pitch = m.group(3).replace(",", ".") if m.group(3) else None
-    designation = f"M{nominal}" + (f"x{pitch}" if pitch else "")
+    before, after = text[: m.start()], text[m.end() :]
+    word = _WORD_BEFORE.search(before)
+    if word is not None and any(f in word.group(1).lower() for f in _FASTENER):
+        return None
+    if m.group(1) is None and re.search(r"\d\s*$", before):
+        return None  # "25 M2": a unit after a number
+    if re.match(r"\s*:", after):
+        return None  # "M1:2": a scale
+    coarse, fine = sizes
+    pitch_text = m.group(3).replace(",", ".") if m.group(3) else None
+    pitch = float(pitch_text) if pitch_text else None
+    if pitch is not None and pitch not in (coarse, *fine):
+        pitch_text = pitch = None  # a depth or a length, not a pitch
+    if pitch is None and coarse is None:
+        return None
+    designation = f"M{nominal_text}" + (f"x{pitch_text}" if pitch_text else "")
     count = max(1, int(m.group(1))) if m.group(1) else 1
-    return designation, float(nominal), float(pitch) if pitch else None, _THROUGH.search(text) is not None, count
+    return designation, float(nominal_text), pitch, _THROUGH.search(text) is not None, count
 
 
 def _gdt_name(text: str) -> str:
@@ -508,7 +599,8 @@ def _map(sheet: SheetPart, data: PmiData) -> tuple[SheetPmi, list[Exception]]:
                 if on is None and sheet._ctx is not None:
                     on = _Sheet(sheet)
                 holes = max(count, _holes(walls, sheet, on), 1)
-                threads.append(Thread(designation, nominal, pitch, through, walls, holes))
+                ids = () if i.kind == "note" else (i.id,)
+                threads.append(Thread(designation, nominal, pitch, through, walls, holes, ids))
         except Exception as e:
             failed.append(e)
         if general is None:
