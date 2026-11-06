@@ -16,7 +16,8 @@ What OCCT's reader gives, and what flatmat makes of it (verified on OCP 8.0.1.1)
   is unreadable: ``upper`` and ``lower`` are None, and ``text`` keeps what was read.
 - ``upper`` and ``lower`` are signed deviations from the nominal: +0.1/+0.05,
   0/-0.2 and -0.05/-0.1 keep their signs. An inverted pair (upper below lower) or a NaN
-  is unreadable.
+  is unreadable. A dimension given only as lower and upper limits has no nominal:
+  ``nominal``, ``upper`` and ``lower`` are None and ``text`` keeps both limits.
 - Graphical-only PMI (a presentation without semantic data) is read as dimensions
   of type ``DimensionPresentation`` or ``CommonLabel``. They never become items: a
   dimension written both ways is one item, and graphical PMI only sets the status
