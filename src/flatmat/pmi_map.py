@@ -13,8 +13,14 @@ A face's flange:
   parallel to it at the sheet thickness (the partner recognition found);
 - a thickness face (a cut edge or a hole wall) takes the flanges of the skin faces it
   shares an edge with, looking through further thickness faces when it touches none.
-  A cut side running along a bent part touches several flanges; a side of an item
-  then sits on the flanges all its faces share.
+  A side of an item sits on the flanges all its faces share. A cut side running along
+  a bent part touches several flanges, and a side on more than one is unmapped (which
+  flange the dimension starts from cannot be told). A diameter's side referenced
+  through the hole's rim edge (the hole wall and a skin plane) is the hole wall.
+- a diameter or radius whose text names a thread (``M6x1.0 - 6H THRU``) is unmapped:
+  the tap holds the tapped size, not the laser; the thread is in :attr:`SheetPmi.threads`.
+  Two sides on opposite skins of one flange, as faces or as edges on them, are the
+  sheet thickness, also unmapped.
 - a bend face, either skin's, and a hole wall that touches one are "on a bend"; a
   face of a formed feature (emboss, extruded hole, louvre, bridge, lance), of an
   engraving, or a countersink's cone and a counterbore's bore and step, is on that
@@ -282,7 +288,11 @@ class _Sheet:
     def route(self, a_set: frozenset[int], b_set: frozenset[int]) -> tuple[int, int, tuple[int, ...]] | None:
         """``(flange a, flange b, bends from a to b)``: the fewest bends, then the lower bend ids.
 
-        A path across a bend made in the punching tool (a lance) is unmapped."""
+        A side on several flanges (a cut side along a bent part) is unmapped: which of its
+        flanges the dimension starts from cannot be told, and picking one could count too
+        few bends. A path across a bend made in the punching tool (a lance) is unmapped."""
+        for ids in (a_set, b_set):
+            _one(ids)
         best: tuple[int, tuple[int, ...], int, int] | None = None
         for a in sorted(a_set):
             reached: dict[tuple[str, int], tuple[int, ...]] = {}  # node -> the bends on the way to it
@@ -310,10 +320,18 @@ class _Sheet:
         return best[2], best[3], best[1]
 
 
+def _one(flanges: frozenset[int]) -> int:
+    """The one flange a side sits on; a side on several is unmapped."""
+    if len(flanges) != 1:
+        raise _Unmapped(f"a side spans flanges {_listed(flanges)}")
+    return next(iter(flanges))
+
+
 # ------------------------------------------------------------------------------ paths
 
 _ORIENTATION = ("perpendicularity", "parallelism", "angularity")
 _SKIN_A, _SKIN_B = frozenset({"skin_a"}), frozenset({"skin_b"})
+_SKINS = _SKIN_A | _SKIN_B
 
 
 def _chain(on: _Sheet, a: _On, b: _On, feature: int | None, what: str = "") -> PmiPath:
@@ -356,19 +374,22 @@ def _path(on: _Sheet, item: PmiItem, datums: dict[str, PmiItem]) -> PmiPath:
         raise _Unmapped("datum")  # a reference, not a tolerance: flatmat_web treats it as a marker
     if kind == "other_gdt":
         raise _Unmapped(f"{_gdt_name(item.text)} is not checked")
-    sides = [on.side(s) for s in item.sides]
+    if kind in ("diameter", "radius") and parse_thread(item.text) is not None:
+        raise _Unmapped("a thread")  # the tap holds the tapped size, not the laser; reported in threads
+    pmi_sides = [_hole_side(on, s) for s in item.sides] if kind in ("diameter", "radius") else item.sides
+    sides = [on.side(s) for s in pmi_sides]
     if not sides:
         raise _Unmapped("refers to no faces")
     feature = next((s.feature for s in sides if s.feature is not None), None)
     if kind in ("diameter", "radius"):
         if any(s.roles - {"thickness"} for s in sides):
             raise _Unmapped(f"a {kind} on a skin face")
-        if any(on.kind.get(i) == "plane" for s in item.sides for i in s.face_ids):
+        if any(on.kind.get(i) == "plane" for s in pmi_sides for i in s.face_ids):
             raise _Unmapped(f"a {kind} on a flat face")
         common = frozenset.intersection(*(s.flanges for s in sides))
         if not common:
             raise _Unmapped(f"a {kind} across flanges")
-        return PmiPath("laser_hole", (min(common),), feature_id=feature)
+        return PmiPath("laser_hole", (_one(common),), feature_id=feature)
     if kind == "flatness":
         common = frozenset.intersection(*(s.flanges for s in sides))
         if len(common) != 1:
@@ -389,11 +410,22 @@ def _path(on: _Sheet, item: PmiItem, datums: dict[str, PmiItem]) -> PmiPath:
         return max(paths, key=lambda p: len(p.bends))  # the farthest datum; the first of equals
     # linear
     if len(sides) == 1:
-        return PmiPath("laser", (min(sides[0].flanges),), feature_id=feature)
+        return PmiPath("laser", (_one(sides[0].flanges),), feature_id=feature)
     a, b = sides[0], sides[1]
-    if {a.roles, b.roles} == {_SKIN_A, _SKIN_B} and a.flanges & b.flanges:
+    # opposite skins of one flange, by their faces or by edges on them: the sheet thickness
+    if {a.roles & _SKINS, b.roles & _SKINS} == {_SKIN_A, _SKIN_B} and a.flanges & b.flanges:
         raise _Unmapped("the sheet thickness")
     return _chain(on, a, b, feature)
+
+
+def _hole_side(on: _Sheet, side: PmiSide) -> PmiSide:
+    """A diameter's side referenced through an edge: the reader gives the edge's two faces,
+    the hole wall and a skin plane. Reduced to the one hole wall."""
+    walls = [i for i in side.face_ids if on.role.get(i) == "thickness" and on.kind.get(i) == "cylinder"]
+    rest = [i for i in side.face_ids if i not in walls]
+    if len(walls) == 1 and rest and all(on.role.get(i) in _SKINS and on.kind.get(i) == "plane" for i in rest):
+        return PmiSide((walls[0],), side.points)
+    return side
 
 
 def _hole_walls(item: PmiItem, sheet: SheetPart) -> tuple[int, ...]:

@@ -10,7 +10,7 @@ from OCP.BRep import BRep_Builder
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
 from OCP.gp import gp_Pnt
 from OCP.TopoDS import TopoDS_Compound
-from pmi_parts import face_at, make_doc_with_pmi, write_step_with_pmi
+from pmi_parts import edge_at, face_at, make_doc_with_pmi, write_step_with_pmi
 
 import flatmat as fm
 from flatmat.pmi import PmiData, PmiItem, PmiSide, read_pmi
@@ -169,7 +169,7 @@ def bracket():
 
 def test_same_flange_is_laser(tmp_path, bracket):
     shape, _, f = bracket
-    items = [dict(kind="linear", nominal=50.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["side"]]))]
+    items = [dict(kind="linear", nominal=16.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]]))]
     sheet, (path,) = _mapped(tmp_path, shape, items)
     assert path == PmiPath("laser", (f["base"],), ())
 
@@ -287,12 +287,15 @@ def test_general_tolerance_from_note(bracket):
 
 
 def test_thread_in_a_dimension_callout(bracket):
-    """Threads come from every text, not only notes: here a diameter's presentation name."""
+    """Threads come from every text, not only notes: here a diameter's callout. The tap holds
+    the tapped size, not the laser, so the diameter itself is unmapped."""
     shape, sheet, f = bracket
-    item = PmiItem(1, "diameter", 8.0, None, None, sides=(PmiSide((f["hole"], f["base_a"])),), text="Ø8; M10x1")
+    text = "M6x1.0 - 6H THRU"
+    item = PmiItem(1, "diameter", 6.0, 0.1, 0.0, sides=(PmiSide((f["hole"], f["base_a"])),), text=text)
     pmi = map_pmi(sheet, PmiData("semantic", (item,)))
     (thread,) = pmi.threads
-    assert (thread.designation, thread.pitch_mm, thread.face_ids) == ("M10x1", 1.0, (f["hole"],))
+    assert (thread.designation, thread.pitch_mm, thread.through, thread.face_ids) == ("M6x1.0", 1.0, True, (f["hole"],))
+    assert pmi.items == ((item, PmiPath("unmapped", reason="a thread")),)
 
 
 def test_unreadable_tolerance_keeps_its_path(bracket):
@@ -472,3 +475,51 @@ def test_coaxial_walls_are_one_hole():
     cbore = parts.make_solid(_case("cbore_L"))
     walls = [face_at(cbore, (28.5, 1, 20), "cylinder"), face_at(cbore, (26.5, -1, 20), "cylinder")]
     assert _note_thread(cbore, "M5", walls).count == 1
+
+
+def _rim(r: float, y: float, cx: float = 20.0, cz: float = 30.0, deg: float = 45.0):
+    """A point on the rim of the L_holes 8 mm hole (centre x = cx, z = cz) on the skin y."""
+    a = math.radians(deg)
+    return (cx + r * math.cos(a), y, cz + r * math.sin(a))
+
+
+def test_hole_diameter_through_an_edge(tmp_path, bracket):
+    """A diameter on the hole's rim edge reads as {hole wall, skin plane}: it is the hole."""
+    shape, _, f = bracket
+    rim = edge_at(shape, _rim(4.0, -1.0))
+    items = [dict(kind="diameter", nominal=8.0, upper=0.1, lower=0.0, edges=([rim],))]
+    sheet, (path,) = _mapped(tmp_path, shape, items)
+    ((item, _),) = sheet.pmi.items
+    ids = item.sides[0].face_ids  # the edge's two faces: the hole wall and one skin
+    assert len(ids) == 2 and f["hole"] in ids and set(ids) - {f["hole"]} <= {f["base_a"], f["base_b"]}
+    assert path == PmiPath("laser_hole", (f["base"],))
+
+
+def test_thickness_through_edges_is_unmapped(tmp_path, bracket):
+    """The two edges of the base's cut end: {skin_a, end} against {skin_b, end} is the thickness."""
+    shape, _, f = bracket
+    items = [
+        dict(
+            kind="linear",
+            nominal=2.0,
+            upper=0.1,
+            lower=-0.1,
+            edges=([edge_at(shape, (0, -1, 50))], [edge_at(shape, (0, 1, 50))]),
+        )
+    ]
+    _, (path,) = _mapped(tmp_path, shape, items)
+    assert path == PmiPath("unmapped", reason="the sheet thickness")
+
+
+def test_side_on_several_flanges_is_unmapped(bracket):
+    """The cut side z = 0 runs along the base, the bend and the flange: which flange a
+    dimension to it starts from cannot be told."""
+    _, sheet, f = bracket
+    reason = f"a side spans flanges {min(f['base'], f['flange'])} and {max(f['base'], f['flange'])}"
+    side, end = PmiSide((f["side"],)), PmiSide((f["end"],))
+    items = (
+        PmiItem(1, "linear", 100.0, None, None, sides=(side,)),
+        PmiItem(2, "position", None, 0.1, None, sides=(side,)),
+        PmiItem(3, "linear", 50.0, None, None, sides=(end, side)),
+    )
+    assert _paths(sheet, *items) == [PmiPath("unmapped", reason=reason)] * 3
