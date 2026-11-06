@@ -370,7 +370,7 @@ def test_pmi_diagnostics_reach_the_sheet(tmp_path, bracket):
     path = os.fspath(tmp_path / "graphical.step")
     write_step_with_pmi(shape, [dict(kind="graphical", faces=([f["end"]], [f["hole"]]))], path)
     sheet = fm.recognize(fm.load_step(path))
-    assert sheet.pmi == SheetPmi("graphical_only")
+    assert sheet.pmi == SheetPmi("graphical_only", graphical=1)
     assert [d.code for d in sheet.diagnostics].count(fm.Code.PMI_GRAPHICAL_ONLY) == 1
 
 

@@ -157,7 +157,7 @@ def test_semantic_and_graphical_copy_is_one_item(tmp_path, bracket):
         dict(kind="graphical", faces=sides),
     ]
     data = _load(tmp_path, shape, items).pmi_for(0)
-    assert data.status == "semantic" and data.diagnostics == ()
+    assert data.status == "semantic" and data.diagnostics == () and data.graphical == 0
     (item,) = data.items
     assert (item.kind, item.nominal) == ("linear", 20.0)
     assert item.anchor is not None  # the presentation's text point
@@ -230,7 +230,7 @@ def test_file_without_pmi_has_status_none(no_pmi_models):
 def test_graphical_only_file_warns(tmp_path, bracket):
     shape, f = bracket
     data = _load(tmp_path, shape, [dict(kind="graphical", faces=([f["end"]], [f["hole"]]))]).pmi_for(0)
-    assert (data.status, data.items) == ("graphical_only", ())
+    assert (data.status, data.items, data.graphical) == ("graphical_only", (), 1)
     (w,) = data.diagnostics
     assert (w.code, w.severity) == (fm.Code.PMI_GRAPHICAL_ONLY, fm.Severity.WARNING)
 
@@ -290,10 +290,12 @@ def test_items_on_another_solid_are_dropped(tmp_path, bracket):
     items = [
         dict(kind="linear", nominal=20.0, faces=([face_at(both, (0, 0, 50))], [face_at(both, (24, 0, 30))])),
         dict(kind="linear", nominal=20.0, faces=([box_top], [face_at(both, (205, 0, 15))])),
+        dict(kind="graphical", faces=([face_at(both, (200, 10, 15))],)),  # on the box, no semantic item's
     ]
     model = _load(tmp_path, both, items)
     assert len(model.solids) == 2
     first, second = model.pmi_for(0), model.pmi_for(1)
+    assert (first.graphical, second.graphical) == (0, 1)  # an annotation on another solid is not this one's
     assert (first.status, [i.id for i in first.items], first.dropped) == ("semantic", [1], 1)
     assert first.items[0].sides[0].face_ids == (f["end"],)
     assert ([i.id for i in second.items], second.dropped) == ([2], 1)
@@ -558,3 +560,20 @@ def test_untoleranced_dimension_not_found_in_the_file_is_unreadable(bracket):
     (item,) = read_pmi(doc, shape).items
     assert (item.nominal, item.tolerance) == (20.0, "unreadable")
     assert item.text == "20 (not found in the file: a fit or a max/min qualifier cannot be ruled out)"
+
+
+def test_graphical_annotation_beside_semantic_pmi_warns(tmp_path, bracket):
+    """A presentation whose faces are not a semantic item's is a callout nobody checks: say so."""
+    shape, f = bracket
+    items = [
+        dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),
+        dict(kind="graphical", faces=([f["side"]], [f["skin"]])),  # faces no semantic item refers to
+        dict(kind="graphical", faces=([f["hole"]], [f["end"]])),  # the semantic item's: a copy of it
+    ]
+    data = _load(tmp_path, shape, items).pmi_for(0)
+    assert (data.status, len(data.items), data.graphical) == ("semantic", 1, 1)
+    (w,) = data.diagnostics
+    assert (w.code, w.severity, w.data["count"]) == (fm.Code.PMI_GRAPHICAL_ONLY, fm.Severity.WARNING, 1)
+    sheet = fm.recognize(fm.load_step(tmp_path / "pmi.step"))
+    assert sheet.pmi.graphical == 1
+    assert [d.code for d in sheet.diagnostics].count(fm.Code.PMI_GRAPHICAL_ONLY) == 1

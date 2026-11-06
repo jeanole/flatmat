@@ -93,6 +93,7 @@ class SheetPmi:
     general: GeneralTolerance | None = None
     notes: tuple[str, ...] = ()
     dropped: int = 0
+    graphical: int = 0  # graphical-only annotations nobody checks (PmiData.graphical)
 
 
 # ------------------------------------------------------------------------------ texts
@@ -485,6 +486,7 @@ def map_pmi(sheet: SheetPart, data: PmiData) -> SheetPmi:
         general,
         tuple(i.text for i in data.items if i.kind == "note"),
         data.dropped,
+        data.graphical,
     )
 
 
@@ -496,6 +498,6 @@ def with_pmi(sheet: SheetPart, data: PmiData) -> SheetPart:
         pmi = map_pmi(sheet, data)
         diags = data.diagnostics
     except Exception as e:  # PMI never refuses a part
-        pmi = SheetPmi("failed", dropped=data.dropped)
+        pmi = SheetPmi("failed", dropped=data.dropped, graphical=data.graphical)
         diags = (*data.diagnostics, warn(Code.PMI_READ_FAILED, f"PMI not mapped onto the sheet: {e!r}"))
     return replace(sheet, pmi=pmi, diagnostics=(*sheet.diagnostics, *diags))

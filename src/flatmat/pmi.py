@@ -29,9 +29,11 @@ What OCCT's reader gives, and what flatmat makes of it (verified on OCP 8.0.1.1)
   (no zone).
 - Graphical-only PMI (a presentation without semantic data) is read as dimensions
   of type ``DimensionPresentation`` or ``CommonLabel``. They never become items: a
-  dimension written both ways is one item, and graphical PMI only sets the status
-  ``"graphical_only"`` (with one ``PMI_GRAPHICAL_ONLY`` warning) when the file has no
-  semantic PMI at all.
+  dimension written both ways is one item. A file with no semantic PMI at all has the
+  status ``"graphical_only"``. Beside semantic PMI, a graphical annotation whose faces are
+  not among one semantic item's faces (or that refers to no faces) is a callout nobody checks:
+  :attr:`PmiData.graphical` counts them, with one ``PMI_GRAPHICAL_ONLY`` warning. One on
+  another solid is not counted; one that repeats a semantic item's faces is silent.
 - Notes do not survive OCCT's STEP round trip (its writer drops them and its reader
   fills no notes table); they are read when a document has them from another source.
   A dimension's ``text`` carries the callout OCCT gives it: the values, its
@@ -127,6 +129,7 @@ class PmiData:
     items: tuple[PmiItem, ...]
     dropped: int = 0  # items whose faces belong to another solid
     diagnostics: tuple[Diagnostic, ...] = ()
+    graphical: int = 0  # graphical-only annotations, not checked: no semantic item refers to their faces
 
 
 _DIM_KINDS: dict[Any, PmiKind] = {
@@ -570,11 +573,13 @@ def _read(doc, solid, step: Sequence[StepDimension], trust_xcaf: bool) -> PmiDat
     )
     items: list[PmiItem] = []
     n_semantic = dropped = graphical = 0
+    presented: list[frozenset[int] | None] = []  # the faces of each graphical annotation
     for _, what, lab in labelled:
         if what == "dim":
             fields, is_graphical = _dimension(lab, faces, matcher)
             if is_graphical:
                 graphical += 1
+                presented.append(_presented(lab, faces))
                 continue
         else:
             fields = _tolerance_item(lab, faces) if what == "tol" else _datum_item(lab, faces)
@@ -593,8 +598,25 @@ def _read(doc, solid, step: Sequence[StepDimension], trust_xcaf: bool) -> PmiDat
             PmiItem(n_semantic, "note", None, None, None, sides=sides, anchor=_anchor(None, sides, faces), text=text)
         )
     if n_semantic:
-        return PmiData("semantic", tuple(items), dropped)
+        semantic_faces = [{f for s in i.sides for f in s.face_ids} for i in items]
+        orphans = sum(1 for k in presented if k is not None and not (k and any(k <= f for f in semantic_faces)))
+        if not orphans:
+            return PmiData("semantic", tuple(items), dropped)
+        return PmiData("semantic", tuple(items), dropped, (_graphical_warning(orphans),), graphical=orphans)
     if graphical:
-        msg = f"{graphical} PMI annotation(s) are graphical only, without semantic data; they are not checked"
-        return PmiData("graphical_only", (), diagnostics=(warn(Code.PMI_GRAPHICAL_ONLY, msg, count=graphical),))
+        return PmiData("graphical_only", (), diagnostics=(_graphical_warning(graphical),), graphical=graphical)
     return PmiData("none", ())
+
+
+def _graphical_warning(n: int) -> Diagnostic:
+    msg = f"{n} PMI annotation(s) are graphical only, without semantic data; they are not checked"
+    return warn(Code.PMI_GRAPHICAL_ONLY, msg, count=n)
+
+
+def _presented(label, faces: _Faces) -> frozenset[int] | None:
+    """The face ids a graphical annotation refers to; None when they are on another solid.
+
+    OCCT's STEP reader keeps only the first shape of a presentation, so an annotation
+    repeats a semantic item when its faces are among the item's."""
+    ids = faces.side([lab for labels in _refs(label) for lab in labels])
+    return None if ids is None else frozenset(ids)
