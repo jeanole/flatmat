@@ -57,6 +57,7 @@ from OCP.XCAFApp import XCAFApp_Application
 from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
 
 from ._occ import OCP_VERSION, LabelSequence, as_edge, as_face, as_solid, as_wire
+from ._pmi_step import StepDimension, step_dimensions
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .pmi import PmiData, read_pmi
 
@@ -84,6 +85,8 @@ class StepModel:
     heal: Heal
     diagnostics: tuple[Diagnostic, ...] = ()
     doc: Any = field(default=None, repr=False, compare=False)  # TDocStd_Document, or None when pmi=False
+    # the file's dimensions as written (flatmat._pmi_step), for the tolerances' signs and units
+    step_dimensions: tuple[StepDimension, ...] = field(default=(), repr=False, compare=False)
     _pmi: dict[int, PmiData] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @property
@@ -101,7 +104,7 @@ class StepModel:
         solid = self.solids[index]
         if index not in self._pmi:
             if self.doc is not None:
-                self._pmi[index] = read_pmi(self.doc, solid)
+                self._pmi[index] = read_pmi(self.doc, solid, self.step_dimensions)
             elif any(d.code is Code.PMI_READ_FAILED for d in self.diagnostics):
                 self._pmi[index] = PmiData("failed", ())
             else:
@@ -170,7 +173,11 @@ class _XcafFailed(Exception):
 
 
 def _read_xcaf(path: str, heal: Heal):
-    """The free shapes of the XCAF document, in root order, and the document.
+    """The free shapes of the XCAF document, in root order, the document, and the file's dimensions.
+
+    The dimensions (:func:`flatmat._pmi_step.step_dimensions`) are read only when the
+    document has any; if reading them fails, they are empty and every toleranced
+    dimension reads as unreadable.
 
     Raises :class:`_XcafFailed` when ``ReadFile`` or ``Transfer`` report a failure.
     """
@@ -191,7 +198,18 @@ def _read_xcaf(path: str, heal: Heal):
     labels = LabelSequence()
     XCAFDoc_DocumentTool.ShapeTool_s(doc.Main()).GetFreeShapes(labels)
     shapes = [XCAFDoc_ShapeTool.GetShape_s(labels.Value(i)) for i in range(1, labels.Length() + 1)]
-    return shapes, doc
+    return shapes, doc, _dimensions_of(reader, doc)
+
+
+def _dimensions_of(reader, doc) -> tuple[StepDimension, ...]:
+    labels = LabelSequence()
+    XCAFDoc_DocumentTool.DimTolTool_s(doc.Main()).GetDimensionLabels(labels)
+    if not labels.Length():
+        return ()
+    try:
+        return step_dimensions(reader.ChangeReader().StepModel())
+    except Exception:  # PMI never refuses a part: the tolerances become unreadable
+        return ()
 
 
 def _solids_of(shapes) -> list:
@@ -216,10 +234,10 @@ def load_step(path: str | os.PathLike, heal: Heal = "fast", *, pmi: bool = True)
         _prepare_78_fast()
     if heal == "full" and _state["fast_78"]:
         diags.append(warn(Code.READ_FAILED, "full healing is unavailable on OCP 7.8 after a fast read in this process"))
-    doc, solids, pmi_failure = None, [], ""
+    doc, solids, pmi_failure, step_dims = None, [], "", ()
     if pmi:
         try:
-            shapes, doc = _read_xcaf(path, heal)
+            shapes, doc, step_dims = _read_xcaf(path, heal)
             solids = _solids_of(shapes)
             if not solids:
                 doc, pmi_failure = None, "XCAF read found no solid"
@@ -244,7 +262,7 @@ def load_step(path: str | os.PathLike, heal: Heal = "fast", *, pmi: bool = True)
                 diags.append(warn(Code.INSIDE_OUT_FIXED, "solid was inside out; reversed"))
             fixed.append(s)
         solids = fixed
-    return StepModel(tuple(solids), path, heal, tuple(diags), doc)
+    return StepModel(tuple(solids), path, heal, tuple(diags), doc, step_dims if doc is not None else ())
 
 
 def ocp_version() -> str:

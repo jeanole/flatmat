@@ -1,0 +1,217 @@
+"""The plus-minus tolerances of a STEP file as the file states them, for :mod:`flatmat.pmi`.
+
+OCCT's XCAF dimension objects lose two things that a tolerance check needs:
+
+- the sign of the lower bound (the reader stores ``Abs(lower_bound)``), and
+- the unit of angular tolerances (the reader converts an angle's nominal to degrees but
+  leaves its tolerance in the file's angle unit).
+
+So :func:`step_dimensions` reads every ``dimensional_location`` / ``dimensional_size``
+of the transferred StepData model, in file order, with its ``plus_minus_tolerance``
+bounds as written and the size of each bound's own unit (mm or degrees per unit).
+:class:`Matcher` then pairs the document's semantic dimensions with these, in order:
+OCCT creates one dimension label per such entity, in file order. A pair is accepted
+only when what XCAF kept agrees with the file (the nominal, the upper bound and the
+lower bound's magnitude). When the next entity disagrees, a later one is taken only if
+every later entity that agrees states the same signed bounds; otherwise the dimension is
+unmatched and its tolerance unreadable.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from OCP.StepBasic import (
+    StepBasic_ConversionBasedUnit,
+    StepBasic_SiPrefix,
+    StepBasic_SiUnit,
+    StepBasic_SiUnitName,
+)
+from OCP.StepShape import (
+    StepShape_DimensionalCharacteristicRepresentation,
+    StepShape_DimensionalLocation,
+    StepShape_DimensionalSize,
+    StepShape_PlusMinusTolerance,
+)
+
+_PREFIXES = {
+    "Exa": 1e18,
+    "Peta": 1e15,
+    "Tera": 1e12,
+    "Giga": 1e9,
+    "Mega": 1e6,
+    "Kilo": 1e3,
+    "Hecto": 1e2,
+    "Deca": 1e1,
+    "Deci": 1e-1,
+    "Centi": 1e-2,
+    "Milli": 1e-3,
+    "Micro": 1e-6,
+    "Nano": 1e-9,
+    "Pico": 1e-12,
+    "Femto": 1e-15,
+    "Atto": 1e-18,
+}
+_METRE = StepBasic_SiUnitName.StepBasic_sunMetre
+_RADIAN = StepBasic_SiUnitName.StepBasic_sunRadian
+
+
+@dataclass(frozen=True)
+class Bound:
+    """A value as the file writes it, and the size of its unit (mm or degrees), None when unknown."""
+
+    raw: float
+    size: float | None
+
+    @property
+    def value(self) -> float | None:
+        return None if self.size is None else self.raw * self.size
+
+
+@dataclass(frozen=True)
+class StepDimension:
+    nominal: Bound | None  # None when the file gives none flatmat can find
+    upper: Bound | None  # the plus_minus_tolerance bounds, signed as written; None without one
+    lower: Bound | None
+
+
+def _unit_size(unit, depth: int = 0) -> float | None:
+    """mm per unit for a length unit, degrees per unit for a plane angle unit, else None."""
+    named = unit.NamedUnit() if hasattr(unit, "NamedUnit") else unit
+    if named is None or depth > 4:
+        return None
+    if isinstance(named, StepBasic_ConversionBasedUnit):
+        factor = _measure(named.ConversionFactor())
+        if factor is None:
+            return None
+        inner = _unit_size(factor[1], depth + 1)
+        return None if inner is None else factor[0] * inner
+    if isinstance(named, StepBasic_SiUnit):
+        scale: float | None = 1.0
+        if named.HasPrefix():
+            scale = _PREFIXES.get(_enum_tail(named.Prefix(), "StepBasic_sp"))
+        if scale is None:
+            return None
+        if named.Name() == _METRE:
+            return 1000.0 * scale
+        if named.Name() == _RADIAN:
+            return math.degrees(1.0) * scale
+    return None
+
+
+def _enum_tail(value: StepBasic_SiPrefix, prefix: str) -> str:
+    return getattr(value, "name", str(value)).split(".")[-1].removeprefix(prefix)
+
+
+def _measure(t) -> tuple[float, Any] | None:
+    """``(value, unit)`` of a measure_with_unit, plain or inside a representation item."""
+    if t is None:
+        return None
+    if hasattr(t, "GetMeasureWithUnit"):
+        t = t.GetMeasureWithUnit()
+    elif hasattr(t, "Measure") and not hasattr(t, "ValueComponent"):
+        t = t.Measure()
+    if t is None or not hasattr(t, "ValueComponent"):
+        return None
+    return t.ValueComponent(), t.UnitComponent()
+
+
+def _bound(t) -> Bound | None:
+    m = _measure(t)
+    return None if m is None else Bound(m[0], _unit_size(m[1]))
+
+
+def _nominal(rep) -> Bound | None:
+    """The first plain measure item of a shape_dimension_representation (what OCCT takes as the nominal)."""
+    for i in range(1, rep.NbItems() + 1):
+        item = rep.ItemsValue(i)
+        name = item.Name().ToCString().lower() if item.Name() is not None else ""
+        if any(w in name for w in ("upper", "lower", "minimum", "maximum")):
+            continue
+        if hasattr(item, "GetQualifiedRepresentationItem") or hasattr(item, "Qualifiers"):
+            continue
+        b = _bound(item)
+        if b is not None:
+            return b
+    return None
+
+
+def step_dimensions(model) -> tuple[StepDimension, ...]:
+    """Every dimensional_location / dimensional_size of ``model`` (a StepData_StepModel), in file order."""
+    dims: list[Any] = []
+    tolerances: dict[Any, Any] = {}
+    nominals: dict[Any, Bound | None] = {}
+    for i in range(1, model.NbEntities() + 1):
+        e = model.Value(i)
+        if isinstance(e, (StepShape_DimensionalLocation, StepShape_DimensionalSize)):
+            dims.append(e)
+        elif isinstance(e, StepShape_PlusMinusTolerance):
+            rng = e.Range()
+            if rng.CaseNumber() == 1:  # a tolerance_value, not limits and fits
+                tolerances[e.TolerancedDimension().Value()] = rng.ToleranceValue()
+        elif isinstance(e, StepShape_DimensionalCharacteristicRepresentation):
+            nominals[e.Dimension().Value()] = _nominal(e.Representation())
+    out = []
+    for d in dims:  # the wrappers are the same Python objects: pybind keeps one per entity while it lives
+        tv = tolerances.get(d)
+        upper = _bound(tv.UpperBound()) if tv is not None else None
+        lower = _bound(tv.LowerBound()) if tv is not None else None
+        out.append(StepDimension(nominals.get(d), upper, lower))
+    return tuple(out)
+
+
+def _close(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-9)
+
+
+def _agrees(kept: float, b: Bound) -> bool:
+    """What XCAF kept equals the file's value converted (lengths), or as written (angular tolerances)."""
+    v = b.value
+    return _close(kept, abs(b.raw)) or (v is not None and _close(kept, abs(v)))
+
+
+@dataclass(frozen=True)
+class Kept:
+    """What OCCT's dimension object kept: the nominal, and the tolerance as XCAF stores it."""
+
+    nominal: float
+    upper: float | None  # None: no plus-minus tolerance; for a negative upper bound, None too
+    lower_magnitude: float | None
+    negative_upper: bool = False  # the reader's 2-value "range": nominal, |lower|
+
+
+def _matches(k: Kept, s: StepDimension) -> bool:
+    if s.nominal is not None and s.nominal.value is not None and not _close(k.nominal, s.nominal.value):
+        return False
+    if k.lower_magnitude is None:
+        return s.upper is None
+    if s.upper is None or s.lower is None or not _agrees(k.lower_magnitude, s.lower):
+        return False
+    if k.negative_upper:
+        return s.upper.raw < 0
+    return k.upper is not None and s.upper.raw >= 0 and _agrees(k.upper, s.upper)
+
+
+class Matcher:
+    """Pairs the document's semantic dimensions, in label order, with the file's (module docstring)."""
+
+    def __init__(self, dims: Sequence[StepDimension]) -> None:
+        self.dims = list(dims)
+        self.next = 0
+
+    def match(self, k: Kept) -> StepDimension | None:
+        n = self.next
+        if n < len(self.dims) and _matches(k, self.dims[n]):
+            self.next = n + 1
+            return self.dims[n]
+        ahead = [j for j in range(n + 1, len(self.dims)) if _matches(k, self.dims[j])]
+        if not ahead:
+            return None
+        signed = {(self.dims[j].upper, self.dims[j].lower) for j in ahead}
+        if len(signed) > 1:
+            return None  # entities that agree with XCAF but differ in sign: no way to tell which
+        self.next = ahead[0] + 1
+        return self.dims[ahead[0]]

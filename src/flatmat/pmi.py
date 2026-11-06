@@ -7,25 +7,25 @@ and bends happens later (:mod:`flatmat.pmi_map`).
 
 What OCCT's reader gives, and what flatmat makes of it (verified on OCP 8.0.1.1):
 
-- Lengths come in mm and angles in degrees: the reader scales values, tolerances and
-  points by the file's length unit and converts angular nominals to degrees. Angular
-  *tolerances* are left in the file's angle unit; that is right for the usual
-  files in degrees, and wrong for a file in radians.
-- A plus-minus tolerance is stored as the upper deviation and the *magnitude* of the
-  lower bound (``Abs``). flatmat gives both as signed deviations from the nominal:
-  ``upper`` as read, ``lower = -magnitude``. A lower bound above the nominal
-  therefore reads as below it; the reader has already lost the sign.
-- A negative upper bound (an inverted pair, or both bounds below the nominal) makes
-  the reader store two values (the nominal and the lower magnitude) as a "range" with
-  the lower bound above the upper. Such a pair, and any NaN, is unreadable: ``upper``
-  and ``lower`` are None and ``text`` keeps what was read.
+- Lengths come in mm and angles in degrees. OCCT scales values, tolerances and points
+  by the file's length unit and converts angular nominals to degrees, but keeps only
+  the *magnitude* of a lower bound and leaves angular tolerances in the file's angle
+  unit. So a document read from STEP takes each tolerance from the file itself
+  (:mod:`flatmat._pmi_step`): the signed bounds as written, converted by their own
+  unit. A tolerance flatmat cannot find in the file, or whose unit it does not know,
+  is unreadable: ``upper`` and ``lower`` are None, and ``text`` keeps what was read.
+- ``upper`` and ``lower`` are signed deviations from the nominal: +0.1/+0.05,
+  0/-0.2 and -0.05/-0.1 keep their signs. An inverted pair (upper below lower) or a NaN
+  is unreadable.
 - Graphical-only PMI (a presentation without semantic data) is read as dimensions
   of type ``DimensionPresentation`` or ``CommonLabel``. They never become items: a
   dimension written both ways is one item, and graphical PMI only sets the status
   ``"graphical_only"`` (with one ``PMI_GRAPHICAL_ONLY`` warning) when the file has no
   semantic PMI at all.
-- OCCT's STEP reader does not fill the notes table; notes are read when the document
-  has them (from another source).
+- Notes do not survive OCCT's STEP round trip (its writer drops them and its reader
+  fills no notes table); they are read when a document has them from another source.
+  A dimension's ``text`` carries the callout OCCT gives it: the values, its
+  descriptions and its presentation's name.
 
 A referenced edge or vertex becomes the faces it bounds. A face is found on the solid
 as it is, and else on the solid without its location (PMI defined on a part that the
@@ -39,7 +39,7 @@ solid it is read for.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -69,6 +69,7 @@ from OCP.XCAFDoc import (
 )
 
 from ._occ import EdgeFaceMap, LabelSequence, ShapeMap, as_face
+from ._pmi_step import Kept, Matcher, StepDimension
 from .diagnostics import Code, Diagnostic, warn
 
 PmiKind = Literal[
@@ -183,7 +184,7 @@ def _text(s) -> str:
 class _Faces:
     """flatmat face ids of the shapes PMI refers to."""
 
-    def __init__(self, solid):
+    def __init__(self, solid) -> None:
         self.solid = solid
         self._maps: list[tuple[Any, Any, Any]] = []
 
@@ -279,35 +280,52 @@ def _sides(faces: _Faces, refs: list[list[TDF_Label]], points: list[Point | None
     return tuple(sides)
 
 
-def _dimension(label, faces: _Faces):
+def _signed(v: float) -> str:
+    return "0" if v == 0 else f"{v:+.6g}"
+
+
+def _values(obj, matcher: Matcher | None) -> tuple[float, float | None, float | None, str]:
+    """``(nominal, upper, lower, tolerance text)`` of a dimension object.
+
+    With a matcher (a document read from STEP) the signed bounds come from the file
+    (:mod:`flatmat._pmi_step`); without one (a document built in memory) from XCAF.
+    """
+    if obj.IsDimWithPlusMinusTolerance():
+        kept = Kept(obj.GetValue(), obj.GetUpperTolValue(), obj.GetLowerTolValue())
+    elif obj.IsDimWithRange():  # what OCCT makes of a negative upper bound: (nominal, |lower|)
+        kept = Kept(obj.GetLowerBound(), None, obj.GetUpperBound(), negative_upper=True)
+    else:
+        return obj.GetValue(), None, None, ""
+    if matcher is None:
+        if kept.upper is None or kept.lower_magnitude is None:
+            return kept.nominal, None, None, " (tolerance unreadable)"
+        raw_up, raw_lo = kept.upper, 0.0 - kept.lower_magnitude
+    else:
+        found = matcher.match(kept)
+        if found is None or found.upper is None or found.lower is None:
+            return kept.nominal, None, None, " (tolerance unreadable: not found in the file)"
+        if found.upper.value is None or found.lower.value is None:
+            return kept.nominal, None, None, f" {_signed(found.upper.raw)}/{_signed(found.lower.raw)} (unit unknown)"
+        raw_up, raw_lo = found.upper.value, found.lower.value
+    upper, lower = tolerance(kept.nominal, raw_up, raw_lo)
+    text = f" {_signed(raw_up)}/{_signed(raw_lo)}" + ("" if upper is not None else " (tolerance unreadable)")
+    return kept.nominal, upper, lower, text
+
+
+def _dimension(label, faces: _Faces, matcher: Matcher | None):
     """``(fields, graphical)``; fields is None when the item is on another solid."""
     obj = XCAFDoc_Dimension.Set_s(label).GetObject()
     dtype = obj.GetType()
     if dtype in _GRAPHICAL:
         return None, True
     kind = _DIM_KINDS.get(dtype, "other_gdt")
+    nominal, upper, lower, tol = _values(obj, matcher)  # before the sides: every dimension takes its turn
     first, second = _refs(label)
     pts = [obj.GetPoint().Coord() if obj.HasPoint() else None, obj.GetPoint2().Coord() if obj.HasPoint2() else None]
     sides = _sides(faces, [first, second], pts)
     if sides is None:
         return None, False
     unit = "°" if kind == "angle" else ""
-    if obj.IsDimWithPlusMinusTolerance():
-        nominal, raw_up, raw_lo = obj.GetValue(), obj.GetUpperTolValue(), 0.0 - obj.GetLowerTolValue()
-        upper, lower = tolerance(nominal, raw_up, raw_lo)
-        tol = f" +{_num(raw_up)}/{_num(raw_lo)}" if raw_lo else f" +{_num(raw_up)}/-0"
-        tol += "" if upper is not None else " (tolerance unreadable)"
-    elif obj.IsDimWithRange():
-        lo_b, up_b = obj.GetLowerBound(), obj.GetUpperBound()
-        if tolerance(None, up_b, lo_b) == (None, None):  # what the reader makes of an inverted pair
-            nominal, upper, lower = lo_b, None, None
-            tol = f" (tolerance unreadable: {_num(lo_b)}, {_num(up_b)})"
-        else:
-            nominal = (lo_b + up_b) / 2
-            upper, lower = up_b - nominal, lo_b - nominal
-            tol = f" ({_num(lo_b)}..{_num(up_b)})"
-    else:
-        nominal, upper, lower, tol = obj.GetValue(), None, None, ""
     name = _text(obj.GetSemanticName())
     if kind == "other_gdt":
         name = name or _enum_name(dtype, "XCAFDimTolObjects_DimensionType_")
@@ -316,11 +334,12 @@ def _dimension(label, faces: _Faces):
         text = f"{name} {text}"
     for i in range(1, obj.NbDescriptions() + 1):
         text += f"; {_text(obj.GetDescription(i))}"
-    if math.isnan(nominal):
-        nominal = None
+    if _text(obj.GetPresentationName()):
+        text += f"; {_text(obj.GetPresentationName())}"
     text_point = obj.GetPointTextAttach().Coord() if obj.HasTextPoint() else None
+    value = None if math.isnan(nominal) else nominal
     return (
-        dict(kind=kind, nominal=nominal, upper=upper, lower=lower, sides=sides, text=text, text_point=text_point),
+        dict(kind=kind, nominal=value, upper=upper, lower=lower, sides=sides, text=text, text_point=text_point),
         False,
     )
 
@@ -424,18 +443,22 @@ def _entry(label) -> str:
     return s.ToCString()
 
 
-def read_pmi(doc, solid) -> PmiData:
+def read_pmi(doc, solid, step: Sequence[StepDimension] | None = None) -> PmiData:
     """The semantic PMI of ``doc`` that refers to ``solid`` (see the module docstring).
+
+    ``step`` is what :func:`flatmat._pmi_step.step_dimensions` read from the STEP file the
+    document came from; tolerances come from there. None means the document was not read
+    from STEP (it was built in memory), and XCAF's own values are used.
 
     Never raises: any error gives status ``"failed"`` with a ``PMI_READ_FAILED`` warning.
     """
     try:
-        return _read(doc, solid)
+        return _read(doc, solid, None if step is None else Matcher(step))
     except Exception as e:  # PMI never refuses a part
         return PmiData("failed", (), diagnostics=(warn(Code.PMI_READ_FAILED, f"PMI not read: {e!r}"),))
 
 
-def _read(doc, solid) -> PmiData:
+def _read(doc, solid, matcher: Matcher | None) -> PmiData:
     faces = _Faces(solid)
     tool = XCAFDoc_DocumentTool.DimTolTool_s(doc.Main())
     dims, tols, datums = LabelSequence(), LabelSequence(), LabelSequence()
@@ -452,7 +475,7 @@ def _read(doc, solid) -> PmiData:
     n_semantic = dropped = graphical = 0
     for _, what, lab in labelled:
         if what == "dim":
-            fields, is_graphical = _dimension(lab, faces)
+            fields, is_graphical = _dimension(lab, faces, matcher)
             if is_graphical:
                 graphical += 1
                 continue

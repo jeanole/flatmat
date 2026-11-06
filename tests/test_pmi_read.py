@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 
 import parts
 import pytest
@@ -15,6 +16,7 @@ from OCP.TopoDS import TopoDS_Compound
 from pmi_parts import centroid, edge_at, face_at, make_doc_with_pmi, write_step_with_pmi
 
 import flatmat as fm
+from flatmat._pmi_step import Bound, Kept, Matcher, StepDimension
 from flatmat.pmi import PmiData, PmiSide, read_pmi, tolerance
 
 # The L_holes case: t = 2, a 50 long base along +x at y in [-1, 1], 100 wide in z, with an
@@ -102,8 +104,15 @@ def test_inch_gdt_zone_reads_in_mm(tmp_path, bracket):
 
 @pytest.mark.parametrize(
     "upper, lower, expected",
-    [(0.1, 0.0, (0.1, 0.0)), (0.0, -0.2, (0.0, -0.2)), (0.2, -0.05, (0.2, -0.05)), (-0.1, 0.1, (None, None))],
-    ids=["plus_only", "minus_only", "asymmetric", "inverted"],
+    [
+        (0.1, 0.0, (0.1, 0.0)),
+        (0.0, -0.2, (0.0, -0.2)),
+        (0.2, -0.05, (0.2, -0.05)),
+        (0.1, 0.05, (0.1, 0.05)),  # both above: OCCT keeps only |lower|, the sign comes from the file
+        (-0.05, -0.1, (-0.05, -0.1)),  # both below: OCCT stores this as a broken range
+        (-0.1, 0.1, (None, None)),
+    ],
+    ids=["plus_only", "minus_only", "asymmetric", "both_above", "both_below", "inverted"],
 )
 def test_one_sided_and_inverted_tolerances(tmp_path, bracket, upper, lower, expected):
     shape, f = bracket
@@ -150,6 +159,7 @@ def test_semantic_and_graphical_copy_is_one_item(tmp_path, bracket):
     (item,) = data.items
     assert (item.kind, item.nominal) == ("linear", 20.0)
     assert item.anchor is not None  # the presentation's text point
+    assert item.text == "20 +0.1/-0.1; PMI 1"  # the callout keeps the presentation's name
 
 
 def test_gdt_position_with_datums(tmp_path, bracket):
@@ -192,7 +202,7 @@ def test_diameter_and_edge_reference(tmp_path, bracket):
         dict(kind="linear", nominal=30.0, upper=0.2, lower=-0.2, edges=([f["corner"]],), faces=([], [f["hole"]])),
     ]
     dia, lin = _load(tmp_path, shape, items).pmi_for(0).items
-    assert (dia.kind, dia.nominal, dia.upper, dia.lower, dia.text) == ("diameter", 8.0, 0.1, 0.0, "Ø8 +0.1/-0")
+    assert (dia.kind, dia.nominal, dia.upper, dia.lower, dia.text) == ("diameter", 8.0, 0.1, 0.0, "Ø8 +0.1/0")
     assert dia.sides == (PmiSide((f["hole"],)),)
     assert lin.sides[0].face_ids == tuple(sorted((f["end"], f["skin"])))  # an edge becomes the faces it bounds
     assert lin.sides[1].face_ids == (f["hole"],)
@@ -312,13 +322,69 @@ def test_notes_in_the_document(bracket):
     assert (general.text, general.sides, general.anchor) == ("ISO 2768-mK", (), None)
 
 
-@pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="OCCT's reader leaves angular tolerances in the file's unit"
-)
 def test_angle_tolerance_reads_in_degrees(tmp_path, bracket):
     shape, f = bracket
     rad = math.radians
-    items = [dict(kind="angle", nominal=rad(90.0), upper=rad(0.5), lower=-rad(0.5), faces=([f["end"]], [f["skin"]]))]
+    items = [dict(kind="angle", nominal=rad(90.0), upper=rad(0.5), lower=-rad(0.25), faces=([f["end"]], [f["skin"]]))]
     (item,) = _load(tmp_path, shape, items).pmi_for(0).items  # OCCT writes angles in radians
     assert item.nominal == pytest.approx(90.0)
-    assert (item.upper, item.lower) == pytest.approx((0.5, -0.5))
+    assert (item.upper, item.lower) == pytest.approx((0.5, -0.25))
+    assert item.text == "90° +0.5/-0.25"
+
+
+def test_angle_tolerance_in_an_unknown_unit_is_unreadable(tmp_path, bracket):
+    """The angle tolerance's unit replaced by the file's solid-angle unit: no way to say what it is in degrees."""
+    shape, f = bracket
+    items = [dict(kind="angle", nominal=math.radians(90.0), upper=0.01, lower=-0.01, faces=([f["end"]], [f["skin"]]))]
+    path = tmp_path / "steradian.step"
+    write_step_with_pmi(shape, items, str(path))
+    step = path.read_text()
+    (angle_unit,) = re.findall(
+        r"^(#\d+) = \( NAMED_UNIT\(\*\) PLANE_ANGLE_UNIT\(\) SI_UNIT\(\$,\.RADIAN\.\) \);", step, re.M
+    )
+    (solid_angle,) = re.findall(
+        r"^(#\d+) = \( NAMED_UNIT\(\*\) SI_UNIT\(\$,\.STERADIAN\.\) SOLID_ANGLE_UNIT\(\) \);", step, re.M
+    )
+    step, n = re.subn(
+        rf"^(#\d+ = MEASURE_WITH_UNIT\([^,]+,){angle_unit}\);", rf"\g<1>{solid_angle});", step, flags=re.M
+    )
+    assert n == 2  # the tolerance's two bounds; the nominal keeps its radians
+    path.write_text(step)
+    (item,) = fm.load_step(path).pmi_for(0).items
+    assert item.nominal == pytest.approx(90.0)
+    assert (item.upper, item.lower) == (None, None)
+    assert item.text == "90° +0.01/-0.01 (unit unknown)"
+
+
+def test_same_magnitudes_with_different_signs_keep_their_own(tmp_path, bracket):
+    """XCAF cannot tell +0.1/+0.05 from +0.1/-0.05; the file order can."""
+    shape, f = bracket
+    sides = ([f["end"]], [f["hole"]])
+    items = [dict(kind="linear", nominal=20.0, upper=0.1, lower=lo, faces=sides) for lo in (0.05, -0.05, 0.05)]
+    got = [(i.upper, i.lower) for i in _load(tmp_path, shape, items).pmi_for(0).items]
+    assert got == [(0.1, 0.05), (0.1, -0.05), (0.1, 0.05)]
+
+
+def test_tolerance_not_found_in_the_file_is_unreadable(bracket):
+    """A document said to come from a STEP file whose dimensions could not be read."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(shape, [dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]],))])
+    (item,) = read_pmi(doc, shape, step=()).items
+    assert (item.nominal, item.upper, item.lower) == (20.0, None, None)
+    assert item.text == "20 (tolerance unreadable: not found in the file)"
+    (kept,) = read_pmi(doc, shape).items  # built in memory: XCAF's own values
+    assert (kept.upper, kept.lower) == (0.1, -0.1)
+
+
+def _dim(nominal, upper, lower):
+    return StepDimension(Bound(nominal, 1.0), Bound(upper, 1.0), Bound(lower, 1.0))
+
+
+def test_matcher_pairs_in_file_order_and_refuses_ambiguity():
+    kept = Kept(20.0, 0.1, 0.05)  # what XCAF keeps of both +0.1/+0.05 and +0.1/-0.05
+    m = Matcher([_dim(20.0, 0.1, 0.05), _dim(20.0, 0.1, -0.05)])
+    assert m.match(kept).lower.raw == 0.05 and m.match(kept).lower.raw == -0.05 and m.match(kept) is None
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, 0.05), _dim(20.0, 0.1, -0.05)])
+    assert m.match(kept) is None  # the next one disagrees, and the two that agree differ in sign
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, -0.05)])
+    assert m.match(kept).lower.raw == -0.05 and m.next == 2  # skipped ahead: every candidate says the same
