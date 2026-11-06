@@ -12,13 +12,14 @@ A face's flange:
 - a plane of the other skin (``skin_b``) takes the flange of the reference-skin plane
   parallel to it at the sheet thickness (the partner recognition found);
 - a thickness face (a cut edge or a hole wall) takes the flanges of the skin faces it
-  shares an edge with, looking through further thickness faces when it touches none
-  (a counterbore's floor). A cut side running along a bent part touches several
-  flanges; a side of an item then sits on the flanges all its faces share.
+  shares an edge with, looking through further thickness faces when it touches none.
+  A cut side running along a bent part touches several flanges; a side of an item
+  then sits on the flanges all its faces share.
 - a bend face, either skin's, and a hole wall that touches one are "on a bend"; a
-  face of a formed feature (emboss, extruded hole, louvre, bridge, lance) or of an
-  engraving is on that feature. Both are unmapped. Countersinks and counterbores are
-  holes of their flange, with :attr:`PmiPath.feature_id` set.
+  face of a formed feature (emboss, extruded hole, louvre, bridge, lance), of an
+  engraving, or a countersink's cone and a counterbore's bore and step, is on that
+  feature. Both are unmapped. The through-bore of a countersink or counterbore is
+  laser-cut: a hole of its flange, with :attr:`PmiPath.feature_id` set.
 
 Between two flanges the path is the shortest chain of bends in the flange/bend graph
 (one edge per bend between its flanges), ties broken by the lower bend ids. GD&T
@@ -28,9 +29,10 @@ and flatness of one flange. Every other type is unmapped, with the reason in pla
 English. An item whose tolerance could not be read keeps its path: whether it is
 checked is decided downstream.
 
-Threads (``M6``, ``M8x1``, ``M6 THRU``) and the general tolerance (``ISO 2768-mK``,
+Threads (``M6``, ``M8x1``, ``M6 THRU``, ``4x M5``) and the general tolerance (``ISO 2768-mK``,
 ``DIN 6930-m``) are parsed from every text the reader yields: dimension callouts,
-presentation names and notes.
+presentation names and notes. A thread's count is the larger of the callout's
+``4x`` and the number of holes it points at (coaxial walls are one hole).
 """
 
 from __future__ import annotations
@@ -65,7 +67,8 @@ class Thread:
     nominal_mm: float
     pitch_mm: float | None  # None = coarse
     through: bool
-    face_ids: tuple[int, ...]  # the hole wall it points at
+    face_ids: tuple[int, ...]  # the hole walls it points at
+    count: int = 1  # how many threads: the callout's "4x", or the holes it points at if more
 
 
 @dataclass(frozen=True)
@@ -95,8 +98,8 @@ _GENERAL = re.compile(
     re.IGNORECASE,
 )
 _STANDARDS: dict[str, Literal["ISO 2768", "DIN 6930"]] = {"2768": "ISO 2768", "6930": "DIN 6930"}
-_THREAD = re.compile(  # M6, M8x1, 4xM5: an M not inside a word (a count like "4x" may precede it)
-    r"(?:(?<![A-Za-z0-9])|(?<=\d[xX×]))M(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?(?![\d.,]*\d)"
+_THREAD = re.compile(  # M6, M8x1, 4x M5, 4xM5: an M not inside a word, maybe after a count "4x"
+    r"(?<![A-Za-z0-9.,])(?:(\d+)\s*[xX×]\s*)?M(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?(?![\d.,]*\d)"
 )
 _THROUGH = re.compile(r"\b(?:thru|through|durchgehend|durchg\.?)(?![A-Za-z])", re.IGNORECASE)
 
@@ -110,15 +113,17 @@ def parse_general_tolerance(text: str) -> GeneralTolerance | None:
     return GeneralTolerance(_STANDARDS[m.group(1)], m.group(2).lower(), geometric, text.strip())
 
 
-def parse_thread(text: str) -> tuple[str, float, float | None, bool] | None:
-    """``(designation, nominal mm, pitch mm or None for coarse, through)`` of a metric thread in a text."""
+def parse_thread(text: str) -> tuple[str, float, float | None, bool, int] | None:
+    """``(designation, nominal mm, pitch mm or None for coarse, through, count)`` of a metric
+    thread in a text; the count is the "4x" before it, else 1."""
     m = _THREAD.search(text)
     if m is None:
         return None
-    nominal = m.group(1).replace(",", ".")
-    pitch = m.group(2).replace(",", ".") if m.group(2) else None
+    nominal = m.group(2).replace(",", ".")
+    pitch = m.group(3).replace(",", ".") if m.group(3) else None
     designation = f"M{nominal}" + (f"x{pitch}" if pitch else "")
-    return designation, float(nominal), float(pitch) if pitch else None, _THROUGH.search(text) is not None
+    count = max(1, int(m.group(1))) if m.group(1) else 1
+    return designation, float(nominal), float(pitch) if pitch else None, _THROUGH.search(text) is not None, count
 
 
 def _gdt_name(text: str) -> str:
@@ -166,6 +171,14 @@ class _Sheet:
         self.bend_faces = {s.face_id for b in sheet.bends for s in b.segments if s.face_id}
         self.sharp = [frozenset(se.faces) for se in ctx.sharp_edges.values()]
         self.feature: dict[int, Feature] = {i: feat for feat in sheet.features for i in feat.face_ids}
+        # the laser-cut through-bore of a countersink or counterbore: its cylinder of the through diameter
+        self.through_bore = {
+            i
+            for i, feat in self.feature.items()
+            if feat.kind_info.flat == "hole"
+            and ctx.faces[i - 1].kind == "cylinder"
+            and abs(2 * ctx.faces[i - 1].radius - feat.through_diameter) <= 1e-3
+        }
         self.partners: dict[int, int] = ctx.partners
         # bends made in the punching tool (a lance's tab), not on the press brake
         self.tool_bent = {
@@ -236,7 +249,7 @@ class _Sheet:
         if self._on_bend(i):
             raise _Unmapped("on a bend")
         feat = self.feature.get(i)
-        if feat is not None and feat.kind_info.flat != "hole":
+        if feat is not None and i not in self.through_bore:  # a cone, a counterbore's bore or step, a form
             raise _Unmapped(f"on {_a(feat.kind_info.name)}")
         role = self.role.get(i)
         if role is None:
@@ -340,7 +353,7 @@ def _datum(on: _Sheet, name: str, datums: dict[str, PmiItem]) -> _On:
 def _path(on: _Sheet, item: PmiItem, datums: dict[str, PmiItem]) -> PmiPath:
     kind = item.kind
     if kind == "datum":
-        raise _Unmapped("a datum, not a tolerance")
+        raise _Unmapped("datum")  # a reference, not a tolerance: flatmat_web treats it as a marker
     if kind == "other_gdt":
         raise _Unmapped(f"{_gdt_name(item.text)} is not checked")
     sides = [on.side(s) for s in item.sides]
@@ -388,6 +401,25 @@ def _hole_walls(item: PmiItem, sheet: SheetPart) -> tuple[int, ...]:
     return tuple(sorted({i for s in item.sides for i in s.face_ids if i in walls}))
 
 
+def _holes(walls: tuple[int, ...], sheet: SheetPart) -> int:
+    """How many holes the walls are: coaxial walls are one hole (a wall split into two
+    faces, a counterbore's bore over its through-bore)."""
+    ctx = sheet._ctx
+    if ctx is None:
+        return len(walls)
+    axes = set()
+    for i in walls:
+        f = ctx.faces[i - 1]
+        d = f.axis_d.Normalized()
+        dx, dy, dz = (round(c, 4) + 0.0 for c in (d.X(), d.Y(), d.Z()))
+        if next(c for c in (dx, dy, dz) if c != 0.0) < 0:
+            dx, dy, dz = -dx, -dy, -dz
+        px, py, pz = f.axis_p.X(), f.axis_p.Y(), f.axis_p.Z()
+        t = px * dx + py * dy + pz * dz  # the foot of the axis nearest the origin names the line
+        axes.add((dx, dy, dz, *(round(c, 3) + 0.0 for c in (px - t * dx, py - t * dy, pz - t * dz))))
+    return len(axes)
+
+
 def map_pmi(sheet: SheetPart, data: PmiData) -> SheetPmi:
     """The PMI of ``data`` on ``sheet`` (read from the same solid): see the module docstring."""
     items = [i for i in data.items if i.kind != "note"]
@@ -409,7 +441,9 @@ def map_pmi(sheet: SheetPart, data: PmiData) -> SheetPmi:
     for i in data.items:
         got = parse_thread(i.text)
         if got is not None:
-            threads.append(Thread(*got, face_ids=_hole_walls(i, sheet)))
+            designation, nominal, pitch, through, count = got
+            walls = _hole_walls(i, sheet)
+            threads.append(Thread(designation, nominal, pitch, through, walls, max(count, _holes(walls, sheet), 1)))
         if general is None:
             general = parse_general_tolerance(i.text)
     return SheetPmi(

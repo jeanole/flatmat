@@ -1,5 +1,6 @@
 """PMI on the sheet: paths through flanges and bends, threads, general tolerance (plan 7, Task 4)."""
 
+import dataclasses
 import math
 import os
 
@@ -45,10 +46,10 @@ def test_parse_general_tolerance(text, expected):
 @pytest.mark.parametrize(
     "text, expected",
     [
-        ("M6", ("M6", 6.0, None, False)),
-        ("M8x1", ("M8x1", 8.0, 1.0, False)),
-        ("M6 THRU", ("M6", 6.0, None, True)),
-        ("4x M5 durchgehend", ("M5", 5.0, None, True)),
+        ("M6", ("M6", 6.0, None, False, 1)),
+        ("M8x1", ("M8x1", 8.0, 1.0, False, 1)),
+        ("M6 THRU", ("M6", 6.0, None, True, 1)),
+        ("4x M5 durchgehend", ("M5", 5.0, None, True, 4)),
         ("Ø6.6", None),
         ("M", None),
     ],
@@ -75,9 +76,10 @@ def test_parse_general_tolerance_variants(text, expected):
 @pytest.mark.parametrize(
     "text, expected",
     [
-        ("M8 x 1,25", ("M8x1.25", 8.0, 1.25, False)),
-        ("20 +0.1/-0.1; M10 through", ("M10", 10.0, None, True)),
-        ("4xM5", ("M5", 5.0, None, False)),
+        ("M8 x 1,25", ("M8x1.25", 8.0, 1.25, False, 1)),
+        ("20 +0.1/-0.1; M10 through", ("M10", 10.0, None, True, 1)),
+        ("4xM5", ("M5", 5.0, None, False, 4)),
+        ("6 x M4x0.7 THRU", ("M4x0.7", 4.0, 0.7, True, 6)),
         ("MM", None),
         ("SUM6", None),
         ("PMI 1", None),
@@ -231,7 +233,7 @@ def test_perpendicularity_is_bend_angle(tmp_path, u_channel):
     ]
     by_kind = {item.kind: path for item, path in _mapped_items(tmp_path, shape, items)}
     assert by_kind == {
-        "datum": PmiPath("unmapped", reason="a datum, not a tolerance"),
+        "datum": PmiPath("unmapped", reason="datum"),
         "perpendicularity": PmiPath("bend_angle", (f2, f1), (_bend_between(sheet, f1, f2),)),
     }
 
@@ -272,6 +274,7 @@ def test_thread_from_hole_callout(bracket):
     pmi = _in_memory(shape, [dict(kind="note", text="M6 THRU", faces=([f["hole"]],))])
     (thread,) = pmi.threads
     assert (thread.designation, thread.nominal_mm, thread.pitch_mm, thread.through) == ("M6", 6.0, None, True)
+    assert thread.count == 1
     assert thread.face_ids == (f["hole"],)
     assert pmi.notes == ("M6 THRU",) and pmi.items == ()
 
@@ -405,3 +408,67 @@ def test_no_path_crosses_a_lance():
     paths = [p for _, p in map_pmi(sheet, PmiData("semantic", items)).items]
     assert all(lance.bend_id not in p.bends for p in paths)
     assert PmiPath("unmapped", reason="across a lance") in paths and PmiPath("unmapped", reason="on a lance") in paths
+
+
+def _paths(sheet, *items) -> list[PmiPath]:
+    return [p for _, p in map_pmi(sheet, PmiData("semantic", tuple(items))).items]
+
+
+def test_countersink_cone_and_counterbore_step_are_unmapped():
+    """Only the through-bore is laser-cut: a side on a countersink's cone, or on a
+    counterbore's bore or step, is not."""
+    csk = parts.make_solid(_case("csk_L"))  # t = 3; a 90° cone from Ø10 at y = 1.5 to Ø6 at y = -0.5, x = 24, z = 20
+    sheet = fm.recognize(csk)
+    end, cone = face_at(csk, (0, 0, 50), "plane"), face_at(csk, (28, 0.5, 20))
+    assert next(x for x in sheet.features if cone in x.face_ids).kind == "countersink"
+    linear = PmiItem(1, "linear", 24.0, None, None, sides=(PmiSide((end,)), PmiSide((cone,))))
+    diameter = PmiItem(2, "diameter", 10.0, None, None, sides=(PmiSide((cone,)),))
+    assert _paths(sheet, linear, diameter) == [PmiPath("unmapped", reason="on a countersink")] * 2
+
+    cbore = parts.make_solid(_case("cbore_L"))  # t = 4; Ø9 bore 2 deep from y = 2 over a Ø5 hole, x = 24, z = 20
+    sheet = fm.recognize(cbore)
+    bore, step = face_at(cbore, (28.5, 1, 20), "cylinder"), face_at(cbore, (27, 0, 20), "plane")
+    items = [PmiItem(1, "diameter", 9.0, None, None, sides=(PmiSide((bore,)),))]
+    items.append(
+        PmiItem(2, "linear", 2.0, None, None, sides=(PmiSide((step,)), PmiSide((face_at(cbore, (0, 0, 50)),))))
+    )
+    assert _paths(sheet, *items) == [PmiPath("unmapped", reason="on a counterbore")] * 2
+
+
+def test_counterbore_through_bore_is_laser_hole():
+    cbore = parts.make_solid(_case("cbore_L"))
+    sheet = fm.recognize(cbore)
+    wall = face_at(cbore, (26.5, -1, 20), "cylinder")  # the Ø5 through-bore under the counterbore
+    (feature,) = (x for x in sheet.features if wall in x.face_ids)
+    base = _flange_of(sheet, _skins_at(sheet, cbore, (10, -2, 50), (10, 2, 50))[0])
+    (path,) = _paths(sheet, PmiItem(1, "diameter", 5.0, 0.1, 0.0, sides=(PmiSide((wall,)),)))
+    assert path == PmiPath("laser_hole", (base,), feature_id=feature.id)
+
+
+def _note_thread(shape, text, walls):
+    (thread,) = _in_memory(shape, [dict(kind="note", text=text, faces=(list(walls),))]).threads
+    return thread
+
+
+def test_thread_count_from_the_callout(bracket):
+    shape, _, f = bracket
+    thread = _note_thread(shape, "4x M5", [f["hole"]])
+    assert (thread.designation, thread.count, thread.face_ids) == ("M5", 4, (f["hole"],))
+    assert _note_thread(shape, "M6", [f["hole"]]).count == 1
+
+
+def test_thread_count_from_the_holes_it_points_at():
+    """L_holes with three holes in its base: an "M6" pointing at all three walls is three threads."""
+    part = dataclasses.replace(_case("L_holes"), holes=[("flat", 0, 0.4, z, 5.0) for z in (20.0, 50.0, 80.0)])
+    shape = parts.make_solid(part)
+    walls = [face_at(shape, (22.5, 0, z), "cylinder") for z in (20.0, 50.0, 80.0)]
+    thread = _note_thread(shape, "M6", walls)
+    assert (thread.count, thread.face_ids) == (3, tuple(sorted(walls)))
+    assert _note_thread(shape, "2x M6", walls).count == 3  # the larger of the two
+
+
+def test_coaxial_walls_are_one_hole():
+    """A counterbore's bore and its through-bore are two walls of one hole."""
+    cbore = parts.make_solid(_case("cbore_L"))
+    walls = [face_at(cbore, (28.5, 1, 20), "cylinder"), face_at(cbore, (26.5, -1, 20), "cylinder")]
+    assert _note_thread(cbore, "M5", walls).count == 1
