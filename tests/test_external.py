@@ -11,6 +11,7 @@ import json
 import os
 
 import pytest
+from conftest import assert_pmi_read_identical
 
 import flatmat as fm
 
@@ -40,6 +41,13 @@ def test_bendfm(i):
     assert pat.area == pytest.approx(theirs, rel=1e-4)
 
 
+@pytest.mark.skipif(not BENDFM, reason="FLATMAT_BENDFM_DIR not set")
+@pytest.mark.parametrize("i", _bendfm_ids() or [None])
+@pytest.mark.parametrize("suffix", ["", "_unfolded"])
+def test_bendfm_pmi_read_identical(i, suffix, tmp_path):
+    assert_pmi_read_identical(os.path.join(BENDFM, f"{i}{suffix}.stp"), tmp_path, k=0.45)
+
+
 def _part_files():
     if not PARTS:
         return []
@@ -52,6 +60,12 @@ def test_private_part(path):
     pat = fm.unfold_step(path, k=0.44)
     assert pat.meta["area_rel_err"] < 1e-4
     assert pat.bends
+
+
+@pytest.mark.skipif(not PARTS, reason="FLATMAT_PARTS_DIR not set")
+@pytest.mark.parametrize("path", _part_files() or [None], ids=lambda p: os.path.basename(p or "none"))
+def test_private_part_pmi_read_identical(path, tmp_path):
+    assert_pmi_read_identical(path, tmp_path, k=0.44)
 
 
 @pytest.mark.skipif(not BENDFM, reason="FLATMAT_BENDFM_DIR not set")

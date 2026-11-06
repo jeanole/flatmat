@@ -19,13 +19,25 @@ Healing modes:
 
 ``full``
     The reader's default healing.
+
+Reading through XCAF (``pmi=True``, the default):
+
+The file is read with ``STEPCAFControl_Reader`` into a ``TDocStd_Document`` so the
+semantic PMI (AP242 GD&T) can be read from it later; :attr:`StepModel.doc` keeps it.
+The XCAF reader drives the same ``STEPControl_Reader`` (``ChangeReader()``), so the
+healing above applies unchanged: on 8.0 the fix parameters are set on that inner
+reader after ``ReadFile``; on 7.8 the resource file is process-wide anyway. Colours
+are not read. The solids are taken from ``XCAFDoc_ShapeTool.GetFreeShapes``, one
+free shape per transferred root in root order, which is the order ``OneShape()``
+gives. If the XCAF read fails or finds no solid, the plain reader reads the file
+again and the document is None: PMI never refuses a part.
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from OCP.BRep import BRep_Tool
@@ -33,11 +45,16 @@ from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.ShapeFix import ShapeFix_Wire
+from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.STEPControl import STEPControl_Reader
+from OCP.TCollection import TCollection_ExtendedString
+from OCP.TDocStd import TDocStd_Document
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SOLID, TopAbs_WIRE
 from OCP.TopExp import TopExp_Explorer
+from OCP.XCAFApp import XCAFApp_Application
+from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
 
-from ._occ import OCP_VERSION, as_edge, as_face, as_solid, as_wire
+from ._occ import OCP_VERSION, LabelSequence, as_edge, as_face, as_solid, as_wire
 from .diagnostics import Code, Diagnostic, refuse, warn
 
 Heal = Literal["fast", "full"]
@@ -57,12 +74,13 @@ _state = {"read_once": False, "fast_78": False}
 
 @dataclass(frozen=True)
 class StepModel:
-    """A STEP file reduced to its solids."""
+    """A STEP file reduced to its solids, and the XCAF document it was read into."""
 
     solids: tuple[Any, ...]
     path: str
     heal: Heal
     diagnostics: tuple[Diagnostic, ...] = ()
+    doc: Any = field(default=None, repr=False, compare=False)  # TDocStd_Document, or None when pmi=False
 
     @property
     def solid(self):
@@ -114,13 +132,8 @@ def add_missing_pcurves(shape) -> int:
     return fixed
 
 
-def load_step(path: str | os.PathLike, heal: Heal = "fast") -> StepModel:
-    path = os.fspath(path)
-    diags: list[Diagnostic] = []
-    if heal == "fast" and not _HAS_FIX_PARAMETERS:
-        _prepare_78_fast()
-    if heal == "full" and _state["fast_78"]:
-        diags.append(warn(Code.READ_FAILED, "full healing is unavailable on OCP 7.8 after a fast read in this process"))
+def _read_plain(path: str, heal: Heal):
+    """The solids' container from ``STEPControl_Reader``: ``OneShape()``."""
     reader = STEPControl_Reader()
     status = reader.ReadFile(path)
     _state["read_once"] = True
@@ -129,12 +142,64 @@ def load_step(path: str | os.PathLike, heal: Heal = "fast") -> StepModel:
     if heal == "fast" and _HAS_FIX_PARAMETERS:
         _apply_fast_80(reader)
     reader.TransferRoots()
-    shape = reader.OneShape()
+    return reader.OneShape()
+
+
+def _read_xcaf(path: str, heal: Heal):
+    """The free shapes of the XCAF document, in root order, and the document; None if it fails."""
+    reader = STEPCAFControl_Reader()
+    reader.SetGDTMode(True)
+    reader.SetNameMode(True)
+    reader.SetColorMode(False)
+    status = reader.ReadFile(path)
+    _state["read_once"] = True
+    if status != IFSelect_RetDone:
+        return None
+    if heal == "fast" and _HAS_FIX_PARAMETERS:
+        _apply_fast_80(reader.ChangeReader())
+    doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
+    XCAFApp_Application.GetApplication_s().InitDocument(doc)
+    if not reader.Transfer(doc):
+        return None
+    labels = LabelSequence()
+    XCAFDoc_DocumentTool.ShapeTool_s(doc.Main()).GetFreeShapes(labels)
+    shapes = [XCAFDoc_ShapeTool.GetShape_s(labels.Value(i)) for i in range(1, labels.Length() + 1)]
+    return shapes, doc
+
+
+def _solids_of(shapes) -> list:
     solids = []
-    ex = TopExp_Explorer(shape, TopAbs_SOLID)
-    while ex.More():
-        solids.append(as_solid(ex.Current()))
-        ex.Next()
+    for shape in shapes:
+        ex = TopExp_Explorer(shape, TopAbs_SOLID)
+        while ex.More():
+            solids.append(as_solid(ex.Current()))
+            ex.Next()
+    return solids
+
+
+def load_step(path: str | os.PathLike, heal: Heal = "fast", *, pmi: bool = True) -> StepModel:
+    """Read the solids of a STEP file, healed as ``heal`` says (see the module docstring).
+
+    With ``pmi`` the file is read through XCAF and :attr:`StepModel.doc` keeps the
+    document; the solids are the same as with ``pmi=False``.
+    """
+    path = os.fspath(path)
+    diags: list[Diagnostic] = []
+    if heal == "fast" and not _HAS_FIX_PARAMETERS:
+        _prepare_78_fast()
+    if heal == "full" and _state["fast_78"]:
+        diags.append(warn(Code.READ_FAILED, "full healing is unavailable on OCP 7.8 after a fast read in this process"))
+    doc, solids = None, []
+    if pmi:
+        try:
+            xcaf = _read_xcaf(path, heal)
+        except Exception:  # an OCCT failure in the XCAF layer: the plain reader decides
+            xcaf = None
+        if xcaf is not None:
+            solids = _solids_of(xcaf[0])
+            doc = xcaf[1] if solids else None
+    if not solids:
+        solids = _solids_of([_read_plain(path, heal)])
     if not solids:
         raise refuse(Code.NO_SOLID, f"no solid in {path}")
     if heal == "fast":
@@ -148,7 +213,7 @@ def load_step(path: str | os.PathLike, heal: Heal = "fast") -> StepModel:
                 diags.append(warn(Code.INSIDE_OUT_FIXED, "solid was inside out; reversed"))
             fixed.append(s)
         solids = fixed
-    return StepModel(tuple(solids), path, heal, tuple(diags))
+    return StepModel(tuple(solids), path, heal, tuple(diags), doc)
 
 
 def ocp_version() -> str:

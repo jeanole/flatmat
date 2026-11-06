@@ -35,6 +35,11 @@ except ImportError:  # OCP 8.0
         List_TopoDS_Shape as ShapeList,
     )
 
+try:  # OCP 7.8
+    from OCP.TDF import TDF_LabelSequence as LabelSequence  # type: ignore[attr-defined]
+except ImportError:  # OCP 8.0
+    from OCP.collections import Sequence_TDF_Label as LabelSequence  # type: ignore[no-redef]
+
 as_face = getattr(TopoDS, "Face_s", None) or TopoDS.Face
 as_edge = getattr(TopoDS, "Edge_s", None) or TopoDS.Edge
 as_vertex = getattr(TopoDS, "Vertex_s", None) or TopoDS.Vertex
@@ -47,6 +52,7 @@ __all__ = [
     "EdgeFaceMap",
     "ShapeMap",
     "ShapeList",
+    "LabelSequence",
     "as_face",
     "as_edge",
     "as_vertex",
