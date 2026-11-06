@@ -19,8 +19,12 @@
     The dimension's own point per side (mm, model space); ``presentation=True`` adds a
     graphical presentation (a line between the sides) with its text point; ``text`` is
     a note's text.
+``decimals``, ``qualifier``, ``fit``
+    A dimension's ``(left, right)`` decimal places (written as a ``VALUE_FORMAT_TYPE_QUALIFIER``
+    on the nominal, as NX, Creo and SolidWorks do), its ``"max"`` / ``"min"`` qualifier, and
+    its ISO 286 fit class as ``(deviation, grade)``: ``("H", 7)`` for a hole, ``("h", 6)`` for a shaft.
 
-OCCT 8.0.1.1's writer has three quirks this module works around, so that the file says
+OCCT 8.0.1.1's writer has four quirks this module works around, so that the file says
 what the item says:
 
 - the AP242 schema must be set after the STEP controller is initialised (a first writer);
@@ -31,6 +35,9 @@ what the item says:
   each file is read back and the zones are rewritten in metres when they came back
   1000 times too large.
 
+- a fit class's grade is written one too high (``'9'`` for IT7); the files are rewritten
+  with the grade the item says, as other CAD systems write it.
+
 A text point is only written with a presentation: without one, the writer crashes on
 a document with GD&T in it. Presentations are for dimensions only: one on a GD&T item
 in a file without a dimension makes the write fail.
@@ -39,6 +46,7 @@ in a file without a dimension makes the write fail.
 from __future__ import annotations
 
 import math
+import re
 
 from OCP.BRep import BRep_Builder
 from OCP.BRepAdaptor import BRepAdaptor_Surface
@@ -62,6 +70,9 @@ from OCP.XCAFDimTolObjects import (
     XCAFDimTolObjects_DimensionObject,
     XCAFDimTolObjects_GeomToleranceObject,
 )
+from OCP.XCAFDimTolObjects import XCAFDimTolObjects_DimensionFormVariance as FormVariance
+from OCP.XCAFDimTolObjects import XCAFDimTolObjects_DimensionGrade as Grade
+from OCP.XCAFDimTolObjects import XCAFDimTolObjects_DimensionQualifier as Qualifier
 from OCP.XCAFDimTolObjects import XCAFDimTolObjects_DimensionType as DimType
 from OCP.XCAFDimTolObjects import XCAFDimTolObjects_GeomToleranceType as TolType
 from OCP.XCAFDoc import (
@@ -191,6 +202,18 @@ def make_doc_with_pmi(shape, items: list[dict], unit: str = "MM", *, zone_scale:
                     # OCCT keeps the lower deviation as a magnitude and writes lower_bound = -magnitude
                     obj.SetUpperTolValue(it["upper"])
                     obj.SetLowerTolValue(0.0 - it["lower"])
+                if it.get("decimals"):
+                    obj.SetNbOfDecimalPlaces(*it["decimals"])
+                if it.get("qualifier"):
+                    obj.SetQualifier(
+                        getattr(Qualifier, f"XCAFDimTolObjects_DimensionQualifier_{it['qualifier'].title()}")
+                    )
+                if it.get("fit"):
+                    letter, grade = it["fit"]
+                    variance = getattr(FormVariance, f"XCAFDimTolObjects_DimensionFormVariance_{letter.upper()}")
+                    obj.SetClassOfTolerance(
+                        letter[0].isupper(), variance, getattr(Grade, f"XCAFDimTolObjects_DimensionGrade_IT{grade}")
+                    )
             for j, p in enumerate(it.get("points", ())):
                 (obj.SetPoint if j == 0 else obj.SetPoint2)(scaled(p))
             if it.get("presentation") or kind == "graphical":
@@ -271,6 +294,25 @@ def write_step_with_pmi(shape, items: list[dict], path: str, unit: str = "MM") -
         _write(make_doc_with_pmi(shape, items, unit, zone_scale=k / 1000.0), path, unit)  # labelled in metres
         if not _close(_zones(path), want):
             raise RuntimeError(f"GD&T zones read back as {_zones(path)}, not {want}")
+    fits = [it["fit"] for it in items if it.get("fit")]
+    if fits:
+        _rewrite_fits(path, fits)
+
+
+def _rewrite_fits(path: str, fits: list) -> None:
+    """The grade of each LIMITS_AND_FITS as the item says it (the writer writes it one too high)."""
+    with open(path) as fh:
+        step = fh.read()
+    found = re.findall(r"LIMITS_AND_FITS\('([^']*)','([^']*)','([^']*)','([^']*)'\)", step)
+    if len(found) != len(fits) or any(
+        f[0].upper() != letter.upper() for f, (letter, _) in zip(found, fits, strict=True)
+    ):
+        raise RuntimeError(f"LIMITS_AND_FITS written as {found}, not {fits}")
+    out = iter(
+        f"LIMITS_AND_FITS('{f[0]}','{f[1]}','{grade}','{f[3]}')" for f, (_, grade) in zip(found, fits, strict=True)
+    )
+    with open(path, "w") as fh:
+        fh.write(re.sub(r"LIMITS_AND_FITS\('[^']*','[^']*','[^']*','[^']*'\)", lambda _: next(out), step))
 
 
 def _close(got: list[float], want: list[float]) -> bool:

@@ -433,9 +433,6 @@ def test_matcher_pairs_in_file_order_when_every_entity_has_a_label():
     kept = Kept(20.0, 0.1, 0.05)  # what XCAF keeps of both +0.1/+0.05 and +0.1/-0.05
     m = Matcher([_dim(20.0, 0.1, 0.05), _dim(20.0, 0.1, -0.05)], labels=2)
     assert m.match(kept).lower.raw == 0.05 and m.match(kept).lower.raw == -0.05 and m.match(kept) is None
-    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05)], labels=2)
-    assert m.match(kept) is None  # its own entity disagrees: unreadable, and the turn is used
-    assert m.match(Kept(20.0, 0.1, 0.05)).lower.raw == -0.05
 
 
 def test_matcher_refuses_ambiguity_when_occt_dropped_an_entity():
@@ -444,3 +441,29 @@ def test_matcher_refuses_ambiguity_when_occt_dropped_an_entity():
     assert m.match(kept) is None  # the in-order candidate too: the two that agree differ in sign
     m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, -0.05)], labels=2)
     assert m.match(kept).lower.raw == -0.05 and m.next == 2  # every candidate that agrees says the same
+
+
+def test_matcher_stops_trusting_the_order_at_the_first_disagreement():
+    """Equal counts say OCCT made one label per entity; a label that disagrees with its entity
+    says the order does not hold after all: from there on a pair needs every candidate to agree."""
+    kept = Kept(20.0, 0.1, 0.05)
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05)], labels=2)
+    assert m.match(kept).lower.raw == -0.05  # its own entity disagrees: the one that agrees
+    assert m.match(Kept(30.0, 0.2, 0.2)) is None  # behind it now: unreadable
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, 0.05)], labels=3)
+    assert m.match(kept) is None  # two agree and differ in sign
+    assert m.match(kept) is None  # in file order the second entity, but the order no longer holds
+
+
+def test_nominal_with_a_format_qualifier_is_read(tmp_path, bracket):
+    """NX, Creo and SolidWorks qualify the nominal with its decimal places (VALUE_FORMAT_TYPE_QUALIFIER)."""
+    shape, f = bracket
+    items = [dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, decimals=(2, 2), faces=([f["end"]], [f["hole"]]))]
+    path = tmp_path / "format.step"
+    write_step_with_pmi(shape, items, str(path))
+    assert "VALUE_FORMAT_TYPE_QUALIFIER('NR2 2.2')" in path.read_text()
+    model = fm.load_step(path)
+    (dim,) = model.step_dimensions
+    assert dim.nominal == Bound(30.0, 1.0)
+    (item,) = model.pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower) == (30.0, 0.1, -0.1)

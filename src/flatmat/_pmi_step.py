@@ -13,9 +13,10 @@ bounds as written and the size of each bound's own unit (mm or degrees per unit)
 OCCT creates one dimension label per such entity, in file order, unless it drops an
 entity it cannot read (one whose shapes it cannot find, for one). A pair is used only
 when what XCAF kept agrees with the file (the nominal, the upper bound and the lower
-bound's magnitude). When OCCT dropped an entity the order no longer holds, and a pair
-is used only if every remaining entity that agrees states the same signed bounds;
-otherwise the dimension is unmatched and its tolerance unreadable.
+bound's magnitude). When OCCT dropped an entity, or a label disagrees with the entity
+in its place, the order no longer holds, and a pair is used only if every remaining
+entity that agrees states the same signed bounds; otherwise the dimension is unmatched
+and its tolerance unreadable. Entities are related by their entity number in the file.
 """
 
 from __future__ import annotations
@@ -125,6 +126,23 @@ def _bound(t) -> Bound | None:
     return None if m is None else Bound(m[0], _unit_size(m[1]))
 
 
+_HARMLESS = (1, 4)  # a value_qualifier's precision_qualifier and value_format_type_qualifier: display only
+
+
+def _plain(item) -> bool:
+    """A measure item without qualifiers, or with ones that only say how it is displayed.
+
+    NX, Creo and SolidWorks qualify a nominal with its decimal places
+    (``VALUE_FORMAT_TYPE_QUALIFIER('NR2 2.2')``); that does not change the value."""
+    qri = item.GetQualifiedRepresentationItem() if hasattr(item, "GetQualifiedRepresentationItem") else None
+    if qri is None:
+        return not hasattr(item, "Qualifiers")
+    for k in range(1, qri.NbQualifiers() + 1):
+        if qri.QualifiersValue(k).CaseNumber() not in _HARMLESS:
+            return False
+    return True
+
+
 def _nominal(rep) -> Bound | None:
     """The first plain measure item of a shape_dimension_representation (what OCCT takes as the nominal)."""
     for i in range(1, rep.NbItems() + 1):
@@ -132,7 +150,7 @@ def _nominal(rep) -> Bound | None:
         name = item.Name().ToCString().lower() if item.Name() is not None else ""
         if any(w in name for w in ("upper", "lower", "minimum", "maximum")):
             continue
-        if hasattr(item, "GetQualifiedRepresentationItem") or hasattr(item, "Qualifiers"):
+        if not _plain(item):
             continue
         b = _bound(item)
         if b is not None:
@@ -140,27 +158,44 @@ def _nominal(rep) -> Bound | None:
     return None
 
 
+def _numbering(model, entities: Sequence[Any]):
+    """The entity number of an entity the model holds, 0 when not found.
+
+    ``model.Number`` when the binding finds the entity. OCP 8.0.1.1 finds none (``Contains``
+    is False for every entity of a model read from a file), so the number comes from the
+    enumeration: ``entities`` holds every wrapper of the model, and pybind hands out the one
+    wrapper it holds for an entity."""
+    by_wrapper = {id(e): i for i, e in enumerate(entities, 1)}
+
+    def number(e) -> int:
+        n = model.Number(e)
+        return n if n else by_wrapper.get(id(e), 0)
+
+    return number
+
+
 def step_dimensions(model) -> tuple[StepDimension, ...]:
     """Every dimensional_location / dimensional_size of ``model`` (a StepData_StepModel), in file order."""
-    dims: list[Any] = []
-    tolerances: dict[Any, Any] = {}
-    nominals: dict[Any, Bound | None] = {}
-    for i in range(1, model.NbEntities() + 1):
-        e = model.Value(i)
+    entities = [model.Value(i) for i in range(1, model.NbEntities() + 1)]
+    number = _numbering(model, entities)
+    dims: list[int] = []  # entity numbers
+    tolerances: dict[int, Any] = {}  # dimension entity number -> its tolerance_value
+    nominals: dict[int, Bound | None] = {}
+    for i, e in enumerate(entities, 1):
         if isinstance(e, (StepShape_DimensionalLocation, StepShape_DimensionalSize)):
-            dims.append(e)
+            dims.append(i)
         elif isinstance(e, StepShape_PlusMinusTolerance):
             rng = e.Range()
             if rng.CaseNumber() == 1:  # a tolerance_value, not limits and fits
-                tolerances[e.TolerancedDimension().Value()] = rng.ToleranceValue()
+                tolerances[number(e.TolerancedDimension().Value())] = rng.ToleranceValue()
         elif isinstance(e, StepShape_DimensionalCharacteristicRepresentation):
-            nominals[e.Dimension().Value()] = _nominal(e.Representation())
+            nominals[number(e.Dimension().Value())] = _nominal(e.Representation())
     out = []
-    for d in dims:  # the wrappers are the same Python objects: pybind keeps one per entity while it lives
-        tv = tolerances.get(d)
+    for n in dims:
+        tv = tolerances.get(n)
         upper = _bound(tv.UpperBound()) if tv is not None else None
         lower = _bound(tv.LowerBound()) if tv is not None else None
-        out.append(StepDimension(nominals.get(d), upper, lower))
+        out.append(StepDimension(nominals.get(n), upper, lower))
     return tuple(out)
 
 
@@ -201,23 +236,41 @@ class Matcher:
 
     ``labels`` is the number of semantic dimension labels in the document. When it equals
     the number of the file's dimension entities, OCCT made one label per entity and the
-    k-th label is the k-th entity: every dimension takes its turn, and a pair is used
-    only if it agrees. When the counts differ, OCCT dropped some entity, and a
-    dimension takes the first remaining entity that agrees, only if every remaining
-    entity that agrees states the same signed bounds.
+    k-th label is the k-th entity: a dimension takes its own entity when they agree. At
+    the first label that disagrees with its entity the order no longer holds, and from
+    there on (that label included) the search rule applies. When the counts differ, OCCT
+    dropped some entity, and the search rule applies from the start: a dimension takes the
+    first remaining entity that agrees, only if every remaining entity that agrees states
+    the same signed bounds.
     """
 
     def __init__(self, dims: Sequence[StepDimension], labels: int) -> None:
         self.dims = list(dims)
         self.in_order = labels == len(self.dims)
         self.next = 0
+        self.turns = 0  # match calls so far
 
     def match(self, k: Kept) -> StepDimension | None:
+        self.turns += 1
         if self.in_order:
-            j, self.next = self.next, self.next + 1
-            return self.dims[j] if j < len(self.dims) and _matches(k, self.dims[j]) else None
+            j = self.next
+            if j < len(self.dims) and _matches(k, self.dims[j]):
+                self.next = j + 1
+                return self.dims[j]
+            self.in_order = False  # the order no longer holds: search, from this label on
         agree = [j for j in range(self.next, len(self.dims)) if _matches(k, self.dims[j])]
-        if not agree or len({(self.dims[j].upper, self.dims[j].lower) for j in agree}) > 1:
-            return None  # nothing agrees, or entities that agree differ in sign: no way to tell which
+        if not agree or len({_said(self.dims[j]) for j in agree}) > 1:
+            return None  # nothing agrees, or entities that agree say different things: no way to tell which
         self.next = agree[0] + 1
         return self.dims[agree[0]]
+
+    def skip(self) -> None:
+        """A label that could not be read: in file order it still uses its entity."""
+        self.turns += 1
+        if self.in_order:
+            self.next += 1
+
+
+def _said(s: StepDimension) -> tuple:
+    """What an entity says beyond what XCAF keeps: two candidates that differ here are ambiguous."""
+    return (s.upper, s.lower)
