@@ -64,6 +64,7 @@ def test_linear_dimension_round_trips(tmp_path, bracket):
     assert item.sides[0].points == ((0, 0, 30),) and item.sides[1].points == ((16, 0, 30),)
     assert item.anchor == pytest.approx((8, 0, 30))  # no text point: the midpoint of the side points
     assert item.text == "20 +0.1/-0.1"
+    assert item.tolerance == "plus_minus"
 
 
 def test_inch_file_reads_in_mm(tmp_path, bracket):
@@ -120,6 +121,7 @@ def test_one_sided_and_inverted_tolerances(tmp_path, bracket, upper, lower, expe
     (item,) = _load(tmp_path, shape, items).pmi_for(0).items
     assert (item.nominal, item.upper, item.lower) == (40.0, *expected)
     assert item.text.startswith("40")
+    assert item.tolerance == ("plus_minus" if expected != (None, None) else "unreadable")
     if expected == (None, None):
         assert "tolerance unreadable" in item.text
 
@@ -176,6 +178,7 @@ def test_gdt_position_with_datums(tmp_path, bracket):
     assert tol.sides == (PmiSide((f["hole"],)),)
     assert tol.anchor == pytest.approx((20, 0, 30), abs=1e-6)  # no points: the centroid of the hole wall
     assert tol.text == "position 0.2 | A | B"
+    assert tol.tolerance == "none"  # GD&T: the zone is in upper
     named = {i.text: i for i in data.items if i.kind == "datum"}
     assert named["A"].sides == (PmiSide((f["skin"],)),) and named["A"].datums == ("A",)
     assert named["B"].sides == (PmiSide((f["end"],)),)
@@ -352,7 +355,7 @@ def test_angle_tolerance_in_an_unknown_unit_is_unreadable(tmp_path, bracket):
     path.write_text(step)
     (item,) = fm.load_step(path).pmi_for(0).items
     assert item.nominal == pytest.approx(90.0)
-    assert (item.upper, item.lower) == (None, None)
+    assert (item.upper, item.lower, item.tolerance) == (None, None, "unreadable")
     assert item.text == "90° +0.01/-0.01 (unit unknown)"
 
 
@@ -370,10 +373,10 @@ def test_tolerance_not_found_in_the_file_is_unreadable(bracket):
     shape, f = bracket
     doc = make_doc_with_pmi(shape, [dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]],))])
     (item,) = read_pmi(doc, shape).items
-    assert (item.nominal, item.upper, item.lower) == (20.0, None, None)
-    assert item.text == "20 (tolerance unreadable: not found in the file)"
+    assert (item.nominal, item.upper, item.lower, item.tolerance) == (20.0, None, None, "unreadable")
+    assert item.text == "20 +0.1/±0.1 (sign unknown: not found in the file)"  # XCAF's magnitudes
     (kept,) = read_pmi(doc, shape, trust_xcaf=True).items  # built in memory: XCAF's own values
-    assert (kept.upper, kept.lower) == (0.1, -0.1)
+    assert (kept.upper, kept.lower, kept.tolerance) == (0.1, -0.1, "plus_minus")
 
 
 def test_entity_dropped_by_occt_makes_the_signs_unreadable(tmp_path, bracket):
@@ -389,19 +392,31 @@ def test_entity_dropped_by_occt_makes_the_signs_unreadable(tmp_path, bracket):
     model = fm.load_step(path)
     assert len(model.step_dimensions) == 2
     (item,) = model.pmi_for(0).items  # the second dimension, +0.1/+0.05 in the file
-    assert (item.nominal, item.upper, item.lower) == (40.0, None, None)
-    assert item.text == "40 (tolerance unreadable: not found in the file)"
+    assert (item.nominal, item.upper, item.lower, item.tolerance) == (40.0, None, None, "unreadable")
+    assert item.text == "40 +0.1/±0.05 (sign unknown: not found in the file)"
 
 
-def test_limits_dimension_keeps_both_limits(tmp_path, bracket):
-    """A dimension given as a lower and an upper limit, with no plus-minus tolerance."""
+@pytest.mark.parametrize(
+    "lower, upper, expected",
+    [
+        ("40.", "40.2", ("limits", "40\u201340.2 (limits)")),
+        ("40.2", "40.", ("unreadable", "40.2\u201340 (limits inverted)")),
+    ],
+    ids=["limits", "inverted"],
+)
+def test_limits_dimension_keeps_both_limits(tmp_path, bracket, lower, upper, expected):
+    """A dimension given as a lower and an upper limit, with no plus-minus tolerance: no nominal."""
     shape, f = bracket
     path = tmp_path / "limits.step"
-    write_step_with_pmi(shape, [dict(kind="linear", nominal=40.0, faces=([f["end"]], [f["hole"]]))], str(path))
+    items = [
+        dict(kind="linear", nominal=float(lower), faces=([f["end"]], [f["hole"]])),
+        dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),  # after it
+    ]
+    write_step_with_pmi(shape, items, str(path))
     step = path.read_text()
     nominal = re.search(
         r"^(#\d+) = \( LENGTH_MEASURE_WITH_UNIT\(\) MEASURE_REPRESENTATION_ITEM\(\) \n"
-        r"MEASURE_WITH_UNIT\(POSITIVE_LENGTH_MEASURE\(40\.\),(#\d+)\) REPRESENTATION_ITEM\n"
+        rf"MEASURE_WITH_UNIT\(POSITIVE_LENGTH_MEASURE\({re.escape(lower)}\),(#\d+)\)\s*REPRESENTATION_ITEM\s*"
         r"\('nominal value'\) \);\n",
         step,
         re.M,
@@ -409,7 +424,7 @@ def test_limits_dimension_keeps_both_limits(tmp_path, bracket):
     item_id, unit = nominal.groups()
     upper = (
         "#99999 = ( LENGTH_MEASURE_WITH_UNIT() MEASURE_REPRESENTATION_ITEM() \n"
-        f"MEASURE_WITH_UNIT(POSITIVE_LENGTH_MEASURE(40.2),{unit}) REPRESENTATION_ITEM\n"
+        f"MEASURE_WITH_UNIT(POSITIVE_LENGTH_MEASURE({upper}),{unit}) REPRESENTATION_ITEM\n"
         "('upper limit') );\n"
     )
     step = step.replace(nominal.group(0), nominal.group(0).replace("'nominal value'", "'lower limit'") + upper)
@@ -420,9 +435,10 @@ def test_limits_dimension_keeps_both_limits(tmp_path, bracket):
     )
     assert n == 1
     path.write_text(step)
-    (item,) = fm.load_step(path).pmi_for(0).items
+    item, after = fm.load_step(path).pmi_for(0).items
     assert (item.nominal, item.upper, item.lower) == (None, None, None)
-    assert item.text == "40\u201340.2 (limits)"
+    assert (item.tolerance, item.text) == expected
+    assert (after.upper, after.lower, after.tolerance) == (0.1, -0.1, "plus_minus")  # the order still holds
 
 
 def _dim(nominal, upper, lower):
@@ -467,3 +483,78 @@ def test_nominal_with_a_format_qualifier_is_read(tmp_path, bracket):
     assert dim.nominal == Bound(30.0, 1.0)
     (item,) = model.pmi_for(0).items
     assert (item.nominal, item.upper, item.lower) == (30.0, 0.1, -0.1)
+
+
+def test_untoleranced_dimension_is_none(tmp_path, bracket):
+    """No tolerance of its own: the general tolerance applies (flatmat_web), so "none", not "unreadable"."""
+    shape, f = bracket
+    items = [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))]
+    (item,) = _load(tmp_path, shape, items).pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower, item.tolerance, item.text) == (20.0, None, None, "none", "20")
+
+
+@pytest.mark.parametrize(
+    "fit, text",
+    [(("H", 7), "Ø8 H7"), (("h", 6), "Ø8 h6"), (("JS", 9), "Ø8 JS9")],
+    ids=["hole", "shaft", "two_letters"],
+)
+def test_fit_class_from_the_file(tmp_path, bracket, fit, text):
+    """An ISO 286 fit (a limits_and_fits entity) is not untoleranced; the class is in the text."""
+    shape, f = bracket
+    items = [
+        dict(kind="diameter", nominal=8.0, fit=fit, faces=([f["hole"]],)),
+        dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),
+    ]
+    path = tmp_path / "fit.step"
+    write_step_with_pmi(shape, items, str(path))
+    assert re.search(rf"LIMITS_AND_FITS\('{fit[0]}','\w+','{fit[1]}',''\)", path.read_text())
+    dia, lin = fm.load_step(path).pmi_for(0).items
+    assert (dia.kind, dia.nominal, dia.upper, dia.lower) == ("diameter", 8.0, None, None)
+    assert (dia.tolerance, dia.text) == ("fit", text)
+    assert (lin.upper, lin.lower, lin.tolerance) == (0.1, -0.1, "plus_minus")
+
+
+def test_fit_class_with_an_unreadable_grade(tmp_path, bracket):
+    shape, f = bracket
+    path = tmp_path / "fit.step"
+    write_step_with_pmi(shape, [dict(kind="diameter", nominal=8.0, fit=("H", 7), faces=([f["hole"]],))], str(path))
+    path.write_text(path.read_text().replace("'hole','7'", "'hole','seven'"))
+    (dia,) = fm.load_step(path).pmi_for(0).items
+    assert (dia.nominal, dia.tolerance, dia.text) == (8.0, "fit", "Ø8 fit (class unreadable: H seven)")
+
+
+def test_fit_class_in_memory_is_not_read(bracket):
+    """OCP cannot return XCAF's class of tolerance: a fit built in memory says so."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(shape, [dict(kind="diameter", nominal=8.0, fit=("H", 7), faces=([f["hole"]],))])
+    (dia,) = read_pmi(doc, shape, trust_xcaf=True).items
+    assert (dia.nominal, dia.upper, dia.lower) == (8.0, None, None)
+    assert (dia.tolerance, dia.text) == ("fit", "Ø8 fit (class not read)")
+
+
+@pytest.mark.parametrize("qualifier", ["max", "min"])
+def test_max_min_qualifier_is_a_limit(tmp_path, bracket, qualifier):
+    """ "max 20" is an upper limit, not an untoleranced 20: no nominal, the qualifier in the text."""
+    shape, f = bracket
+    items = [
+        dict(kind="linear", nominal=20.0, qualifier=qualifier, faces=([f["end"]], [f["hole"]])),
+        dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),
+    ]
+    path = tmp_path / "qualified.step"
+    write_step_with_pmi(shape, items, str(path))
+    assert f"TYPE_QUALIFIER('{qualifier}imum')" in path.read_text()
+    item, after = fm.load_step(path).pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower) == (None, None, None)
+    assert (item.tolerance, item.text) == ("limits", f"{qualifier} 20")
+    assert (after.upper, after.lower, after.tolerance) == (0.1, -0.1, "plus_minus")
+    (mem,) = read_pmi(make_doc_with_pmi(shape, items[:1]), shape, trust_xcaf=True).items
+    assert (mem.nominal, mem.tolerance, mem.text) == (None, "limits", f"{qualifier} 20")
+
+
+def test_untoleranced_dimension_not_found_in_the_file_is_unreadable(bracket):
+    """XCAF drops a STEP file's max/min qualifier: unconfirmed by the file, "none" could be false."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(shape, [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))])
+    (item,) = read_pmi(doc, shape).items
+    assert (item.nominal, item.tolerance) == (20.0, "unreadable")
+    assert item.text == "20 (not found in the file: a fit or a max/min qualifier cannot be ruled out)"

@@ -8,7 +8,10 @@ OCCT's XCAF dimension objects lose two things that a tolerance check needs:
 
 So :func:`step_dimensions` reads every ``dimensional_location`` / ``dimensional_size``
 of the transferred StepData model, in file order, with its ``plus_minus_tolerance``
-bounds as written and the size of each bound's own unit (mm or degrees per unit).
+bounds as written and the size of each bound's own unit (mm or degrees per unit). It
+also keeps what XCAF reads but OCP cannot return or OCCT drops: a ``limits_and_fits``
+class (``H7``), the nominal's ``type_qualifier`` (maximum, minimum) and the lower and
+upper limits of a limits dimension.
 :class:`Matcher` then pairs the document's semantic dimensions with these, in order:
 OCCT creates one dimension label per such entity, in file order, unless it drops an
 entity it cannot read (one whose shapes it cannot find, for one). A pair is used only
@@ -78,6 +81,9 @@ class StepDimension:
     nominal: Bound | None  # None when the file gives none flatmat can find
     upper: Bound | None  # the plus_minus_tolerance bounds, signed as written; None without one
     lower: Bound | None
+    limits: tuple[Bound, Bound] | None = None  # the 'lower limit' and 'upper limit' items, as written
+    fit: tuple[str, str] | None = None  # a limits_and_fits' (form_variance, grade) as written: ("H", "7")
+    qualifier: str = ""  # the nominal's type_qualifier: "maximum", "minimum", "average"
 
 
 def _unit_size(unit, depth: int = 0) -> float | None:
@@ -127,35 +133,62 @@ def _bound(t) -> Bound | None:
 
 
 _HARMLESS = (1, 4)  # a value_qualifier's precision_qualifier and value_format_type_qualifier: display only
+_TYPE = 2  # a value_qualifier's type_qualifier ("maximum", "minimum", "average")
 
 
-def _plain(item) -> bool:
-    """A measure item without qualifiers, or with ones that only say how it is displayed.
+def _qualifier(item) -> str | None:
+    """The type_qualifier of a measure item ("" without one), or None when it has a qualifier
+    flatmat does not read (an uncertainty, for one).
 
     NX, Creo and SolidWorks qualify a nominal with its decimal places
     (``VALUE_FORMAT_TYPE_QUALIFIER('NR2 2.2')``); that does not change the value."""
     qri = item.GetQualifiedRepresentationItem() if hasattr(item, "GetQualifiedRepresentationItem") else None
     if qri is None:
-        return not hasattr(item, "Qualifiers")
+        return None if hasattr(item, "Qualifiers") else ""
+    found = ""
     for k in range(1, qri.NbQualifiers() + 1):
-        if qri.QualifiersValue(k).CaseNumber() not in _HARMLESS:
-            return False
-    return True
+        q = qri.QualifiersValue(k)
+        if q.CaseNumber() == _TYPE:
+            name = q.TypeQualifier().Name()
+            found = name.ToCString().strip().lower() if name is not None else ""
+        elif q.CaseNumber() not in _HARMLESS:
+            return None
+    return found
 
 
-def _nominal(rep) -> Bound | None:
-    """The first plain measure item of a shape_dimension_representation (what OCCT takes as the nominal)."""
+def _name(item) -> str:
+    return item.Name().ToCString().strip().lower() if item.Name() is not None else ""
+
+
+def _nominal(rep) -> tuple[Bound | None, str]:
+    """The first plain measure item of a shape_dimension_representation (what OCCT takes as
+    the nominal), and its type qualifier."""
     for i in range(1, rep.NbItems() + 1):
         item = rep.ItemsValue(i)
-        name = item.Name().ToCString().lower() if item.Name() is not None else ""
-        if any(w in name for w in ("upper", "lower", "minimum", "maximum")):
+        if any(w in _name(item) for w in ("upper", "lower", "minimum", "maximum")):
             continue
-        if not _plain(item):
+        qualifier = _qualifier(item)
+        if qualifier is None:
             continue
         b = _bound(item)
         if b is not None:
-            return b
-    return None
+            return b, qualifier
+    return None, ""
+
+
+def _limits(rep) -> tuple[Bound, Bound] | None:
+    """The 'lower limit' and 'upper limit' items of a shape_dimension_representation."""
+    found: dict[str, Bound | None] = {}
+    for i in range(1, rep.NbItems() + 1):
+        item = rep.ItemsValue(i)
+        if _name(item) in ("lower limit", "upper limit"):
+            found[_name(item)] = _bound(item)
+    lo, hi = found.get("lower limit"), found.get("upper limit")
+    return (lo, hi) if lo is not None and hi is not None else None
+
+
+def _label(s) -> str:
+    return s.ToCString().strip() if s is not None else ""
 
 
 def _numbering(model, entities: Sequence[Any]):
@@ -179,23 +212,29 @@ def step_dimensions(model) -> tuple[StepDimension, ...]:
     entities = [model.Value(i) for i in range(1, model.NbEntities() + 1)]
     number = _numbering(model, entities)
     dims: list[int] = []  # entity numbers
-    tolerances: dict[int, Any] = {}  # dimension entity number -> its tolerance_value
-    nominals: dict[int, Bound | None] = {}
+    tolerances: dict[int, Any] = {}  # dimension entity number -> its tolerance_value or limits_and_fits
+    reps: dict[int, Any] = {}  # dimension entity number -> its shape_dimension_representation
     for i, e in enumerate(entities, 1):
         if isinstance(e, (StepShape_DimensionalLocation, StepShape_DimensionalSize)):
             dims.append(i)
         elif isinstance(e, StepShape_PlusMinusTolerance):
-            rng = e.Range()
-            if rng.CaseNumber() == 1:  # a tolerance_value, not limits and fits
-                tolerances[number(e.TolerancedDimension().Value())] = rng.ToleranceValue()
+            tolerances[number(e.TolerancedDimension().Value())] = e.Range()
         elif isinstance(e, StepShape_DimensionalCharacteristicRepresentation):
-            nominals[number(e.Dimension().Value())] = _nominal(e.Representation())
+            reps[number(e.Dimension().Value())] = e.Representation()
     out = []
     for n in dims:
-        tv = tolerances.get(n)
-        upper = _bound(tv.UpperBound()) if tv is not None else None
-        lower = _bound(tv.LowerBound()) if tv is not None else None
-        out.append(StepDimension(nominals.get(n), upper, lower))
+        rng, rep = tolerances.get(n), reps.get(n)
+        upper = lower = None
+        fit = None
+        if rng is not None and rng.CaseNumber() == 1:  # a tolerance_value
+            tv = rng.ToleranceValue()
+            upper, lower = _bound(tv.UpperBound()), _bound(tv.LowerBound())
+        elif rng is not None and rng.CaseNumber() == 2:  # limits_and_fits
+            lf = rng.LimitsAndFits()
+            fit = (_label(lf.FormVariance()), _label(lf.Grade()))
+        nominal, qualifier = _nominal(rep) if rep is not None else (None, "")
+        limits = _limits(rep) if rep is not None else None
+        out.append(StepDimension(nominal, upper, lower, limits, fit, qualifier))
     return tuple(out)
 
 
@@ -216,14 +255,17 @@ class Kept:
     nominal: float
     upper: float | None  # None: no plus-minus tolerance; for a negative upper bound, None too
     lower_magnitude: float | None
-    negative_upper: bool = False  # the reader's 2-value "range": nominal, |lower|
+    negative_upper: bool = False  # the reader's 2-value "range": nominal, |lower|; or true limits
+    fit: bool = False  # XCAF has a class of tolerance (a limits_and_fits in the file)
 
 
 def _matches(k: Kept, s: StepDimension) -> bool:
     if s.nominal is not None and s.nominal.value is not None and not _close(k.nominal, s.nominal.value):
         return False
     if k.lower_magnitude is None:
-        return s.upper is None
+        return s.upper is None and s.limits is None and k.fit == (s.fit is not None)
+    if k.negative_upper and s.upper is None:  # true limits: XCAF keeps (lower limit, upper limit)
+        return s.limits is not None and _agrees(k.nominal, s.limits[0]) and _agrees(k.lower_magnitude, s.limits[1])
     if s.upper is None or s.lower is None or not _agrees(k.lower_magnitude, s.lower):
         return False
     if k.negative_upper:
@@ -273,4 +315,4 @@ class Matcher:
 
 def _said(s: StepDimension) -> tuple:
     """What an entity says beyond what XCAF keeps: two candidates that differ here are ambiguous."""
-    return (s.upper, s.lower)
+    return (s.upper, s.lower, s.limits, s.fit, s.qualifier)

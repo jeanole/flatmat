@@ -18,6 +18,15 @@ What OCCT's reader gives, and what flatmat makes of it (verified on OCP 8.0.1.1)
   0/-0.2 and -0.05/-0.1 keep their signs. An inverted pair (upper below lower) or a NaN
   is unreadable. A dimension given only as lower and upper limits has no nominal:
   ``nominal``, ``upper`` and ``lower`` are None and ``text`` keeps both limits.
+- :attr:`PmiItem.tolerance` says which of these a dimension is: ``"none"`` (no
+  tolerance of its own, so the general tolerance applies), ``"plus_minus"`` (``upper``
+  and ``lower`` hold it), ``"limits"`` (lower and upper limits, or a max / min
+  qualifier: no nominal), ``"fit"`` (an ISO 286 class, ``Ø8 H7`` in ``text``) or
+  ``"unreadable"``. OCCT's reader drops a STEP file's qualifiers, and OCP cannot return
+  XCAF's class of tolerance, so both come from the file: an untoleranced dimension
+  flatmat cannot find in the file is unreadable too, since a qualifier or a fit cannot
+  be ruled out. GD&T items are ``"none"`` (the zone is ``upper``) or ``"unreadable"``
+  (no zone).
 - Graphical-only PMI (a presentation without semantic data) is read as dimensions
   of type ``DimensionPresentation`` or ``CommonLabel``. They never become items: a
   dimension written both ways is one item, and graphical PMI only sets the status
@@ -40,6 +49,7 @@ solid it is read for.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -88,6 +98,7 @@ PmiKind = Literal[
     "note",
 ]
 Point = tuple[float, float, float]
+Tolerance = Literal["none", "plus_minus", "unreadable", "limits", "fit"]
 
 
 @dataclass(frozen=True)
@@ -107,6 +118,7 @@ class PmiItem:
     sides: tuple[PmiSide, ...] = ()  # 1 or 2
     anchor: Point | None = None
     text: str = ""  # raw callout / note text, never lost
+    tolerance: Tolerance = "none"  # what kind of tolerance a dimension has (module docstring)
 
 
 @dataclass(frozen=True)
@@ -285,39 +297,104 @@ def _signed(v: float) -> str:
     return "0" if v == 0 else f"{v:+.6g}"
 
 
-def _values(obj, matcher: Matcher | None, unit: str) -> tuple[float | None, float | None, float | None, str]:
-    """``(nominal, upper, lower, value text)`` of a dimension object.
+_QUALIFIERS = {"maximum": "max", "minimum": "min", "average": "avg"}
+_FORM = re.compile(r"[A-Za-z]{1,2}")  # an ISO 286 fundamental deviation: H, h, JS, zc ...
+_GRADE = re.compile(r"0|01|[1-9]|1[0-8]")  # an IT grade
 
-    With a matcher (a document read from STEP) the signed bounds come from the file
-    (:mod:`flatmat._pmi_step`); without one (a document built in memory) from XCAF.
+
+def _fit(found: StepDimension | None) -> str:
+    """The fit class as the file writes it (``H7``, ``h6``), or why it cannot be given."""
+    if found is None or found.fit is None:
+        return "fit (class not read)"
+    form, grade = found.fit
+    if _FORM.fullmatch(form) and _GRADE.fullmatch(grade):
+        return f"{form}{grade}"
+    return f"fit (class unreadable: {form} {grade})".replace("  ", " ")
+
+
+def _xcaf_qualifier(obj) -> str:
+    if not obj.HasQualifier():
+        return ""
+    name = _enum_name(obj.GetQualifier(), "XCAFDimTolObjects_DimensionQualifier_")
+    return "" if name == "none" else name
+
+
+def _values(obj, matcher: Matcher | None, unit: str) -> tuple[float | None, float | None, float | None, Tolerance, str]:
+    """``(nominal, upper, lower, tolerance, value text)`` of a dimension object.
+
+    With a matcher (a document read from STEP) the signed bounds, the fit class and the
+    qualifier come from the file (:mod:`flatmat._pmi_step`); without one (a document built
+    in memory) from XCAF.
     """
     if obj.IsDimWithPlusMinusTolerance():
         kept = Kept(obj.GetValue(), obj.GetUpperTolValue(), obj.GetLowerTolValue())
     elif obj.IsDimWithRange():  # OCCT's (nominal, |lower|) for a negative upper bound, or true limits
         kept = Kept(obj.GetLowerBound(), None, obj.GetUpperBound(), negative_upper=True)
     else:
-        kept = Kept(obj.GetValue(), None, None)
+        kept = Kept(obj.GetValue(), None, None, fit=obj.IsDimWithClassOfTolerance())
     found = matcher.match(kept) if matcher is not None else None  # every dimension takes its turn
-    nominal = kept.nominal
-    if kept.lower_magnitude is None:
-        return nominal, None, None, f"{_num(nominal)}{unit}"
-    if kept.negative_upper and nominal <= kept.lower_magnitude and (found is None or found.upper is None):
-        limits = f"{_num(nominal)}{unit}–{_num(kept.lower_magnitude)}{unit}"  # lower and upper limit
-        return None, None, None, f"{limits} (limits)"
     if matcher is None:
-        if kept.upper is None:
-            return nominal, None, None, f"{_num(nominal)}{unit} (tolerance unreadable)"
+        qualifier = _xcaf_qualifier(obj)
+    else:
+        qualifier = _QUALIFIERS.get(found.qualifier, found.qualifier) if found is not None else ""
+    nominal = kept.nominal
+    base = f"{_num(nominal)}{unit}"
+    q = f"{qualifier} " if qualifier else ""
+    if kept.lower_magnitude is None:  # no plus-minus tolerance and no limits
+        if matcher is not None and found is None:
+            return nominal, None, None, "unreadable", f"{base} (not found in the file: {_RULED_OUT})"
+        if kept.fit:
+            return nominal, None, None, "fit", f"{q}{base} {_fit(found)}"
+        if qualifier in ("max", "min"):  # an upper or a lower limit
+            return None, None, None, "limits", f"{qualifier} {base}"
+        if qualifier:
+            return nominal, None, None, "unreadable", f"{qualifier} {base}"
+        return nominal, None, None, "none", base
+    if kept.negative_upper and (found is None or found.upper is None):  # limits, or a tolerance not found
+        lo: float | None
+        hi: float | None
+        if found is not None and found.limits is not None:  # the file's own
+            lo, hi = found.limits[0].value, found.limits[1].value
+            if lo is None or hi is None:
+                raw = f"{_num(found.limits[0].raw)}–{_num(found.limits[1].raw)}"
+                return None, None, None, "unreadable", f"{raw} (limits, unit unknown)"
+        else:
+            lo, hi = nominal, kept.lower_magnitude
+        limits = f"{_num(lo)}{unit}–{_num(hi)}{unit}"
+        if lo <= hi:
+            return None, None, None, "limits", f"{limits} (limits)"
+        if matcher is None or found is not None:  # true limits, upper below lower
+            return None, None, None, "unreadable", f"{limits} (limits inverted)"
+        # inverted limits, or a tolerance with a negative upper bound that the file does not confirm
+        return None, None, None, "unreadable", f"{limits} (tolerance unreadable: not found in the file)"
+    if matcher is None:
+        if kept.upper is None:  # in memory a range is limits, handled above
+            return nominal, None, None, "unreadable", f"{base} (tolerance unreadable)"
         raw_up, raw_lo = kept.upper, 0.0 - kept.lower_magnitude
     elif found is None or found.upper is None or found.lower is None:
-        return nominal, None, None, f"{_num(nominal)}{unit} (tolerance unreadable: not found in the file)"
+        # XCAF's magnitudes: the lower bound's sign is lost, and an angle's are in the file's unit
+        up = _signed(kept.upper) if kept.upper is not None else "?"
+        where = ", in the file's angle unit" if unit else ""
+        return (
+            nominal,
+            None,
+            None,
+            "unreadable",
+            f"{base} {up}/±{_num(kept.lower_magnitude)} (sign unknown: not found in the file{where})",
+        )
     elif found.upper.value is None or found.lower.value is None:
         tol = f"{_signed(found.upper.raw)}/{_signed(found.lower.raw)}"
-        return nominal, None, None, f"{_num(nominal)}{unit} {tol} (unit unknown)"
+        return nominal, None, None, "unreadable", f"{q}{base} {tol} (unit unknown)"
     else:
         raw_up, raw_lo = found.upper.value, found.lower.value
     upper, lower = tolerance(nominal, raw_up, raw_lo)
-    text = f"{_num(nominal)}{unit} {_signed(raw_up)}/{_signed(raw_lo)}"
-    return nominal, upper, lower, text + ("" if upper is not None else " (tolerance unreadable)")
+    text = f"{q}{base} {_signed(raw_up)}/{_signed(raw_lo)}"
+    if upper is None:
+        return nominal, None, None, "unreadable", text + " (tolerance unreadable)"
+    return nominal, upper, lower, "plus_minus", text
+
+
+_RULED_OUT = "a fit or a max/min qualifier cannot be ruled out"
 
 
 def _dimension(label, faces: _Faces, matcher: Matcher | None):
@@ -328,7 +405,7 @@ def _dimension(label, faces: _Faces, matcher: Matcher | None):
         return None, True
     kind = _DIM_KINDS.get(dtype, "other_gdt")
     unit = "°" if kind == "angle" else ""
-    nominal, upper, lower, value_text = _values(obj, matcher, unit)  # before the sides: each takes its turn
+    nominal, upper, lower, tol, value_text = _values(obj, matcher, unit)  # before the sides: each takes its turn
     first, second = _refs(label)
     pts = [obj.GetPoint().Coord() if obj.HasPoint() else None, obj.GetPoint2().Coord() if obj.HasPoint2() else None]
     sides = _sides(faces, [first, second], pts)
@@ -346,10 +423,10 @@ def _dimension(label, faces: _Faces, matcher: Matcher | None):
         text += f"; {_text(obj.GetPresentationName())}"
     text_point = obj.GetPointTextAttach().Coord() if obj.HasTextPoint() else None
     value = None if nominal is None or math.isnan(nominal) else nominal
-    return (
-        dict(kind=kind, nominal=value, upper=upper, lower=lower, sides=sides, text=text, text_point=text_point),
-        False,
-    )
+    if value is None and tol in ("none", "fit", "plus_minus"):
+        tol = "unreadable"  # a NaN nominal
+    fields = dict(kind=kind, nominal=value, upper=upper, lower=lower, sides=sides, text=text, tolerance=tol)
+    return {**fields, "text_point": text_point}, False
 
 
 def _datum_names(label) -> tuple[str, ...]:
@@ -378,7 +455,15 @@ def _tolerance_item(label, faces: _Faces):
     text_point = obj.GetPointTextAttach().Coord() if obj.HasPointText() else None
     upper = None if math.isnan(zone) else zone
     return dict(
-        kind=kind, nominal=None, upper=upper, lower=None, datums=datums, sides=sides, text=text, text_point=text_point
+        kind=kind,
+        nominal=None,
+        upper=upper,
+        lower=None,
+        datums=datums,
+        sides=sides,
+        text=text,
+        text_point=text_point,
+        tolerance="none" if upper is not None else "unreadable",
     )
 
 

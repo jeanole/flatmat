@@ -302,11 +302,13 @@ def test_unreadable_tolerance_keeps_its_path(bracket):
     _, sheet, f = bracket
     sides = (PmiSide((f["end"],)), PmiSide((f["hole"],)))
     items = (
-        PmiItem(1, "linear", 20.0, None, None, sides=sides, text="20 +0.1/-0.1 (unit unknown)"),
-        PmiItem(2, "linear", None, None, None, sides=sides, text="40–40.2 (limits)"),
+        PmiItem(1, "linear", 20.0, None, None, sides=sides, text="20 +0.1/-0.1 (unit unknown)", tolerance="unreadable"),
+        PmiItem(2, "linear", None, None, None, sides=sides, text="40–40.2 (limits)", tolerance="limits"),
     )
     pmi = map_pmi(sheet, PmiData("semantic", items))
     assert [p for _, p in pmi.items] == [PmiPath("laser", (f["base"],))] * 2
+    fit = PmiItem(3, "diameter", 8.0, None, None, sides=(PmiSide((f["hole"],)),), text="Ø8 H7", tolerance="fit")
+    assert map_pmi(sheet, PmiData("semantic", (fit,))).items == ((fit, PmiPath("laser_hole", (f["base"],))),)
 
 
 def test_sheet_thickness_is_unmapped(bracket):
