@@ -58,6 +58,7 @@ from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
 
 from ._occ import OCP_VERSION, LabelSequence, as_edge, as_face, as_solid, as_wire
 from .diagnostics import Code, Diagnostic, refuse, warn
+from .pmi import PmiData, read_pmi
 
 Heal = Literal["fast", "full"]
 
@@ -83,12 +84,29 @@ class StepModel:
     heal: Heal
     diagnostics: tuple[Diagnostic, ...] = ()
     doc: Any = field(default=None, repr=False, compare=False)  # TDocStd_Document, or None when pmi=False
+    _pmi: dict[int, PmiData] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @property
     def solid(self):
         if len(self.solids) != 1:
             raise refuse(Code.MULTIPLE_SOLIDS, f"{len(self.solids)} solids; pick one with solid=<index>")
         return self.solids[0]
+
+    def pmi_for(self, index: int) -> PmiData:
+        """The PMI of solid ``index`` (:func:`flatmat.pmi.read_pmi`), read once and cached.
+
+        Without a document: status ``"failed"`` when the XCAF read fell back (the load
+        already warned ``PMI_READ_FAILED``, so no second warning), else ``"none"``.
+        """
+        solid = self.solids[index]
+        if index not in self._pmi:
+            if self.doc is not None:
+                self._pmi[index] = read_pmi(self.doc, solid)
+            elif any(d.code is Code.PMI_READ_FAILED for d in self.diagnostics):
+                self._pmi[index] = PmiData("failed", ())
+            else:
+                self._pmi[index] = PmiData("none", ())
+        return self._pmi[index]
 
 
 def _prepare_78_fast() -> None:
