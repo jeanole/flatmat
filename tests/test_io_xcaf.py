@@ -9,6 +9,8 @@ from OCP.BRep import BRep_Builder
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
 from OCP.GProp import GProp_GProps
+from OCP.IFSelect import IFSelect_RetError
+from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
 from OCP.TopoDS import TopoDS_Compound
 
@@ -61,8 +63,61 @@ def test_fast_healing_reaches_the_xcaf_reader(any_case_path, monkeypatch):
         real(reader)
 
     monkeypatch.setattr(fm.io, "_apply_fast_80", spy)
-    fm.load_step(any_case_path, pmi=True)
+    model = fm.load_step(any_case_path, pmi=True)
     assert seen == ["STEPControl_Reader"]
+    assert model.doc is not None
+
+
+class _Reader:
+    """The real XCAF reader with some methods replaced."""
+
+    def __init__(self, **replaced):
+        self._real = STEPCAFControl_Reader()
+        self._replaced = replaced
+
+    def __getattr__(self, name):
+        return self._replaced.get(name) or getattr(self._real, name)
+
+
+def _boom(path, heal):
+    raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize(
+    "patch, reason",
+    [
+        (lambda m: m.setattr(fm.io, "_read_xcaf", _boom), "XCAF read failed: RuntimeError('boom')"),
+        (lambda m: m.setattr(fm.io, "_read_xcaf", lambda path, heal: ([], object())), "XCAF read found no solid"),
+        (
+            lambda m: m.setattr(fm.io, "STEPCAFControl_Reader", lambda: _Reader(ReadFile=lambda p: IFSelect_RetError)),
+            "XCAF ReadFile failed",
+        ),
+        (
+            lambda m: m.setattr(fm.io, "STEPCAFControl_Reader", lambda: _Reader(Transfer=lambda doc: False)),
+            "XCAF Transfer failed",
+        ),
+    ],
+    ids=["raises", "no_solid", "read_file", "transfer"],
+)
+def test_xcaf_failure_falls_back_with_a_warning(patch, reason, any_case_path, monkeypatch):
+    plain = fm.load_step(any_case_path, pmi=False)
+    patch(monkeypatch)
+    model = fm.load_step(any_case_path, pmi=True)
+    assert model.doc is None
+    assert _volumes(model) == _volumes(plain)
+    (w,) = (d for d in model.diagnostics if d.code is fm.Code.PMI_READ_FAILED)
+    assert w.severity is fm.Severity.WARNING
+    assert w.message.startswith(reason) and w.message.endswith("; geometry read without PMI")
+    assert [d.code for d in model.diagnostics if d is not w] == [d.code for d in plain.diagnostics]
+
+
+def test_unreadable_file_is_refused_without_a_pmi_warning(tmp_path):
+    path = tmp_path / "garbage.step"
+    path.write_text("not a STEP file")
+    for pmi in (False, True):
+        with pytest.raises(fm.FlatmatError) as e:
+            fm.load_step(path, pmi=pmi)
+        assert e.value.diagnostic.code is fm.Code.READ_FAILED
 
 
 def _volumes(model):

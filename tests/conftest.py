@@ -53,6 +53,9 @@ def _outcome(path: str, pmi: bool, k: float, dxf: str, heal: str):
         model = fm.load_step(path, heal, pmi=pmi)
     except fm.FlatmatError as e:
         return ("refused at load", e.diagnostic.code)
+    if pmi:  # the plain read succeeded too (or the outcomes differ below): it must have gone through XCAF
+        assert model.doc is not None, f"{path}: the pmi=True read fell back to the plain reader"
+        assert fm.Code.PMI_READ_FAILED not in [d.code for d in model.diagnostics]
     picks = [None] + (list(range(len(model.solids))) if len(model.solids) > 1 else [])
     return (
         len(model.solids),

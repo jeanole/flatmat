@@ -30,7 +30,9 @@ reader after ``ReadFile``; on 7.8 the resource file is process-wide anyway. Colo
 are not read. The solids are taken from ``XCAFDoc_ShapeTool.GetFreeShapes``, one
 free shape per transferred root in root order, which is the order ``OneShape()``
 gives. If the XCAF read fails or finds no solid, the plain reader reads the file
-again and the document is None: PMI never refuses a part.
+again, the document is None and the model carries a ``PMI_READ_FAILED`` warning:
+PMI never refuses a part. A file neither reader can read is refused as before,
+without the warning.
 """
 
 from __future__ import annotations
@@ -145,8 +147,15 @@ def _read_plain(path: str, heal: Heal):
     return reader.OneShape()
 
 
+class _XcafFailed(Exception):
+    """The XCAF reader reported a failure (not an exception of its own)."""
+
+
 def _read_xcaf(path: str, heal: Heal):
-    """The free shapes of the XCAF document, in root order, and the document; None if it fails."""
+    """The free shapes of the XCAF document, in root order, and the document.
+
+    Raises :class:`_XcafFailed` when ``ReadFile`` or ``Transfer`` report a failure.
+    """
     reader = STEPCAFControl_Reader()
     reader.SetGDTMode(True)
     reader.SetNameMode(True)
@@ -154,13 +163,13 @@ def _read_xcaf(path: str, heal: Heal):
     status = reader.ReadFile(path)
     _state["read_once"] = True
     if status != IFSelect_RetDone:
-        return None
+        raise _XcafFailed(f"XCAF ReadFile failed ({status})")
     if heal == "fast" and _HAS_FIX_PARAMETERS:
         _apply_fast_80(reader.ChangeReader())
     doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
     XCAFApp_Application.GetApplication_s().InitDocument(doc)
     if not reader.Transfer(doc):
-        return None
+        raise _XcafFailed("XCAF Transfer failed")
     labels = LabelSequence()
     XCAFDoc_DocumentTool.ShapeTool_s(doc.Main()).GetFreeShapes(labels)
     shapes = [XCAFDoc_ShapeTool.GetShape_s(labels.Value(i)) for i in range(1, labels.Length() + 1)]
@@ -189,19 +198,23 @@ def load_step(path: str | os.PathLike, heal: Heal = "fast", *, pmi: bool = True)
         _prepare_78_fast()
     if heal == "full" and _state["fast_78"]:
         diags.append(warn(Code.READ_FAILED, "full healing is unavailable on OCP 7.8 after a fast read in this process"))
-    doc, solids = None, []
+    doc, solids, pmi_failure = None, [], ""
     if pmi:
         try:
-            xcaf = _read_xcaf(path, heal)
-        except Exception:  # an OCCT failure in the XCAF layer: the plain reader decides
-            xcaf = None
-        if xcaf is not None:
-            solids = _solids_of(xcaf[0])
-            doc = xcaf[1] if solids else None
+            shapes, doc = _read_xcaf(path, heal)
+            solids = _solids_of(shapes)
+            if not solids:
+                doc, pmi_failure = None, "XCAF read found no solid"
+        except _XcafFailed as e:
+            doc, pmi_failure = None, str(e)
+        except Exception as e:  # never refuse a part over PMI: the plain reader decides
+            doc, pmi_failure = None, f"XCAF read failed: {e!r}"
     if not solids:
         solids = _solids_of([_read_plain(path, heal)])
-    if not solids:
-        raise refuse(Code.NO_SOLID, f"no solid in {path}")
+        if not solids:
+            raise refuse(Code.NO_SOLID, f"no solid in {path}")
+        if pmi_failure:
+            diags.append(warn(Code.PMI_READ_FAILED, f"{pmi_failure}; geometry read without PMI"))
     if heal == "fast":
         fixed = []
         for s in solids:
