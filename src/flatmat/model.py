@@ -10,6 +10,7 @@ from typing import Any, Literal
 import numpy as np
 
 from .diagnostics import Diagnostic
+from .pmi_map import SheetPmi
 
 Point = tuple[float, float]
 
@@ -449,6 +450,7 @@ class SheetPart:
     diagnostics: tuple[Diagnostic, ...] = ()
     source: str = ""
     features: tuple[Feature, ...] = ()
+    pmi: SheetPmi = SheetPmi("none")  # the file's PMI on this sheet (flatmat.pmi_map); "none" without
     # internal: the recognition context unfold() works on (OCP objects); not public API
     _ctx: Any = field(default=None, repr=False, compare=False)
 

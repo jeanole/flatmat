@@ -110,6 +110,8 @@ class Context:
     sharp_edges: dict[int, SharpEdge] = field(default_factory=dict)
     features: dict[int, FeatureData] = field(default_factory=dict)  # by feature id, ascending
     tol: Tolerances = field(default_factory=Tolerances)
+    # plane -> the opposite plane at the sheet thickness (either skin), for mapping PMI onto flanges
+    partners: dict[int, int] = field(default_factory=dict)
 
 
 def surface_props(face, ad, u: float, v: float) -> tuple[gp_Vec, float]:

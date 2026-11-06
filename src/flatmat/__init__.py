@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.2.0.dev0"
 
 from .bendmodel import KDin6935, KScalar, KTable, bend_allowance, bend_deduction, din6935_k, din6935_v
 from .dfm import MATERIALS, DfmReport, DfmRules, Material, check
@@ -30,6 +30,8 @@ from .model import (
     Spline,
     Tolerances,
 )
+from .pmi import PmiData, PmiItem, PmiSide
+from .pmi_map import GeneralTolerance, PmiPath, SheetPmi, Thread, map_pmi, parse_general_tolerance, parse_thread
 from .recognize import recognize
 from .sequence import BendPlan, BendStep, Collision, plan_bends
 from .tooling import DIES, PUNCHES, Die, Punch, Tooling
@@ -64,6 +66,7 @@ __all__ = [
     "FlatPattern",
     "FlatmatError",
     "FoldModel",
+    "GeneralTolerance",
     "KDin6935",
     "KScalar",
     "KTable",
@@ -71,11 +74,17 @@ __all__ = [
     "Line",
     "Loop2D",
     "PUNCHES",
+    "PmiData",
+    "PmiItem",
+    "PmiPath",
+    "PmiSide",
     "Punch",
     "Severity",
     "SheetPart",
+    "SheetPmi",
     "Spline",
     "StepModel",
+    "Thread",
     "Tolerances",
     "Tooling",
     "bend_allowance",
@@ -85,6 +94,9 @@ __all__ = [
     "din6935_k",
     "din6935_v",
     "load_step",
+    "map_pmi",
+    "parse_general_tolerance",
+    "parse_thread",
     "plan_bends",
     "recognize",
     "unfold",

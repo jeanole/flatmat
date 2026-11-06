@@ -78,6 +78,38 @@ A part flatmat cannot handle raises `fm.FlatmatError`. Its `.diagnostic` has a
 code (`VARIABLE_THICKNESS`, `EDGE_FEATURE`, `UNSUPPORTED_SURFACE`,
 `CYCLE_INCONSISTENT`, …) and names the faces involved.
 
+### PMI: tolerances from AP242 files
+
+`load_step` reads STEP through XCAF and keeps the file's semantic PMI:
+dimensions, GD&T, datums and notes. `recognize` maps it onto the sheet as
+`sheet.pmi`, a `SheetPmi`. flatmat does not judge whether a tolerance can be
+held. It gives the path each tolerance takes through the part, so the caller
+can decide which process determines it:
+
+| `PmiPath.kind` | when | carries |
+|---|---|---|
+| `laser` | both sides on one flange (cut edges, holes, outer contour) | `flanges` |
+| `laser_hole` | a hole diameter or a radius on a cut face | `flanges`; `feature_id` for a countersink or counterbore |
+| `bend_chain` | sides on different flanges | `bends` between them, in path order |
+| `bend_angle` | an angle, perpendicularity, parallelism or angularity between adjacent flanges | the one bend |
+| `flatness` | flatness of one flange | `flanges` |
+| `unmapped` | a side on a bend or a formed feature, an angle across several bends, other GD&T | `reason`, in plain English |
+
+```python
+sheet = fm.recognize(fm.load_step("part_mbd.step"))
+for item, path in sheet.pmi.items:  # status: "none", "semantic", "graphical_only", "failed"
+    print(item.kind, item.nominal, item.upper, item.lower, path.kind, path.bends, path.reason)
+print(sheet.pmi.general)  # GeneralTolerance("ISO 2768", "m", "K", ...) from a note or a callout
+print([(t.designation, t.through, t.face_ids) for t in sheet.pmi.threads])  # "M6 THRU" -> the hole wall
+```
+
+A tolerance flatmat cannot read (an unknown sign or unit, a limits dimension)
+has `upper` and `lower` set to None. It keeps its path and its raw text. A PMI
+problem is a warning (`PMI_READ_FAILED`, `PMI_GRAPHICAL_ONLY`), never a reason
+to refuse a part. A file without PMI gives `SheetPmi("none")` and the same
+result as before, byte for byte in the DXF. `load_step(path, pmi=False)` skips
+the XCAF read.
+
 ### Tests
 
 ```sh
