@@ -284,32 +284,39 @@ def _signed(v: float) -> str:
     return "0" if v == 0 else f"{v:+.6g}"
 
 
-def _values(obj, matcher: Matcher | None) -> tuple[float, float | None, float | None, str]:
-    """``(nominal, upper, lower, tolerance text)`` of a dimension object.
+def _values(obj, matcher: Matcher | None, unit: str) -> tuple[float | None, float | None, float | None, str]:
+    """``(nominal, upper, lower, value text)`` of a dimension object.
 
     With a matcher (a document read from STEP) the signed bounds come from the file
     (:mod:`flatmat._pmi_step`); without one (a document built in memory) from XCAF.
     """
     if obj.IsDimWithPlusMinusTolerance():
         kept = Kept(obj.GetValue(), obj.GetUpperTolValue(), obj.GetLowerTolValue())
-    elif obj.IsDimWithRange():  # what OCCT makes of a negative upper bound: (nominal, |lower|)
+    elif obj.IsDimWithRange():  # OCCT's (nominal, |lower|) for a negative upper bound, or true limits
         kept = Kept(obj.GetLowerBound(), None, obj.GetUpperBound(), negative_upper=True)
     else:
-        return obj.GetValue(), None, None, ""
+        kept = Kept(obj.GetValue(), None, None)
+    found = matcher.match(kept) if matcher is not None else None  # every dimension takes its turn
+    nominal = kept.nominal
+    if kept.lower_magnitude is None:
+        return nominal, None, None, f"{_num(nominal)}{unit}"
+    if kept.negative_upper and nominal <= kept.lower_magnitude and (found is None or found.upper is None):
+        limits = f"{_num(nominal)}{unit}–{_num(kept.lower_magnitude)}{unit}"  # lower and upper limit
+        return None, None, None, f"{limits} (limits)"
     if matcher is None:
-        if kept.upper is None or kept.lower_magnitude is None:
-            return kept.nominal, None, None, " (tolerance unreadable)"
+        if kept.upper is None:
+            return nominal, None, None, f"{_num(nominal)}{unit} (tolerance unreadable)"
         raw_up, raw_lo = kept.upper, 0.0 - kept.lower_magnitude
+    elif found is None or found.upper is None or found.lower is None:
+        return nominal, None, None, f"{_num(nominal)}{unit} (tolerance unreadable: not found in the file)"
+    elif found.upper.value is None or found.lower.value is None:
+        tol = f"{_signed(found.upper.raw)}/{_signed(found.lower.raw)}"
+        return nominal, None, None, f"{_num(nominal)}{unit} {tol} (unit unknown)"
     else:
-        found = matcher.match(kept)
-        if found is None or found.upper is None or found.lower is None:
-            return kept.nominal, None, None, " (tolerance unreadable: not found in the file)"
-        if found.upper.value is None or found.lower.value is None:
-            return kept.nominal, None, None, f" {_signed(found.upper.raw)}/{_signed(found.lower.raw)} (unit unknown)"
         raw_up, raw_lo = found.upper.value, found.lower.value
-    upper, lower = tolerance(kept.nominal, raw_up, raw_lo)
-    text = f" {_signed(raw_up)}/{_signed(raw_lo)}" + ("" if upper is not None else " (tolerance unreadable)")
-    return kept.nominal, upper, lower, text
+    upper, lower = tolerance(nominal, raw_up, raw_lo)
+    text = f"{_num(nominal)}{unit} {_signed(raw_up)}/{_signed(raw_lo)}"
+    return nominal, upper, lower, text + ("" if upper is not None else " (tolerance unreadable)")
 
 
 def _dimension(label, faces: _Faces, matcher: Matcher | None):
@@ -319,17 +326,17 @@ def _dimension(label, faces: _Faces, matcher: Matcher | None):
     if dtype in _GRAPHICAL:
         return None, True
     kind = _DIM_KINDS.get(dtype, "other_gdt")
-    nominal, upper, lower, tol = _values(obj, matcher)  # before the sides: every dimension takes its turn
+    unit = "°" if kind == "angle" else ""
+    nominal, upper, lower, value_text = _values(obj, matcher, unit)  # before the sides: each takes its turn
     first, second = _refs(label)
     pts = [obj.GetPoint().Coord() if obj.HasPoint() else None, obj.GetPoint2().Coord() if obj.HasPoint2() else None]
     sides = _sides(faces, [first, second], pts)
     if sides is None:
         return None, False
-    unit = "°" if kind == "angle" else ""
     name = _text(obj.GetSemanticName())
     if kind == "other_gdt":
         name = name or _enum_name(dtype, "XCAFDimTolObjects_DimensionType_")
-    text = f"{_PREFIX.get(kind, '')}{_num(nominal)}{unit}{tol}"
+    text = f"{_PREFIX.get(kind, '')}{value_text}"
     if kind == "other_gdt":
         text = f"{name} {text}"
     for i in range(1, obj.NbDescriptions() + 1):
@@ -337,7 +344,7 @@ def _dimension(label, faces: _Faces, matcher: Matcher | None):
     if _text(obj.GetPresentationName()):
         text += f"; {_text(obj.GetPresentationName())}"
     text_point = obj.GetPointTextAttach().Coord() if obj.HasTextPoint() else None
-    value = None if math.isnan(nominal) else nominal
+    value = None if nominal is None or math.isnan(nominal) else nominal
     return (
         dict(kind=kind, nominal=value, upper=upper, lower=lower, sides=sides, text=text, text_point=text_point),
         False,
@@ -443,28 +450,32 @@ def _entry(label) -> str:
     return s.ToCString()
 
 
-def read_pmi(doc, solid, step: Sequence[StepDimension] | None = None) -> PmiData:
+def read_pmi(doc, solid, step: Sequence[StepDimension] = (), *, trust_xcaf: bool = False) -> PmiData:
     """The semantic PMI of ``doc`` that refers to ``solid`` (see the module docstring).
 
-    ``step`` is what :func:`flatmat._pmi_step.step_dimensions` read from the STEP file the
-    document came from; tolerances come from there. None means the document was not read
-    from STEP (it was built in memory), and XCAF's own values are used.
+    For a STEP file use :meth:`flatmat.StepModel.pmi_for`, which passes the file's
+    dimensions. ``step`` is what :func:`flatmat._pmi_step.step_dimensions` read from the
+    file the document came from, and tolerances come from there: without it every
+    tolerance is unreadable. ``trust_xcaf`` takes XCAF's own values instead, which is
+    right only for a document built in memory (OCCT's STEP reader loses signs and units).
 
     Never raises: any error gives status ``"failed"`` with a ``PMI_READ_FAILED`` warning.
     """
     try:
-        return _read(doc, solid, None if step is None else Matcher(step))
+        return _read(doc, solid, step, trust_xcaf)
     except Exception as e:  # PMI never refuses a part
         return PmiData("failed", (), diagnostics=(warn(Code.PMI_READ_FAILED, f"PMI not read: {e!r}"),))
 
 
-def _read(doc, solid, matcher: Matcher | None) -> PmiData:
+def _read(doc, solid, step: Sequence[StepDimension], trust_xcaf: bool) -> PmiData:
     faces = _Faces(solid)
     tool = XCAFDoc_DocumentTool.DimTolTool_s(doc.Main())
     dims, tols, datums = LabelSequence(), LabelSequence(), LabelSequence()
     tool.GetDimensionLabels(dims)
     tool.GetGeomToleranceLabels(tols)
     tool.GetDatumLabels(datums)
+    semantic = sum(XCAFDoc_Dimension.Set_s(lab).GetObject().GetType() not in _GRAPHICAL for lab in _seq(dims))
+    matcher = None if trust_xcaf else Matcher(step, semantic)
     labelled = sorted(
         [(lab.Tag(), "dim", lab) for lab in _seq(dims)]
         + [(lab.Tag(), "tol", lab) for lab in _seq(tols)]

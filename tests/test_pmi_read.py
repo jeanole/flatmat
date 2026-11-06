@@ -366,25 +366,81 @@ def test_same_magnitudes_with_different_signs_keep_their_own(tmp_path, bracket):
 
 
 def test_tolerance_not_found_in_the_file_is_unreadable(bracket):
-    """A document said to come from a STEP file whose dimensions could not be read."""
+    """Without the file's dimensions every tolerance is unreadable; trust_xcaf is for documents built in memory."""
     shape, f = bracket
     doc = make_doc_with_pmi(shape, [dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]],))])
-    (item,) = read_pmi(doc, shape, step=()).items
+    (item,) = read_pmi(doc, shape).items
     assert (item.nominal, item.upper, item.lower) == (20.0, None, None)
     assert item.text == "20 (tolerance unreadable: not found in the file)"
-    (kept,) = read_pmi(doc, shape).items  # built in memory: XCAF's own values
+    (kept,) = read_pmi(doc, shape, trust_xcaf=True).items  # built in memory: XCAF's own values
     assert (kept.upper, kept.lower) == (0.1, -0.1)
+
+
+def test_entity_dropped_by_occt_makes_the_signs_unreadable(tmp_path, bracket):
+    """OCCT drops a dimension whose shapes it cannot find: the order no longer says which entity is which."""
+    shape, f = bracket
+    sides = ([f["end"]], [f["hole"]])
+    items = [dict(kind="linear", nominal=40.0, upper=0.1, lower=lo, faces=sides) for lo in (-0.05, 0.05)]
+    path = tmp_path / "dropped.step"
+    write_step_with_pmi(shape, items, str(path))
+    lines = path.read_text().splitlines()
+    gisu = [i for i, line in enumerate(lines) if "GEOMETRIC_ITEM_SPECIFIC_USAGE" in line][:2]  # the first one's
+    path.write_text("\n".join(line for i, line in enumerate(lines) if i not in gisu) + "\n")
+    model = fm.load_step(path)
+    assert len(model.step_dimensions) == 2
+    (item,) = model.pmi_for(0).items  # the second dimension, +0.1/+0.05 in the file
+    assert (item.nominal, item.upper, item.lower) == (40.0, None, None)
+    assert item.text == "40 (tolerance unreadable: not found in the file)"
+
+
+def test_limits_dimension_keeps_both_limits(tmp_path, bracket):
+    """A dimension given as a lower and an upper limit, with no plus-minus tolerance."""
+    shape, f = bracket
+    path = tmp_path / "limits.step"
+    write_step_with_pmi(shape, [dict(kind="linear", nominal=40.0, faces=([f["end"]], [f["hole"]]))], str(path))
+    step = path.read_text()
+    nominal = re.search(
+        r"^(#\d+) = \( LENGTH_MEASURE_WITH_UNIT\(\) MEASURE_REPRESENTATION_ITEM\(\) \n"
+        r"MEASURE_WITH_UNIT\(POSITIVE_LENGTH_MEASURE\(40\.\),(#\d+)\) REPRESENTATION_ITEM\n"
+        r"\('nominal value'\) \);\n",
+        step,
+        re.M,
+    )
+    item_id, unit = nominal.groups()
+    upper = (
+        "#99999 = ( LENGTH_MEASURE_WITH_UNIT() MEASURE_REPRESENTATION_ITEM() \n"
+        f"MEASURE_WITH_UNIT(POSITIVE_LENGTH_MEASURE(40.2),{unit}) REPRESENTATION_ITEM\n"
+        "('upper limit') );\n"
+    )
+    step = step.replace(nominal.group(0), nominal.group(0).replace("'nominal value'", "'lower limit'") + upper)
+    step, n = re.subn(
+        rf"SHAPE_DIMENSION_REPRESENTATION\('',\({item_id}\),",
+        rf"SHAPE_DIMENSION_REPRESENTATION('',({item_id},#99999),",
+        step,
+    )
+    assert n == 1
+    path.write_text(step)
+    (item,) = fm.load_step(path).pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower) == (None, None, None)
+    assert item.text == "40\u201340.2 (limits)"
 
 
 def _dim(nominal, upper, lower):
     return StepDimension(Bound(nominal, 1.0), Bound(upper, 1.0), Bound(lower, 1.0))
 
 
-def test_matcher_pairs_in_file_order_and_refuses_ambiguity():
+def test_matcher_pairs_in_file_order_when_every_entity_has_a_label():
     kept = Kept(20.0, 0.1, 0.05)  # what XCAF keeps of both +0.1/+0.05 and +0.1/-0.05
-    m = Matcher([_dim(20.0, 0.1, 0.05), _dim(20.0, 0.1, -0.05)])
+    m = Matcher([_dim(20.0, 0.1, 0.05), _dim(20.0, 0.1, -0.05)], labels=2)
     assert m.match(kept).lower.raw == 0.05 and m.match(kept).lower.raw == -0.05 and m.match(kept) is None
-    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, 0.05), _dim(20.0, 0.1, -0.05)])
-    assert m.match(kept) is None  # the next one disagrees, and the two that agree differ in sign
-    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, -0.05)])
-    assert m.match(kept).lower.raw == -0.05 and m.next == 2  # skipped ahead: every candidate says the same
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05)], labels=2)
+    assert m.match(kept) is None  # its own entity disagrees: unreadable, and the turn is used
+    assert m.match(Kept(20.0, 0.1, 0.05)).lower.raw == -0.05
+
+
+def test_matcher_refuses_ambiguity_when_occt_dropped_an_entity():
+    kept = Kept(20.0, 0.1, 0.05)
+    m = Matcher([_dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, 0.05)], labels=1)
+    assert m.match(kept) is None  # the in-order candidate too: the two that agree differ in sign
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, -0.05)], labels=2)
+    assert m.match(kept).lower.raw == -0.05 and m.next == 2  # every candidate that agrees says the same

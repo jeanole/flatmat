@@ -10,11 +10,12 @@ So :func:`step_dimensions` reads every ``dimensional_location`` / ``dimensional_
 of the transferred StepData model, in file order, with its ``plus_minus_tolerance``
 bounds as written and the size of each bound's own unit (mm or degrees per unit).
 :class:`Matcher` then pairs the document's semantic dimensions with these, in order:
-OCCT creates one dimension label per such entity, in file order. A pair is accepted
-only when what XCAF kept agrees with the file (the nominal, the upper bound and the
-lower bound's magnitude). When the next entity disagrees, a later one is taken only if
-every later entity that agrees states the same signed bounds; otherwise the dimension is
-unmatched and its tolerance unreadable.
+OCCT creates one dimension label per such entity, in file order, unless it drops an
+entity it cannot read (one whose shapes it cannot find, for one). A pair is used only
+when what XCAF kept agrees with the file (the nominal, the upper bound and the lower
+bound's magnitude). When OCCT dropped an entity the order no longer holds, and a pair
+is used only if every remaining entity that agrees states the same signed bounds;
+otherwise the dimension is unmatched and its tolerance unreadable.
 """
 
 from __future__ import annotations
@@ -196,22 +197,27 @@ def _matches(k: Kept, s: StepDimension) -> bool:
 
 
 class Matcher:
-    """Pairs the document's semantic dimensions, in label order, with the file's (module docstring)."""
+    """Pairs the document's semantic dimensions, in label order, with the file's (module docstring).
 
-    def __init__(self, dims: Sequence[StepDimension]) -> None:
+    ``labels`` is the number of semantic dimension labels in the document. When it equals
+    the number of the file's dimension entities, OCCT made one label per entity and the
+    k-th label is the k-th entity: every dimension takes its turn, and a pair is used
+    only if it agrees. When the counts differ, OCCT dropped some entity, and a
+    dimension takes the first remaining entity that agrees, only if every remaining
+    entity that agrees states the same signed bounds.
+    """
+
+    def __init__(self, dims: Sequence[StepDimension], labels: int) -> None:
         self.dims = list(dims)
+        self.in_order = labels == len(self.dims)
         self.next = 0
 
     def match(self, k: Kept) -> StepDimension | None:
-        n = self.next
-        if n < len(self.dims) and _matches(k, self.dims[n]):
-            self.next = n + 1
-            return self.dims[n]
-        ahead = [j for j in range(n + 1, len(self.dims)) if _matches(k, self.dims[j])]
-        if not ahead:
-            return None
-        signed = {(self.dims[j].upper, self.dims[j].lower) for j in ahead}
-        if len(signed) > 1:
-            return None  # entities that agree with XCAF but differ in sign: no way to tell which
-        self.next = ahead[0] + 1
-        return self.dims[ahead[0]]
+        if self.in_order:
+            j, self.next = self.next, self.next + 1
+            return self.dims[j] if j < len(self.dims) and _matches(k, self.dims[j]) else None
+        agree = [j for j in range(self.next, len(self.dims)) if _matches(k, self.dims[j])]
+        if not agree or len({(self.dims[j].upper, self.dims[j].lower) for j in agree}) > 1:
+            return None  # nothing agrees, or entities that agree differ in sign: no way to tell which
+        self.next = agree[0] + 1
+        return self.dims[agree[0]]
