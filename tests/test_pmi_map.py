@@ -382,11 +382,35 @@ def test_mapping_error_never_refuses(tmp_path, bracket, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("flatmat.pmi_map.map_pmi", boom)
+    monkeypatch.setattr("flatmat.pmi_map._Sheet", boom)
     sheet = fm.recognize(fm.load_step(path))
     assert sheet.pmi.status == "failed"
     assert [d.code for d in sheet.diagnostics] == [fm.Code.PMI_READ_FAILED]
     assert sheet.flanges and fm.unfold(sheet).area > 0
+
+
+def test_one_item_that_fails_to_map_loses_only_its_path(tmp_path, bracket, monkeypatch):
+    shape, _, f = bracket
+    path = os.fspath(tmp_path / "pmi.step")
+    items = [dict(kind="linear", nominal=n, faces=([f["end"]], [f["hole"]])) for n in (20.0, 21.0)]
+    write_step_with_pmi(shape, items, path)
+    real = fm.pmi_map._path
+
+    def first_fails(on, item, datums):
+        if item.id == 1:
+            raise RuntimeError("bad item")
+        return real(on, item, datums)
+
+    monkeypatch.setattr("flatmat.pmi_map._path", first_fails)
+    sheet = fm.recognize(fm.load_step(path))
+    assert sheet.pmi.status == "semantic"
+    assert [p for _, p in sheet.pmi.items] == [
+        PmiPath("unmapped", reason="not mapped: an error in flatmat"),
+        PmiPath("laser", (f["base"],)),
+    ]
+    (w,) = sheet.diagnostics
+    assert (w.code, w.data["count"]) == (fm.Code.PMI_READ_FAILED, 1)
+    assert w.message == "1 PMI item(s) not mapped onto the sheet: RuntimeError('bad item')"
 
 
 def test_joggle_chain_crosses_both_bends():

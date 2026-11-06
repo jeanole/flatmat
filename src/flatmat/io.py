@@ -173,11 +173,12 @@ class _XcafFailed(Exception):
 
 
 def _read_xcaf(path: str, heal: Heal):
-    """The free shapes of the XCAF document, in root order, the document, and the file's dimensions.
+    """The free shapes of the XCAF document, in root order, the document, the file's
+    dimensions and a warning when they could not be read.
 
     The dimensions (:func:`flatmat._pmi_step.step_dimensions`) are read only when the
-    document has any; if reading them fails, they are empty and every toleranced
-    dimension reads as unreadable.
+    document has any; if reading them fails, they are empty, every toleranced dimension
+    reads as unreadable, and the load carries a ``PMI_READ_FAILED`` warning.
 
     Raises :class:`_XcafFailed` when ``ReadFile`` or ``Transfer`` report a failure.
     """
@@ -198,18 +199,18 @@ def _read_xcaf(path: str, heal: Heal):
     labels = LabelSequence()
     XCAFDoc_DocumentTool.ShapeTool_s(doc.Main()).GetFreeShapes(labels)
     shapes = [XCAFDoc_ShapeTool.GetShape_s(labels.Value(i)) for i in range(1, labels.Length() + 1)]
-    return shapes, doc, _dimensions_of(reader, doc)
+    return (shapes, doc, *_dimensions_of(reader, doc))
 
 
-def _dimensions_of(reader, doc) -> tuple[StepDimension, ...]:
+def _dimensions_of(reader, doc) -> tuple[tuple[StepDimension, ...], Diagnostic | None]:
     labels = LabelSequence()
     XCAFDoc_DocumentTool.DimTolTool_s(doc.Main()).GetDimensionLabels(labels)
     if not labels.Length():
-        return ()
+        return (), None
     try:
-        return step_dimensions(reader.ChangeReader().StepModel())
-    except Exception:  # PMI never refuses a part: the tolerances become unreadable
-        return ()
+        return step_dimensions(reader.ChangeReader().StepModel()), None
+    except Exception as e:  # PMI never refuses a part: the tolerances become unreadable
+        return (), warn(Code.PMI_READ_FAILED, f"tolerance signs not read: {e!r}")
 
 
 def _solids_of(shapes) -> list:
@@ -237,10 +238,12 @@ def load_step(path: str | os.PathLike, heal: Heal = "fast", *, pmi: bool = True)
     doc, solids, pmi_failure, step_dims = None, [], "", ()
     if pmi:
         try:
-            shapes, doc, step_dims = _read_xcaf(path, heal)
+            shapes, doc, step_dims, unread = _read_xcaf(path, heal)
             solids = _solids_of(shapes)
             if not solids:
                 doc, pmi_failure = None, "XCAF read found no solid"
+            elif unread is not None:
+                diags.append(unread)
         except _XcafFailed as e:
             doc, pmi_failure = None, str(e)
         except Exception as e:  # never refuse a part over PMI: the plain reader decides

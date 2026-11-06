@@ -490,8 +490,9 @@ def _datum_item(label, faces: _Faces):
     )
 
 
-def _notes(doc, faces: _Faces):
-    """``(text, sides)`` per note, or ``(text, None)`` when it points at another solid."""
+def _notes(doc, faces: _Faces, failed: list[Exception]):
+    """``(text, sides)`` per note, ``(text, None)`` when it points at another solid, and
+    ``None`` for a note that could not be read (its error appended to ``failed``)."""
     tool = XCAFDoc_DocumentTool.NotesTool_s(doc.Main())
     notes = LabelSequence()
     tool.GetNotes(notes)
@@ -501,36 +502,53 @@ def _notes(doc, faces: _Faces):
     annotated = LabelSequence()
     tool.GetAnnotatedItems(annotated)
     for lab in _seq(annotated):
-        ref = XCAFDoc_AssemblyItemRef.Get_s(lab)
-        if ref is None or ref.IsGUID() or ref.IsSubshapeIndex():
-            continue  # notes on attributes, or on a sub-shape index: no face to name
-        item_id = ref.GetItem()
-        item = TDF_Label()
-        TDF_Tool.Label_s(doc.GetData(), item_id.ToString(), item, False)
-        if item.IsNull():
-            continue
-        found = LabelSequence()
-        tool.GetNotes(item_id, found)
-        for note in _seq(found):
-            targets.setdefault(_entry(note), []).append(XCAFDoc_ShapeTool.GetShape_s(item))
-    out = []
+        try:
+            _annotated(doc, tool, lab, targets)
+        except Exception as e:  # one link lost, not the notes
+            failed.append(e)
+    out: list[tuple[str, tuple[PmiSide, ...] | None] | None] = []
     for note in _seq(notes):
-        comment = XCAFDoc_NoteComment.Get_s(note)
-        if comment is not None:
-            text = _text(comment.Comment())
-        else:
-            bin_data = XCAFDoc_NoteBinData.Get_s(note)
-            text = _text(bin_data.Title()) if bin_data is not None else ""
-        ids: set[int] = set()
-        foreign = False
-        for shape in targets.get(_entry(note), []):
-            got = faces.of(shape)
-            if got is None:
-                foreign = True
-                break
-            ids.update(got)
-        out.append((text, None if foreign else ((PmiSide(tuple(sorted(ids))),) if ids else ())))
+        try:
+            out.append(_note(note, targets, faces))
+        except Exception as e:
+            failed.append(e)
+            out.append(None)
     return out
+
+
+def _annotated(doc, tool, lab, targets: dict[str, list]) -> None:
+    """Add the shape an annotated item names to the targets of each of its notes."""
+    ref = XCAFDoc_AssemblyItemRef.Get_s(lab)
+    if ref is None or ref.IsGUID() or ref.IsSubshapeIndex():
+        return  # notes on attributes, or on a sub-shape index: no face to name
+    item_id = ref.GetItem()
+    item = TDF_Label()
+    TDF_Tool.Label_s(doc.GetData(), item_id.ToString(), item, False)
+    if item.IsNull():
+        return
+    found = LabelSequence()
+    tool.GetNotes(item_id, found)
+    for note in _seq(found):
+        targets.setdefault(_entry(note), []).append(XCAFDoc_ShapeTool.GetShape_s(item))
+
+
+def _note_text(note) -> str:
+    comment = XCAFDoc_NoteComment.Get_s(note)
+    if comment is not None:
+        return _text(comment.Comment())
+    bin_data = XCAFDoc_NoteBinData.Get_s(note)
+    return _text(bin_data.Title()) if bin_data is not None else ""
+
+
+def _note(note, targets: dict[str, list], faces: _Faces) -> tuple[str, tuple[PmiSide, ...] | None]:
+    text = _note_text(note)
+    ids: set[int] = set()
+    for shape in targets.get(_entry(note), []):
+        got = faces.of(shape)
+        if got is None:
+            return text, None
+        ids.update(got)
+    return text, (PmiSide(tuple(sorted(ids))),) if ids else ()
 
 
 def _entry(label) -> str:
@@ -548,7 +566,9 @@ def read_pmi(doc, solid, step: Sequence[StepDimension] = (), *, trust_xcaf: bool
     tolerance is unreadable. ``trust_xcaf`` takes XCAF's own values instead, which is
     right only for a document built in memory (OCCT's STEP reader loses signs and units).
 
-    Never raises: any error gives status ``"failed"`` with a ``PMI_READ_FAILED`` warning.
+    Never raises. An item that cannot be read is left out (its id is not reused), with one
+    ``PMI_READ_FAILED`` warning that counts them; an error outside the items gives status
+    ``"failed"`` with a ``PMI_READ_FAILED`` warning.
     """
     try:
         return _read(doc, solid, step, trust_xcaf)
@@ -563,8 +583,8 @@ def _read(doc, solid, step: Sequence[StepDimension], trust_xcaf: bool) -> PmiDat
     tool.GetDimensionLabels(dims)
     tool.GetGeomToleranceLabels(tols)
     tool.GetDatumLabels(datums)
-    semantic = sum(XCAFDoc_Dimension.Set_s(lab).GetObject().GetType() not in _GRAPHICAL for lab in _seq(dims))
-    matcher = None if trust_xcaf else Matcher(step, semantic)
+    graphical_tags = {lab.Tag() for lab in _seq(dims) if _is_graphical(lab)}
+    matcher = None if trust_xcaf else Matcher(step, dims.Length() - len(graphical_tags))
     labelled = sorted(
         [(lab.Tag(), "dim", lab) for lab in _seq(dims)]
         + [(lab.Tag(), "tol", lab) for lab in _seq(tols)]
@@ -572,40 +592,65 @@ def _read(doc, solid, step: Sequence[StepDimension], trust_xcaf: bool) -> PmiDat
         key=lambda t: t[0],
     )
     items: list[PmiItem] = []
-    n_semantic = dropped = graphical = 0
+    n_semantic = dropped = 0
+    failed: list[Exception] = []  # items that could not be read: each loses only itself
     presented: list[frozenset[int] | None] = []  # the faces of each graphical annotation
-    for _, what, lab in labelled:
-        if what == "dim":
-            fields, is_graphical = _dimension(lab, faces, matcher)
-            if is_graphical:
-                graphical += 1
+    for tag, what, lab in labelled:
+        if tag in graphical_tags and what == "dim":
+            try:
                 presented.append(_presented(lab, faces))
-                continue
-        else:
-            fields = _tolerance_item(lab, faces) if what == "tol" else _datum_item(lab, faces)
-        n_semantic += 1
-        if fields is None:
-            dropped += 1
+            except Exception:
+                presented.append(frozenset())  # faces unknown: not a copy of a semantic item
             continue
-        text_point = fields.pop("text_point")
-        items.append(PmiItem(n_semantic, anchor=_anchor(text_point, fields["sides"], faces), **fields))
-    for text, sides in _notes(doc, faces):
         n_semantic += 1
+        turns = matcher.turns if matcher is not None else 0
+        try:
+            if what == "dim":
+                fields, _ = _dimension(lab, faces, matcher)
+            else:
+                fields = _tolerance_item(lab, faces) if what == "tol" else _datum_item(lab, faces)
+            if fields is None:
+                dropped += 1
+                continue
+            text_point = fields.pop("text_point")
+            items.append(PmiItem(n_semantic, anchor=_anchor(text_point, fields["sides"], faces), **fields))
+        except Exception as e:
+            failed.append(e)
+            if what == "dim" and matcher is not None and matcher.turns == turns:
+                matcher.skip()  # in file order it still uses its entity
+    for note in _notes(doc, faces, failed):
+        n_semantic += 1
+        if note is None:
+            continue
+        text, sides = note
         if sides is None:
             dropped += 1
             continue
         items.append(
             PmiItem(n_semantic, "note", None, None, None, sides=sides, anchor=_anchor(None, sides, faces), text=text)
         )
+    diags: list[Diagnostic] = []
+    if failed:
+        msg = f"{len(failed)} PMI item(s) not read: {failed[0]!r}"
+        diags.append(warn(Code.PMI_READ_FAILED, msg, count=len(failed)))
     if n_semantic:
         semantic_faces = [{f for s in i.sides for f in s.face_ids} for i in items]
         orphans = sum(1 for k in presented if k is not None and not (k and any(k <= f for f in semantic_faces)))
-        if not orphans:
-            return PmiData("semantic", tuple(items), dropped)
-        return PmiData("semantic", tuple(items), dropped, (_graphical_warning(orphans),), graphical=orphans)
-    if graphical:
-        return PmiData("graphical_only", (), diagnostics=(_graphical_warning(graphical),), graphical=graphical)
-    return PmiData("none", ())
+        if orphans:
+            diags.append(_graphical_warning(orphans))
+        return PmiData("semantic", tuple(items), dropped, tuple(diags), graphical=orphans)
+    if presented:
+        n = len(presented)
+        return PmiData("graphical_only", (), diagnostics=(*diags, _graphical_warning(n)), graphical=n)
+    return PmiData("none", (), diagnostics=tuple(diags))
+
+
+def _is_graphical(label) -> bool:
+    """A graphical-only annotation; a dimension whose type cannot be read counts as semantic."""
+    try:
+        return XCAFDoc_Dimension.Set_s(label).GetObject().GetType() in _GRAPHICAL
+    except Exception:
+        return False
 
 
 def _graphical_warning(n: int) -> Diagnostic:

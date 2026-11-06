@@ -577,3 +577,68 @@ def test_graphical_annotation_beside_semantic_pmi_warns(tmp_path, bracket):
     sheet = fm.recognize(fm.load_step(tmp_path / "pmi.step"))
     assert sheet.pmi.graphical == 1
     assert [d.code for d in sheet.diagnostics].count(fm.Code.PMI_GRAPHICAL_ONLY) == 1
+
+
+def test_unreadable_step_dimensions_warn(tmp_path, bracket, monkeypatch):
+    """If the file's dimensions cannot be read, the part still loads, its tolerances are
+    unreadable, and a warning says why."""
+    shape, f = bracket
+    path = str(tmp_path / "dim.step")
+    items = [dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]]))]
+    write_step_with_pmi(shape, items, path)
+
+    def boom(model):
+        raise RuntimeError("no entities")
+
+    monkeypatch.setattr(fm.io, "step_dimensions", boom)
+    model = fm.load_step(path)
+    assert model.doc is not None and model.step_dimensions == ()
+    (w,) = (d for d in model.diagnostics if d.code is fm.Code.PMI_READ_FAILED)
+    assert w.message == "tolerance signs not read: RuntimeError('no entities')"
+    (item,) = model.pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower, item.tolerance) == (20.0, None, None, "unreadable")
+    sheet = fm.recognize(model)
+    assert [d.code for d in sheet.diagnostics].count(fm.Code.PMI_READ_FAILED) == 1
+
+
+def _fails_once(monkeypatch, name):
+    """``flatmat.pmi.<name>`` raising at its first call only."""
+    real, calls = getattr(fm.pmi, name), []
+
+    def once(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("bad label")
+        return real(*a, **k)
+
+    monkeypatch.setattr(fm.pmi, name, once)
+
+
+def test_one_bad_label_loses_only_its_item(tmp_path, bracket, monkeypatch):
+    shape, f = bracket
+    items = [
+        dict(kind="linear", nominal=20.0, upper=0.1, lower=0.05, faces=([f["end"]], [f["hole"]])),
+        dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.05, faces=([f["end"]], [f["hole"]])),
+        dict(kind="flatness", zone=0.1, faces=([f["skin"]],)),
+    ]
+    model = _load(tmp_path, shape, items)
+    whole = read_pmi(model.doc, model.solids[0], model.step_dimensions).items
+    _fails_once(monkeypatch, "_dimension")
+    data = read_pmi(model.doc, model.solids[0], model.step_dimensions)
+    assert data.status == "semantic"
+    assert data.items == whole[1:]  # the others keep their ids, and the second dimension its own signs
+    assert (data.items[0].upper, data.items[0].lower) == (0.1, -0.05)
+    (w,) = data.diagnostics
+    assert (w.code, w.data["count"]) == (fm.Code.PMI_READ_FAILED, 1)
+    assert w.message == "1 PMI item(s) not read: RuntimeError('bad label')"
+
+
+def test_one_bad_note_loses_only_itself(bracket, monkeypatch):
+    shape, f = bracket
+    doc = make_doc_with_pmi(
+        shape, [dict(kind="note", text="M6 THRU", faces=([f["hole"]],)), dict(kind="note", text="ISO 2768-mK")]
+    )
+    _fails_once(monkeypatch, "_note_text")
+    data = read_pmi(doc, shape)
+    assert [(i.id, i.text) for i in data.items] == [(2, "ISO 2768-mK")]
+    assert [d.code for d in data.diagnostics] == [fm.Code.PMI_READ_FAILED]

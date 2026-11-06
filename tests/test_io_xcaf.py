@@ -87,7 +87,10 @@ def _boom(path, heal):
     "patch, reason",
     [
         (lambda m: m.setattr(fm.io, "_read_xcaf", _boom), "XCAF read failed: RuntimeError('boom')"),
-        (lambda m: m.setattr(fm.io, "_read_xcaf", lambda path, heal: ([], object(), ())), "XCAF read found no solid"),
+        (
+            lambda m: m.setattr(fm.io, "_read_xcaf", lambda path, heal: ([], object(), (), None)),
+            "XCAF read found no solid",
+        ),
         (
             lambda m: m.setattr(fm.io, "STEPCAFControl_Reader", lambda: _Reader(ReadFile=lambda p: IFSelect_RetError)),
             "XCAF ReadFile failed",

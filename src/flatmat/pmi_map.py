@@ -454,9 +454,18 @@ def _holes(walls: tuple[int, ...], sheet: SheetPart) -> int:
 
 
 def map_pmi(sheet: SheetPart, data: PmiData) -> SheetPmi:
-    """The PMI of ``data`` on ``sheet`` (read from the same solid): see the module docstring."""
+    """The PMI of ``data`` on ``sheet`` (read from the same solid): see the module docstring.
+
+    An item that fails to map (an error in flatmat, not an unmapped item) is unmapped with
+    the reason ``"not mapped: an error in flatmat"``; :func:`with_pmi` also warns."""
+    return _map(sheet, data)[0]
+
+
+def _map(sheet: SheetPart, data: PmiData) -> tuple[SheetPmi, list[Exception]]:
+    """:func:`map_pmi`, and the errors of the items that failed to map."""
     items = [i for i in data.items if i.kind != "note"]
     pairs: list[tuple[PmiItem, PmiPath]] = []
+    failed: list[Exception] = []
     if items:
         on = _Sheet(sheet)
         datums: dict[str, PmiItem] = {}
@@ -468,18 +477,25 @@ def map_pmi(sheet: SheetPart, data: PmiData) -> SheetPmi:
                 path = _path(on, i, datums)
             except _Unmapped as e:
                 path = PmiPath("unmapped", reason=str(e))
+            except Exception as e:  # one item loses its path, not the others theirs
+                failed.append(e)
+                path = PmiPath("unmapped", reason="not mapped: an error in flatmat")
             pairs.append((i, path))
     threads = []
     general = None
     for i in data.items:
-        got = parse_thread(i.text)
-        if got is not None:
-            designation, nominal, pitch, through, count = got
-            walls = _hole_walls(i, sheet)
-            threads.append(Thread(designation, nominal, pitch, through, walls, max(count, _holes(walls, sheet), 1)))
+        try:
+            got = parse_thread(i.text)
+            if got is not None:
+                designation, nominal, pitch, through, count = got
+                walls = _hole_walls(i, sheet)
+                holes = max(count, _holes(walls, sheet), 1)
+                threads.append(Thread(designation, nominal, pitch, through, walls, holes))
+        except Exception as e:
+            failed.append(e)
         if general is None:
             general = parse_general_tolerance(i.text)
-    return SheetPmi(
+    pmi = SheetPmi(
         data.status,
         tuple(pairs),
         tuple(threads),
@@ -488,6 +504,7 @@ def map_pmi(sheet: SheetPart, data: PmiData) -> SheetPmi:
         data.dropped,
         data.graphical,
     )
+    return pmi, failed
 
 
 def with_pmi(sheet: SheetPart, data: PmiData) -> SheetPart:
@@ -495,8 +512,11 @@ def with_pmi(sheet: SheetPart, data: PmiData) -> SheetPart:
     if data.status == "none" and not data.diagnostics:
         return sheet  # a file without PMI: nothing changes
     try:
-        pmi = map_pmi(sheet, data)
+        pmi, failed = _map(sheet, data)
         diags = data.diagnostics
+        if failed:
+            msg = f"{len(failed)} PMI item(s) not mapped onto the sheet: {failed[0]!r}"
+            diags = (*diags, warn(Code.PMI_READ_FAILED, msg, count=len(failed)))
     except Exception as e:  # PMI never refuses a part
         pmi = SheetPmi("failed", dropped=data.dropped, graphical=data.graphical)
         diags = (*data.diagnostics, warn(Code.PMI_READ_FAILED, f"PMI not mapped onto the sheet: {e!r}"))
