@@ -215,7 +215,7 @@ def step_dimensions(model) -> tuple[StepDimension, ...]:
     tolerances: dict[int, Any] = {}  # dimension entity number -> its tolerance_value or limits_and_fits
     reps: dict[int, Any] = {}  # dimension entity number -> its shape_dimension_representation
     for i, e in enumerate(entities, 1):
-        if isinstance(e, (StepShape_DimensionalLocation, StepShape_DimensionalSize)):
+        if isinstance(e, StepShape_DimensionalLocation | StepShape_DimensionalSize):
             dims.append(i)
         elif isinstance(e, StepShape_PlusMinusTolerance):
             tolerances[number(e.TolerancedDimension().Value())] = e.Range()
