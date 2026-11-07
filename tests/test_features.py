@@ -45,7 +45,8 @@ def test_countersinks(feats):
     assert any(d.code == fm.Code.COUNTERSINK_PROJECTED for d in pat.diagnostics)
     centers = sorted(f.center for f in pat.features)
     holes = sorted(h.segments[0].center for h in pat.holes)
-    assert centers == pytest.approx(holes)
+    for c, h in zip(centers, holes, strict=True):  # pytest 9: approx takes no nested tuples
+        assert c == pytest.approx(h)
 
 
 def test_counterbores(feats):
