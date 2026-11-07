@@ -41,6 +41,7 @@ from .canonical import canonicalize
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .io import StepModel
 from .model import FEATURE_KINDS, Bend, BendSegment, FaceInfo, Feature, Flange, SheetPart, Tolerances
+from .pmi_map import with_pmi
 
 # ------------------------------------------------------------------------------ tables
 
@@ -1238,8 +1239,9 @@ def recognize(
         sharp_edges,
         table.data,
         tol,
+        partners,
     )
-    return SheetPart(
+    sheet = SheetPart(
         thickness=t,
         thickness_confidence=conf,
         faces=face_infos,
@@ -1251,3 +1253,6 @@ def recognize(
         features=tuple(features),
         _ctx=ctx,
     )
+    if isinstance(model, StepModel):  # the file's PMI on this sheet; a file without PMI changes nothing
+        sheet = with_pmi(sheet, model.pmi_for(solid if solid is not None else 0))
+    return sheet

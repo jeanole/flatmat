@@ -78,6 +78,63 @@ A part flatmat cannot handle raises `fm.FlatmatError`. Its `.diagnostic` has a
 code (`VARIABLE_THICKNESS`, `EDGE_FEATURE`, `UNSUPPORTED_SURFACE`,
 `CYCLE_INCONSISTENT`, …) and names the faces involved.
 
+### PMI: tolerances from AP242 files
+
+`load_step` reads STEP through XCAF and keeps the file's semantic PMI:
+dimensions, GD&T, datums and notes. `recognize` maps it onto the sheet as
+`sheet.pmi`, a `SheetPmi`. flatmat does not judge whether a tolerance can be
+held. It gives the path each tolerance takes through the part, so the caller
+can decide which process determines it:
+
+| `PmiPath.kind` | when | carries |
+|---|---|---|
+| `laser` | both sides on one flange (cut edges, holes, outer contour) | `flanges` |
+| `laser_hole` | a hole diameter or a radius on a cut face | `flanges`; `feature_id` for a countersink or counterbore |
+| `bend_chain` | sides on different flanges | `bends` between them, in path order |
+| `bend_angle` | an angle, perpendicularity, parallelism or angularity between adjacent flanges | the one bend |
+| `flatness` | flatness of one flange | `flanges` |
+| `unmapped` | a side on a bend or a formed feature, an angle across several bends, other GD&T | `reason`, in plain English |
+
+```python
+sheet = fm.recognize(fm.load_step("part_mbd.step"))
+for item, path in sheet.pmi.items:  # status: "none", "semantic", "graphical_only", "failed"
+    print(item.kind, item.nominal, item.upper, item.lower, item.tolerance, item.text, path.kind, path.bends)
+print(sheet.pmi.general)  # GeneralTolerance("ISO 2768", "m", "K", ...) from a note or a callout
+print([(t.designation, t.count, t.face_ids, t.pmi_ids) for t in sheet.pmi.threads])  # "M6 THRU" -> the hole
+```
+
+Lengths are in mm and angles in degrees, whatever the file's units.
+`PmiItem.tolerance` says what kind of tolerance a dimension has:
+
+| `tolerance` | means | `nominal`, `upper`, `lower` |
+|---|---|---|
+| `"none"` | no tolerance of its own: the general tolerance applies | the nominal; None, None |
+| `"plus_minus"` | a ± tolerance, signs as the file writes them (+0.1/+0.05 stays) | the nominal and the signed deviations |
+| `"limits"` | a lower and an upper limit, or a max / min qualifier (`max 20`) | None: `text` holds the limits |
+| `"fit"` | an ISO 286 fit: the class is in `text` (`Ø8 H7`) | the nominal; None, None |
+| `"unreadable"` | a sign or unit flatmat cannot read, inverted limits, a dimension not found in the file | None for the bounds: `text` keeps what was read |
+
+GD&T items are `"none"` (the zone is `upper`) or `"unreadable"`. A tolerance
+that cannot be read keeps its path and its raw text: whether it is checked is
+the caller's call, never a guess. OCCT's reader drops a STEP file's signs,
+angle units, max / min qualifiers and fit classes, so flatmat reads these from
+the file's own entities.
+
+Notes (free text) never survive OCCT's STEP reader: its writer drops them and
+its reader fills no notes table. Threads and the general tolerance are parsed
+from every text the reader does yield (dimension callouts, presentation
+names), and from notes of a document built in memory. A thread
+(`Thread.designation`, an ISO 261 size and pitch) counts the larger of the
+callout's `4x` and the holes it points at (coaxial walls in one flange are
+one hole); `Thread.pmi_ids` names the item it came from, empty for a note.
+`SheetPmi.graphical` counts graphical-only annotations beside semantic PMI
+that no semantic item repeats: callouts nobody checks.
+
+A PMI problem is a warning (`PMI_READ_FAILED`, `PMI_GRAPHICAL_ONLY`), never a
+reason to refuse a part: one bad item loses only itself. A file without PMI
+gives `SheetPmi("none")` and the same result as before, byte for byte in the
+DXF. `load_step(path, pmi=False)` skips the XCAF read.
+
 ### Tests
 
 ```sh

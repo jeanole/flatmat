@@ -4,10 +4,13 @@ import math
 import os
 
 import pytest
+from OCP.BRep import BRep_Tool
 from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
+from OCP.TopAbs import TopAbs_VERTEX
 from parts import Part, cases, feature_cases, make_solid, sharp_cases, write_step
 
 import flatmat as fm
+from flatmat._occ import as_vertex
 from flatmat.canonical import canonicalize, needs_canonicalization
 from flatmat.model import Spline
 
@@ -62,3 +65,44 @@ def test_input_shape_is_not_modified(step_dir):
     assert diag is not None and converted is not solid
     ex = TopExp_Explorer(solid, TopAbs_FACE)
     assert BRepAdaptor_Surface(as_face(ex.Current()), False).GetType() == GeomAbs_BSplineSurface
+
+
+def _face_signatures(shape) -> list[list[tuple[float, float, float]]]:
+    """Sorted vertex points of every face, in TopExp.MapShapes order.
+
+    That is the order PMI face references index into. Vertices are exact and survive the
+    surface conversion untouched (rounded to 1 um), unlike GProp centroids of trimmed faces, which are
+    integrated over rebuilt pcurves and can drift (L_hole_in_bend's hole wall).
+    """
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp
+
+    from flatmat._occ import ShapeMap
+
+    fmap = ShapeMap()
+    TopExp.MapShapes_s(shape, TopAbs_FACE, fmap)
+    out = []
+    for i in range(1, fmap.Extent() + 1):
+        vmap = ShapeMap()
+        TopExp.MapShapes_s(fmap.FindKey(i), TopAbs_VERTEX, vmap)
+        pts = [BRep_Tool.Pnt_s(as_vertex(vmap.FindKey(k))) for k in range(1, vmap.Extent() + 1)]
+        out.append(sorted((round(p.X(), 3), round(p.Y(), 3), round(p.Z(), 3)) for p in pts))
+    return out
+
+
+@pytest.mark.parametrize("name", list(ALL))
+def test_canonical_keeps_face_order(name, step_dir):
+    """Face i of MapShapes(original) is face i of MapShapes(canonicalize(original)).
+
+    PMI face references index the original solid; flatmat's face ids index the canonical copy.
+    """
+    original = _nurbs_model(ALL[name], step_dir).solid  # still B-splines: loaded without canonicalization
+    assert needs_canonicalization(original)
+    canon, diag = canonicalize(original)
+    assert canon is not original and diag is not None
+    before, after = _face_signatures(original), _face_signatures(canon)
+    assert len(before) == len(after)
+    for i, (a, b) in enumerate(zip(before, after, strict=True)):
+        assert a == b, f"face {i} moved: {a} -> {b}"
+    # discriminating: swapping any two faces would be caught, because all signatures differ
+    assert len({tuple(a) for a in before}) == len(before)

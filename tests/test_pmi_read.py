@@ -1,0 +1,644 @@
+"""Reading semantic AP242 PMI into PmiItems (plan 7, Task 3)."""
+
+import math
+import os
+import re
+
+import parts
+import pytest
+from OCP.BRep import BRep_Builder
+from OCP.BRepGProp import BRepGProp
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+from OCP.gp import gp_Pnt, gp_Trsf, gp_Vec
+from OCP.GProp import GProp_GProps
+from OCP.TopLoc import TopLoc_Location
+from OCP.TopoDS import TopoDS_Compound
+from pmi_parts import centroid, edge_at, face_at, make_doc_with_pmi, write_step_with_pmi
+
+import flatmat as fm
+from flatmat._pmi_step import Bound, Kept, Matcher, StepDimension
+from flatmat.pmi import PmiData, PmiSide, read_pmi, tolerance
+
+# The L_holes case: t = 2, a 50 long base along +x at y in [-1, 1], 100 wide in z, with an
+# 8 mm hole at x = 20, z = 30 (axis along y) and a 90° bend up at x = 50.
+(L_HOLES,) = (p for p in parts.cases() if p.name == "L_holes")
+
+
+@pytest.fixture(scope="module")
+def bracket():
+    """The L_holes solid and the faces the tests refer to, found by geometry."""
+    shape = parts.make_solid(L_HOLES)
+    return shape, {
+        "end": face_at(shape, (0, 0, 50), "plane"),  # the base's cut end, x = 0
+        "hole": face_at(shape, (24, 0, 30), "cylinder"),  # the wall of the 8 mm hole
+        "skin": face_at(shape, (10, -1, 50), "plane"),  # the base's outer skin, y = -1
+        "side": face_at(shape, (10, 0, 0), "plane"),  # the cut side z = 0
+        "corner": edge_at(shape, (0, -1, 50)),  # the edge between "end" and "skin"
+    }
+
+
+def _load(tmp_path, shape, items, unit="MM", name="pmi.step"):
+    path = str(tmp_path / name)
+    write_step_with_pmi(shape, items, path, unit)
+    return fm.load_step(path)
+
+
+def test_linear_dimension_round_trips(tmp_path, bracket):
+    shape, f = bracket
+    items = [
+        dict(
+            kind="linear",
+            nominal=20.0,
+            upper=0.1,
+            lower=-0.1,
+            faces=([f["end"]], [f["hole"]]),
+            points=((0, 0, 30), (16, 0, 30)),
+        )
+    ]
+    data = _load(tmp_path, shape, items).pmi_for(0)
+    assert data.status == "semantic"
+    assert data.diagnostics == () and data.dropped == 0
+    (item,) = data.items
+    assert (item.id, item.kind, item.nominal, item.upper, item.lower) == (1, "linear", 20.0, 0.1, -0.1)
+    assert item.sides[0].face_ids == (f["end"],) and item.sides[1].face_ids == (f["hole"],)
+    assert item.sides[0].points == ((0, 0, 30),) and item.sides[1].points == ((16, 0, 30),)
+    assert item.anchor == pytest.approx((8, 0, 30))  # no text point: the midpoint of the side points
+    assert item.text == "20 +0.1/-0.1"
+    assert item.tolerance == "plus_minus"
+
+
+def test_inch_file_reads_in_mm(tmp_path, bracket):
+    shape, f = bracket
+    items = [
+        dict(
+            kind="linear",
+            nominal=1.0,
+            upper=0.005,
+            lower=-0.005,
+            faces=([f["end"]], [f["hole"]]),
+            points=((0, 0, 30), (16, 0, 30)),
+        )
+    ]
+    path = str(tmp_path / "inch.step")
+    write_step_with_pmi(shape, items, path, unit="INCH")
+    with open(path) as fh:
+        step = fh.read()
+    assert "CONVERSION_BASED_UNIT('INCH'" in step and "POSITIVE_LENGTH_MEASURE(1.)" in step  # the file says 1 in
+    model = fm.load_step(path)
+    (item,) = model.pmi_for(0).items
+    assert item.nominal == pytest.approx(25.4)
+    assert item.upper == pytest.approx(0.127) and item.lower == pytest.approx(-0.127)
+    assert item.sides[0].face_ids == (f["end"],) and item.sides[1].face_ids == (f["hole"],)
+    assert item.sides[1].points[0] == pytest.approx((16, 0, 30))
+
+
+def test_inch_gdt_zone_reads_in_mm(tmp_path, bracket):
+    shape, f = bracket
+    items = [
+        dict(kind="datum", name="A", faces=([f["skin"]],)),
+        dict(kind="position", zone=0.01, datums=("A",), faces=([f["hole"]],)),
+    ]
+    data = _load(tmp_path, shape, items, unit="INCH").pmi_for(0)
+    (tol,) = (i for i in data.items if i.kind == "position")
+    assert tol.upper == pytest.approx(0.254)
+
+
+@pytest.mark.parametrize(
+    "upper, lower, expected",
+    [
+        (0.1, 0.0, (0.1, 0.0)),
+        (0.0, -0.2, (0.0, -0.2)),
+        (0.2, -0.05, (0.2, -0.05)),
+        (0.1, 0.05, (0.1, 0.05)),  # both above: OCCT keeps only |lower|, the sign comes from the file
+        (-0.05, -0.1, (-0.05, -0.1)),  # both below: OCCT stores this as a broken range
+        (-0.1, 0.1, (None, None)),
+    ],
+    ids=["plus_only", "minus_only", "asymmetric", "both_above", "both_below", "inverted"],
+)
+def test_one_sided_and_inverted_tolerances(tmp_path, bracket, upper, lower, expected):
+    shape, f = bracket
+    items = [dict(kind="linear", nominal=40.0, upper=upper, lower=lower, faces=([f["end"]], [f["hole"]]))]
+    (item,) = _load(tmp_path, shape, items).pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower) == (40.0, *expected)
+    assert item.text.startswith("40")
+    assert item.tolerance == ("plus_minus" if expected != (None, None) else "unreadable")
+    if expected == (None, None):
+        assert "tolerance unreadable" in item.text
+
+
+@pytest.mark.parametrize(
+    "nominal, upper, lower, expected",
+    [
+        (40.0, 0.1, -0.1, (0.1, -0.1)),
+        (40.0, math.nan, -0.1, (None, None)),
+        (math.nan, 0.1, -0.1, (None, None)),
+        (40.0, -0.1, 0.1, (None, None)),
+        (40.0, None, None, (None, None)),
+    ],
+)
+def test_tolerance_pairs(nominal, upper, lower, expected):
+    assert tolerance(nominal, upper, lower) == expected
+
+
+def test_anchor_without_points_is_the_centroid_of_the_side_faces(tmp_path, bracket):
+    shape, f = bracket
+    items = [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))]
+    (item,) = _load(tmp_path, shape, items).pmi_for(0).items
+    both = centroid(shape, [f["end"], f["hole"]])
+    assert both != pytest.approx(centroid(shape, [f["hole"]]), abs=1)  # the two faces, not the last one
+    assert item.anchor == pytest.approx(both)
+
+
+def test_semantic_and_graphical_copy_is_one_item(tmp_path, bracket):
+    shape, f = bracket
+    sides = ([f["end"]], [f["hole"]])
+    items = [
+        dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=sides, presentation=True),
+        dict(kind="graphical", faces=sides),
+    ]
+    data = _load(tmp_path, shape, items).pmi_for(0)
+    assert data.status == "semantic" and data.diagnostics == () and data.graphical == 0
+    (item,) = data.items
+    assert (item.kind, item.nominal) == ("linear", 20.0)
+    assert item.anchor is not None  # the presentation's text point
+    assert item.text == "20 +0.1/-0.1; PMI 1"  # the callout keeps the presentation's name
+
+
+def test_gdt_position_with_datums(tmp_path, bracket):
+    shape, f = bracket
+    items = [
+        dict(kind="datum", name="A", faces=([f["skin"]],)),
+        dict(kind="datum", name="B", faces=([f["end"]],)),
+        dict(kind="position", zone=0.2, datums=("A", "B"), faces=([f["hole"]],)),
+    ]
+    data = _load(tmp_path, shape, items).pmi_for(0)
+    assert data.status == "semantic"
+    (tol,) = (i for i in data.items if i.kind == "position")
+    assert (tol.nominal, tol.upper, tol.lower, tol.datums) == (None, 0.2, None, ("A", "B"))
+    assert tol.sides == (PmiSide((f["hole"],)),)
+    assert tol.anchor == pytest.approx((20, 0, 30), abs=1e-6)  # no points: the centroid of the hole wall
+    assert tol.text == "position 0.2 | A | B"
+    assert tol.tolerance == "none"  # GD&T: the zone is in upper
+    named = {i.text: i for i in data.items if i.kind == "datum"}
+    assert named["A"].sides == (PmiSide((f["skin"],)),) and named["A"].datums == ("A",)
+    assert named["B"].sides == (PmiSide((f["end"],)),)
+    assert sorted(i.id for i in data.items) == [1, 2, 3]
+
+
+def test_other_gdt_keeps_its_name(tmp_path, bracket):
+    shape, f = bracket
+    items = [
+        dict(kind="datum", name="A", faces=([f["skin"]],)),
+        dict(kind="profile_of_surface", zone=0.5, datums=("A",), faces=([f["end"]],)),
+        dict(kind="flatness", zone=0.05, faces=([f["skin"]],)),
+    ]
+    data = _load(tmp_path, shape, items).pmi_for(0)
+    kinds = {i.kind: i for i in data.items}
+    assert kinds["other_gdt"].text == "profile of surface 0.5 | A" and kinds["other_gdt"].upper == 0.5
+    assert kinds["flatness"].upper == 0.05 and kinds["flatness"].datums == ()
+
+
+def test_diameter_and_edge_reference(tmp_path, bracket):
+    shape, f = bracket
+    items = [
+        dict(kind="diameter", nominal=8.0, upper=0.1, lower=0.0, faces=([f["hole"]],)),
+        dict(kind="linear", nominal=30.0, upper=0.2, lower=-0.2, edges=([f["corner"]],), faces=([], [f["hole"]])),
+    ]
+    dia, lin = _load(tmp_path, shape, items).pmi_for(0).items
+    assert (dia.kind, dia.nominal, dia.upper, dia.lower, dia.text) == ("diameter", 8.0, 0.1, 0.0, "Ø8 +0.1/0")
+    assert dia.sides == (PmiSide((f["hole"],)),)
+    assert lin.sides[0].face_ids == tuple(sorted((f["end"], f["skin"])))  # an edge becomes the faces it bounds
+    assert lin.sides[1].face_ids == (f["hole"],)
+
+
+@pytest.fixture(scope="module")
+def no_pmi_models(step_dir):
+    out = []
+    for part in parts.cases():
+        path = os.path.join(step_dir, f"pmi_none_{part.name}.step")
+        parts.write_step(parts.make_solid(part), path)
+        out.append(fm.load_step(path))
+    return out
+
+
+def test_file_without_pmi_has_status_none(no_pmi_models):
+    for model in no_pmi_models:
+        assert model.pmi_for(0) == PmiData("none", ()), model.path
+        assert fm.Code.PMI_READ_FAILED not in [d.code for d in model.diagnostics]
+
+
+def test_graphical_only_file_warns(tmp_path, bracket):
+    shape, f = bracket
+    data = _load(tmp_path, shape, [dict(kind="graphical", faces=([f["end"]], [f["hole"]]))]).pmi_for(0)
+    assert (data.status, data.items, data.graphical) == ("graphical_only", (), 1)
+    (w,) = data.diagnostics
+    assert (w.code, w.severity) == (fm.Code.PMI_GRAPHICAL_ONLY, fm.Severity.WARNING)
+
+
+class _Raises:
+    @staticmethod
+    def DimTolTool_s(main):
+        raise RuntimeError("no GD&T table")
+
+
+def test_broken_pmi_never_refuses(tmp_path, bracket, monkeypatch):
+    shape, f = bracket
+    model = _load(tmp_path, shape, [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))])
+    monkeypatch.setattr(fm.pmi, "XCAFDoc_DocumentTool", _Raises)
+    data = model.pmi_for(0)
+    assert (data.status, data.items) == ("failed", ())
+    (w,) = data.diagnostics
+    assert w.code is fm.Code.PMI_READ_FAILED and "no GD&T table" in w.message
+    assert len(model.solids) == 1 and _volume(model.solids[0]) == pytest.approx(_volume(shape))
+    assert fm.recognize(model).thickness == pytest.approx(2.0)
+
+
+def _volume(s) -> float:
+    g = GProp_GProps()
+    BRepGProp.VolumeProperties_s(s, g)
+    return g.Mass()
+
+
+def test_no_document_is_none_or_failed(tmp_path, bracket, monkeypatch):
+    shape, f = bracket
+    path = str(tmp_path / "dim.step")
+    write_step_with_pmi(shape, [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))], path)
+    assert fm.load_step(path, pmi=False).pmi_for(0) == PmiData("none", ())
+
+    def boom(path, heal):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fm.io, "_read_xcaf", boom)
+    model = fm.load_step(path)
+    assert model.pmi_for(0) == PmiData("failed", ())  # the load already warned PMI_READ_FAILED, once
+    assert [d.code for d in model.diagnostics].count(fm.Code.PMI_READ_FAILED) == 1
+
+
+def test_pmi_is_cached_per_solid(tmp_path, bracket):
+    shape, f = bracket
+    model = _load(tmp_path, shape, [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))])
+    assert model.pmi_for(0) is model.pmi_for(0)
+
+
+def test_items_on_another_solid_are_dropped(tmp_path, bracket):
+    shape, f = bracket
+    builder, both = BRep_Builder(), TopoDS_Compound()
+    builder.MakeCompound(both)
+    builder.Add(both, shape)
+    builder.Add(both, BRepPrimAPI_MakeBox(gp_Pnt(200, 0, 0), 10, 20, 30).Shape())
+    box_top = face_at(both, (205, 20, 15), "plane")  # an id on the compound, not on either solid
+    items = [
+        dict(kind="linear", nominal=20.0, faces=([face_at(both, (0, 0, 50))], [face_at(both, (24, 0, 30))])),
+        dict(kind="linear", nominal=20.0, faces=([box_top], [face_at(both, (205, 0, 15))])),
+        dict(kind="graphical", faces=([face_at(both, (200, 10, 15))],)),  # on the box, no semantic item's
+    ]
+    model = _load(tmp_path, both, items)
+    assert len(model.solids) == 2
+    first, second = model.pmi_for(0), model.pmi_for(1)
+    assert (first.graphical, second.graphical) == (0, 1)  # an annotation on another solid is not this one's
+    assert (first.status, [i.id for i in first.items], first.dropped) == ("semantic", [1], 1)
+    assert first.items[0].sides[0].face_ids == (f["end"],)
+    assert ([i.id for i in second.items], second.dropped) == ([2], 1)
+    assert second.items[0].sides[0].face_ids == (face_at(model.solids[1], (205, 20, 15)),)
+
+
+def test_pmi_on_a_placed_part(bracket):
+    """PMI defined on a part's own faces still names them when the solid is an instance placed elsewhere."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(shape, [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))])
+    move = gp_Trsf()
+    move.SetTranslation(gp_Vec(100, 0, 0))
+    data = read_pmi(doc, shape.Moved(TopLoc_Location(move)))
+    assert data.dropped == 0
+    (item,) = data.items
+    assert item.sides[0].face_ids == (f["end"],) and item.sides[1].face_ids == (f["hole"],)
+
+
+def test_notes_in_the_document(bracket):
+    """OCCT's STEP writer drops notes, so the notes table is filled in memory."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(
+        shape, [dict(kind="note", text="M6 THRU", faces=([f["hole"]],)), dict(kind="note", text="ISO 2768-mK")]
+    )
+    data = read_pmi(doc, shape)
+    thread, general = data.items
+    assert (thread.kind, thread.text, thread.sides) == ("note", "M6 THRU", (PmiSide((f["hole"],)),))
+    assert thread.anchor == pytest.approx(centroid(shape, [f["hole"]]))
+    assert (general.text, general.sides, general.anchor) == ("ISO 2768-mK", (), None)
+
+
+def test_angle_tolerance_reads_in_degrees(tmp_path, bracket):
+    shape, f = bracket
+    rad = math.radians
+    items = [dict(kind="angle", nominal=rad(90.0), upper=rad(0.5), lower=-rad(0.25), faces=([f["end"]], [f["skin"]]))]
+    (item,) = _load(tmp_path, shape, items).pmi_for(0).items  # OCCT writes angles in radians
+    assert item.nominal == pytest.approx(90.0)
+    assert (item.upper, item.lower) == pytest.approx((0.5, -0.25))
+    assert item.text == "90° +0.5/-0.25"
+
+
+def test_angle_tolerance_in_an_unknown_unit_is_unreadable(tmp_path, bracket):
+    """The angle tolerance's unit replaced by the file's solid-angle unit: no way to say what it is in degrees."""
+    shape, f = bracket
+    items = [dict(kind="angle", nominal=math.radians(90.0), upper=0.01, lower=-0.01, faces=([f["end"]], [f["skin"]]))]
+    path = tmp_path / "steradian.step"
+    write_step_with_pmi(shape, items, str(path))
+    step = path.read_text()
+    (angle_unit,) = re.findall(
+        r"^(#\d+) = \( NAMED_UNIT\(\*\) PLANE_ANGLE_UNIT\(\) SI_UNIT\(\$,\.RADIAN\.\) \);", step, re.M
+    )
+    (solid_angle,) = re.findall(
+        r"^(#\d+) = \( NAMED_UNIT\(\*\) SI_UNIT\(\$,\.STERADIAN\.\) SOLID_ANGLE_UNIT\(\) \);", step, re.M
+    )
+    step, n = re.subn(
+        rf"^(#\d+ = MEASURE_WITH_UNIT\([^,]+,){angle_unit}\);", rf"\g<1>{solid_angle});", step, flags=re.M
+    )
+    assert n == 2  # the tolerance's two bounds; the nominal keeps its radians
+    path.write_text(step)
+    (item,) = fm.load_step(path).pmi_for(0).items
+    assert item.nominal == pytest.approx(90.0)
+    assert (item.upper, item.lower, item.tolerance) == (None, None, "unreadable")
+    assert item.text == "90° +0.01/-0.01 (unit unknown)"
+
+
+def test_same_magnitudes_with_different_signs_keep_their_own(tmp_path, bracket):
+    """XCAF cannot tell +0.1/+0.05 from +0.1/-0.05; the file order can."""
+    shape, f = bracket
+    sides = ([f["end"]], [f["hole"]])
+    items = [dict(kind="linear", nominal=20.0, upper=0.1, lower=lo, faces=sides) for lo in (0.05, -0.05, 0.05)]
+    got = [(i.upper, i.lower) for i in _load(tmp_path, shape, items).pmi_for(0).items]
+    assert got == [(0.1, 0.05), (0.1, -0.05), (0.1, 0.05)]
+
+
+def test_tolerance_not_found_in_the_file_is_unreadable(bracket):
+    """Without the file's dimensions every tolerance is unreadable; trust_xcaf is for documents built in memory."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(shape, [dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]],))])
+    (item,) = read_pmi(doc, shape).items
+    assert (item.nominal, item.upper, item.lower, item.tolerance) == (20.0, None, None, "unreadable")
+    assert item.text == "20 +0.1/±0.1 (sign unknown: not found in the file)"  # XCAF's magnitudes
+    (kept,) = read_pmi(doc, shape, trust_xcaf=True).items  # built in memory: XCAF's own values
+    assert (kept.upper, kept.lower, kept.tolerance) == (0.1, -0.1, "plus_minus")
+
+
+def test_entity_dropped_by_occt_makes_the_signs_unreadable(tmp_path, bracket):
+    """OCCT drops a dimension whose shapes it cannot find: the order no longer says which entity is which."""
+    shape, f = bracket
+    sides = ([f["end"]], [f["hole"]])
+    items = [dict(kind="linear", nominal=40.0, upper=0.1, lower=lo, faces=sides) for lo in (-0.05, 0.05)]
+    path = tmp_path / "dropped.step"
+    write_step_with_pmi(shape, items, str(path))
+    lines = path.read_text().splitlines()
+    gisu = [i for i, line in enumerate(lines) if "GEOMETRIC_ITEM_SPECIFIC_USAGE" in line][:2]  # the first one's
+    path.write_text("\n".join(line for i, line in enumerate(lines) if i not in gisu) + "\n")
+    model = fm.load_step(path)
+    assert len(model.step_dimensions) == 2
+    (item,) = model.pmi_for(0).items  # the second dimension, +0.1/+0.05 in the file
+    assert (item.nominal, item.upper, item.lower, item.tolerance) == (40.0, None, None, "unreadable")
+    assert item.text == "40 +0.1/±0.05 (sign unknown: not found in the file)"
+
+
+@pytest.mark.parametrize(
+    "lower, upper, expected",
+    [
+        ("40.", "40.2", ("limits", "40\u201340.2 (limits)")),
+        ("40.2", "40.", ("unreadable", "40.2\u201340 (limits inverted)")),
+    ],
+    ids=["limits", "inverted"],
+)
+def test_limits_dimension_keeps_both_limits(tmp_path, bracket, lower, upper, expected):
+    """A dimension given as a lower and an upper limit, with no plus-minus tolerance: no nominal."""
+    shape, f = bracket
+    path = tmp_path / "limits.step"
+    items = [
+        dict(kind="linear", nominal=float(lower), faces=([f["end"]], [f["hole"]])),
+        dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),  # after it
+    ]
+    write_step_with_pmi(shape, items, str(path))
+    step = path.read_text()
+    nominal = re.search(
+        r"^(#\d+) = \( LENGTH_MEASURE_WITH_UNIT\(\) MEASURE_REPRESENTATION_ITEM\(\) \n"
+        rf"MEASURE_WITH_UNIT\(POSITIVE_LENGTH_MEASURE\({re.escape(lower)}\),(#\d+)\)\s*REPRESENTATION_ITEM\s*"
+        r"\('nominal value'\) \);\n",
+        step,
+        re.M,
+    )
+    item_id, unit = nominal.groups()
+    upper = (
+        "#99999 = ( LENGTH_MEASURE_WITH_UNIT() MEASURE_REPRESENTATION_ITEM() \n"
+        f"MEASURE_WITH_UNIT(POSITIVE_LENGTH_MEASURE({upper}),{unit}) REPRESENTATION_ITEM\n"
+        "('upper limit') );\n"
+    )
+    step = step.replace(nominal.group(0), nominal.group(0).replace("'nominal value'", "'lower limit'") + upper)
+    step, n = re.subn(
+        rf"SHAPE_DIMENSION_REPRESENTATION\('',\({item_id}\),",
+        rf"SHAPE_DIMENSION_REPRESENTATION('',({item_id},#99999),",
+        step,
+    )
+    assert n == 1
+    path.write_text(step)
+    item, after = fm.load_step(path).pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower) == (None, None, None)
+    assert (item.tolerance, item.text) == expected
+    assert (after.upper, after.lower, after.tolerance) == (0.1, -0.1, "plus_minus")  # the order still holds
+
+
+def _dim(nominal, upper, lower):
+    return StepDimension(Bound(nominal, 1.0), Bound(upper, 1.0), Bound(lower, 1.0))
+
+
+def test_matcher_pairs_in_file_order_when_every_entity_has_a_label():
+    kept = Kept(20.0, 0.1, 0.05)  # what XCAF keeps of both +0.1/+0.05 and +0.1/-0.05
+    m = Matcher([_dim(20.0, 0.1, 0.05), _dim(20.0, 0.1, -0.05)], labels=2)
+    assert m.match(kept).lower.raw == 0.05 and m.match(kept).lower.raw == -0.05 and m.match(kept) is None
+
+
+def test_matcher_refuses_ambiguity_when_occt_dropped_an_entity():
+    kept = Kept(20.0, 0.1, 0.05)
+    m = Matcher([_dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, 0.05)], labels=1)
+    assert m.match(kept) is None  # the in-order candidate too: the two that agree differ in sign
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, -0.05)], labels=2)
+    assert m.match(kept).lower.raw == -0.05 and m.next == 2  # every candidate that agrees says the same
+
+
+def test_matcher_stops_trusting_the_order_at_the_first_disagreement():
+    """Equal counts say OCCT made one label per entity; a label that disagrees with its entity
+    says the order does not hold after all: from there on a pair needs every candidate to agree."""
+    kept = Kept(20.0, 0.1, 0.05)
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05)], labels=2)
+    assert m.match(kept).lower.raw == -0.05  # its own entity disagrees: the one that agrees
+    assert m.match(Kept(30.0, 0.2, 0.2)) is None  # behind it now: unreadable
+    m = Matcher([_dim(30.0, 0.2, -0.2), _dim(20.0, 0.1, -0.05), _dim(20.0, 0.1, 0.05)], labels=3)
+    assert m.match(kept) is None  # two agree and differ in sign
+    assert m.match(kept) is None  # in file order the second entity, but the order no longer holds
+
+
+def test_nominal_with_a_format_qualifier_is_read(tmp_path, bracket):
+    """NX, Creo and SolidWorks qualify the nominal with its decimal places (VALUE_FORMAT_TYPE_QUALIFIER)."""
+    shape, f = bracket
+    items = [dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, decimals=(2, 2), faces=([f["end"]], [f["hole"]]))]
+    path = tmp_path / "format.step"
+    write_step_with_pmi(shape, items, str(path))
+    assert "VALUE_FORMAT_TYPE_QUALIFIER('NR2 2.2')" in path.read_text()
+    model = fm.load_step(path)
+    (dim,) = model.step_dimensions
+    assert dim.nominal == Bound(30.0, 1.0)
+    (item,) = model.pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower) == (30.0, 0.1, -0.1)
+
+
+def test_untoleranced_dimension_is_none(tmp_path, bracket):
+    """No tolerance of its own: the general tolerance applies (flatmat_web), so "none", not "unreadable"."""
+    shape, f = bracket
+    items = [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))]
+    (item,) = _load(tmp_path, shape, items).pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower, item.tolerance, item.text) == (20.0, None, None, "none", "20")
+
+
+@pytest.mark.parametrize(
+    "fit, text",
+    [(("H", 7), "Ø8 H7"), (("h", 6), "Ø8 h6"), (("JS", 9), "Ø8 JS9")],
+    ids=["hole", "shaft", "two_letters"],
+)
+def test_fit_class_from_the_file(tmp_path, bracket, fit, text):
+    """An ISO 286 fit (a limits_and_fits entity) is not untoleranced; the class is in the text."""
+    shape, f = bracket
+    items = [
+        dict(kind="diameter", nominal=8.0, fit=fit, faces=([f["hole"]],)),
+        dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),
+    ]
+    path = tmp_path / "fit.step"
+    write_step_with_pmi(shape, items, str(path))
+    assert re.search(rf"LIMITS_AND_FITS\('{fit[0]}','\w+','{fit[1]}',''\)", path.read_text())
+    dia, lin = fm.load_step(path).pmi_for(0).items
+    assert (dia.kind, dia.nominal, dia.upper, dia.lower) == ("diameter", 8.0, None, None)
+    assert (dia.tolerance, dia.text) == ("fit", text)
+    assert (lin.upper, lin.lower, lin.tolerance) == (0.1, -0.1, "plus_minus")
+
+
+def test_fit_class_with_an_unreadable_grade(tmp_path, bracket):
+    shape, f = bracket
+    path = tmp_path / "fit.step"
+    write_step_with_pmi(shape, [dict(kind="diameter", nominal=8.0, fit=("H", 7), faces=([f["hole"]],))], str(path))
+    path.write_text(path.read_text().replace("'hole','7'", "'hole','seven'"))
+    (dia,) = fm.load_step(path).pmi_for(0).items
+    assert (dia.nominal, dia.tolerance, dia.text) == (8.0, "fit", "Ø8 fit (class unreadable: H seven)")
+
+
+def test_fit_class_in_memory_is_not_read(bracket):
+    """OCP cannot return XCAF's class of tolerance: a fit built in memory says so."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(shape, [dict(kind="diameter", nominal=8.0, fit=("H", 7), faces=([f["hole"]],))])
+    (dia,) = read_pmi(doc, shape, trust_xcaf=True).items
+    assert (dia.nominal, dia.upper, dia.lower) == (8.0, None, None)
+    assert (dia.tolerance, dia.text) == ("fit", "Ø8 fit (class not read)")
+
+
+@pytest.mark.parametrize("qualifier", ["max", "min"])
+def test_max_min_qualifier_is_a_limit(tmp_path, bracket, qualifier):
+    """ "max 20" is an upper limit, not an untoleranced 20: no nominal, the qualifier in the text."""
+    shape, f = bracket
+    items = [
+        dict(kind="linear", nominal=20.0, qualifier=qualifier, faces=([f["end"]], [f["hole"]])),
+        dict(kind="linear", nominal=30.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),
+    ]
+    path = tmp_path / "qualified.step"
+    write_step_with_pmi(shape, items, str(path))
+    assert f"TYPE_QUALIFIER('{qualifier}imum')" in path.read_text()
+    item, after = fm.load_step(path).pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower) == (None, None, None)
+    assert (item.tolerance, item.text) == ("limits", f"{qualifier} 20")
+    assert (after.upper, after.lower, after.tolerance) == (0.1, -0.1, "plus_minus")
+    (mem,) = read_pmi(make_doc_with_pmi(shape, items[:1]), shape, trust_xcaf=True).items
+    assert (mem.nominal, mem.tolerance, mem.text) == (None, "limits", f"{qualifier} 20")
+
+
+def test_untoleranced_dimension_not_found_in_the_file_is_unreadable(bracket):
+    """XCAF drops a STEP file's max/min qualifier: unconfirmed by the file, "none" could be false."""
+    shape, f = bracket
+    doc = make_doc_with_pmi(shape, [dict(kind="linear", nominal=20.0, faces=([f["end"]], [f["hole"]]))])
+    (item,) = read_pmi(doc, shape).items
+    assert (item.nominal, item.tolerance) == (20.0, "unreadable")
+    assert item.text == "20 (not found in the file: a fit or a max/min qualifier cannot be ruled out)"
+
+
+def test_graphical_annotation_beside_semantic_pmi_warns(tmp_path, bracket):
+    """A presentation whose faces are not a semantic item's is a callout nobody checks: say so."""
+    shape, f = bracket
+    items = [
+        dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]])),
+        dict(kind="graphical", faces=([f["side"]], [f["skin"]])),  # faces no semantic item refers to
+        dict(kind="graphical", faces=([f["hole"]], [f["end"]])),  # the semantic item's: a copy of it
+    ]
+    data = _load(tmp_path, shape, items).pmi_for(0)
+    assert (data.status, len(data.items), data.graphical) == ("semantic", 1, 1)
+    (w,) = data.diagnostics
+    assert (w.code, w.severity, w.data["count"]) == (fm.Code.PMI_GRAPHICAL_ONLY, fm.Severity.WARNING, 1)
+    sheet = fm.recognize(fm.load_step(tmp_path / "pmi.step"))
+    assert sheet.pmi.graphical == 1
+    assert [d.code for d in sheet.diagnostics].count(fm.Code.PMI_GRAPHICAL_ONLY) == 1
+
+
+def test_unreadable_step_dimensions_warn(tmp_path, bracket, monkeypatch):
+    """If the file's dimensions cannot be read, the part still loads, its tolerances are
+    unreadable, and a warning says why."""
+    shape, f = bracket
+    path = str(tmp_path / "dim.step")
+    items = [dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.1, faces=([f["end"]], [f["hole"]]))]
+    write_step_with_pmi(shape, items, path)
+
+    def boom(model):
+        raise RuntimeError("no entities")
+
+    monkeypatch.setattr(fm.io, "step_dimensions", boom)
+    model = fm.load_step(path)
+    assert model.doc is not None and model.step_dimensions == ()
+    (w,) = (d for d in model.diagnostics if d.code is fm.Code.PMI_READ_FAILED)
+    assert w.message == "tolerance signs not read: RuntimeError('no entities')"
+    (item,) = model.pmi_for(0).items
+    assert (item.nominal, item.upper, item.lower, item.tolerance) == (20.0, None, None, "unreadable")
+    sheet = fm.recognize(model)
+    assert [d.code for d in sheet.diagnostics].count(fm.Code.PMI_READ_FAILED) == 1
+
+
+def _fails_once(monkeypatch, name):
+    """``flatmat.pmi.<name>`` raising at its first call only."""
+    real, calls = getattr(fm.pmi, name), []
+
+    def once(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("bad label")
+        return real(*a, **k)
+
+    monkeypatch.setattr(fm.pmi, name, once)
+
+
+def test_one_bad_label_loses_only_its_item(tmp_path, bracket, monkeypatch):
+    shape, f = bracket
+    items = [
+        dict(kind="linear", nominal=20.0, upper=0.1, lower=0.05, faces=([f["end"]], [f["hole"]])),
+        dict(kind="linear", nominal=20.0, upper=0.1, lower=-0.05, faces=([f["end"]], [f["hole"]])),
+        dict(kind="flatness", zone=0.1, faces=([f["skin"]],)),
+    ]
+    model = _load(tmp_path, shape, items)
+    whole = read_pmi(model.doc, model.solids[0], model.step_dimensions).items
+    _fails_once(monkeypatch, "_dimension")
+    data = read_pmi(model.doc, model.solids[0], model.step_dimensions)
+    assert data.status == "semantic"
+    assert data.items == whole[1:]  # the others keep their ids, and the second dimension its own signs
+    assert (data.items[0].upper, data.items[0].lower) == (0.1, -0.05)
+    (w,) = data.diagnostics
+    assert (w.code, w.data["count"]) == (fm.Code.PMI_READ_FAILED, 1)
+    assert w.message == "1 PMI item(s) not read: RuntimeError('bad label')"
+
+
+def test_one_bad_note_loses_only_itself(bracket, monkeypatch):
+    shape, f = bracket
+    doc = make_doc_with_pmi(
+        shape, [dict(kind="note", text="M6 THRU", faces=([f["hole"]],)), dict(kind="note", text="ISO 2768-mK")]
+    )
+    _fails_once(monkeypatch, "_note_text")
+    data = read_pmi(doc, shape)
+    assert [(i.id, i.text) for i in data.items] == [(2, "ISO 2768-mK")]
+    assert [d.code for d in data.diagnostics] == [fm.Code.PMI_READ_FAILED]
