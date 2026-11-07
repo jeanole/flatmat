@@ -190,9 +190,10 @@ def parse_thread(text: str) -> tuple[str, float, float | None, bool, int] | None
 
     Only an ISO 261 size is a thread, and not one named after a fastener (``Einpressmutter
     M6``, ``Schraube M6x20``, ``PEM M4``), after a number (``25 M2``: square metres) or
-    before a colon (``M1:2``: a scale). A pitch is one only if ISO 261 lists it for the
-    size, coarse or fine; any other number after the size (``M6 x 12 tief``, ``M6x20``) is
-    a depth or a length, and the thread is coarse. A fine-only size needs its pitch."""
+    before a colon (``M1:2``: a scale). A number after the size that is smaller than the
+    size is the pitch as written (``M6x0.5``), listed in ISO 261 or not; one at least as
+    large (``M6 x 12 tief``, ``M6x20``) is a depth or a length, and the thread is coarse.
+    A fine-only size needs its pitch."""
     for m in _THREAD.finditer(text):
         got = _thread(text, m)
         if got is not None:
@@ -213,10 +214,10 @@ def _thread(text: str, m: re.Match[str]) -> tuple[str, float, float | None, bool
         return None  # "25 M2": a unit after a number
     if re.match(r"\s*:", after):
         return None  # "M1:2": a scale
-    coarse, fine = sizes
+    coarse = sizes[0]
     pitch_text = m.group(3).replace(",", ".") if m.group(3) else None
     pitch = float(pitch_text) if pitch_text else None
-    if pitch is not None and pitch not in (coarse, *fine):
+    if pitch is not None and pitch >= float(nominal_text):
         pitch_text = pitch = None  # a depth or a length, not a pitch
     if pitch is None and coarse is None:
         return None

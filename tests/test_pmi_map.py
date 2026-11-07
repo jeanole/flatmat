@@ -50,6 +50,11 @@ def test_parse_general_tolerance(text, expected):
         ("M8x1", ("M8x1", 8.0, 1.0, False, 1)),
         ("M6 THRU", ("M6", 6.0, None, True, 1)),
         ("4x M5 durchgehend", ("M5", 5.0, None, True, 4)),
+        ("M6x0.5", ("M6x0.5", 6.0, 0.5, False, 1)),  # stated fine pitch, not in ISO 261
+        ("M16x1.25", ("M16x1.25", 16.0, 1.25, False, 1)),
+        ("M6x12 tief", ("M6", 6.0, None, False, 1)),  # a depth
+        ("M6 x 20", ("M6", 6.0, None, False, 1)),  # a length
+        ("4x M5", ("M5", 5.0, None, False, 4)),
         ("Ø6.6", None),
         ("M", None),
     ],
