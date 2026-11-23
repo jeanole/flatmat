@@ -1,0 +1,32 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 1.5,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 1.5,
+      "ba": 3.392920065876977
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 1.5,
+      "ba": 3.392920065876977
+    },
+    {
+      "angle_deg": 180,
+      "r_in": 1.0,
+      "ba": 5.215043804959057
+    }
+  ],
+  "flat": {
+    "area_mm2": 8800.070714937041,
+    "size": [
+      80,
+      110.00088393671301
+    ],
+    "holes": 0,
+    "hems": 1
+  },
+  "note": "U channel, an open hem (R 1, 2 mm gap) folded into the channel on one flange"
+}

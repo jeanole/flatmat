@@ -1,0 +1,31 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 2.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 2.0,
+      "ba": 4.523893421169302
+    },
+    {
+      "angle_deg": 20,
+      "r_in": 4.0,
+      "ba": 1.7034413499464656
+    },
+    {
+      "angle_deg": 20,
+      "r_in": 4.0,
+      "ba": 1.7034413499464656
+    }
+  ],
+  "flat": {
+    "area_mm2": 4975.846567263734,
+    "size": [
+      60,
+      82.93077612106224
+    ],
+    "holes": 0
+  },
+  "note": "an L whose flange is joggled: two tangent 20 deg bends, R 4, no flat between"
+}

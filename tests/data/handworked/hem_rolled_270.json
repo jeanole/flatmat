@@ -1,0 +1,22 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 1.5,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 270,
+      "r_in": 3.0,
+      "ba": 17.247343668207964
+    }
+  ],
+  "flat": {
+    "area_mm2": 3554.840620092478,
+    "size": [
+      59.24734366820796,
+      60
+    ],
+    "holes": 0,
+    "hems": 1
+  },
+  "note": "a rolled edge: one 270 deg bend, R 3, a 2 mm leg"
+}

@@ -1,0 +1,66 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 5.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 8.168140899333462
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 8.168140899333462
+    }
+  ],
+  "flat": {
+    "area_mm2": 7487.994725482057,
+    "size": [
+      60,
+      126.33628179866693
+    ],
+    "holes": 3,
+    "hole_centres_s_z": [
+      [
+        20.0,
+        30.0
+      ],
+      [
+        106.33628179866693,
+        30.0
+      ],
+      [
+        63.168140899333466,
+        30.0
+      ]
+    ],
+    "features": [
+      {
+        "kind": "counterbore",
+        "side": 1,
+        "through_diameter": 6.6,
+        "outer_diameter": 11.0,
+        "angle_deg": null,
+        "depth": 3.0
+      },
+      {
+        "kind": "counterbore",
+        "side": -1,
+        "through_diameter": 6.6,
+        "outer_diameter": 11.0,
+        "angle_deg": null,
+        "depth": 3.0
+      },
+      {
+        "kind": "countersink",
+        "side": 1,
+        "through_diameter": 5.5,
+        "outer_diameter": 10.0,
+        "angle_deg": 90.0,
+        "depth": null
+      }
+    ]
+  },
+  "note": "a Z, t 5: counterbores (d6.6 / d11, 3 deep) on the outer flats, opposite sides; a countersink in the web"
+}

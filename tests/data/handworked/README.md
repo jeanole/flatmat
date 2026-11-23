@@ -1,9 +1,11 @@
-# Holes across bends and box corners
+# Holes across bends, box corners, hems, joggles and countersinks
 
 Sheet metal parts built in OCP by `tests/handworked_parts.py`, each with its flat pattern
 worked out by hand in `<name>.json`: thickness, K (0.44), the bends with their allowance
 θ(R + K·t), the flat area, size and number of inner loops. `tests/test_handworked.py`
 checks the generated parts at K 0.33, 0.44 and 0.5, and these files at K 0.44.
+A countersink or counterbore is checked for its kind, side, diameters, angle and depth;
+the flat cuts its through hole, so flat area × t is not the volume there.
 
 | File | Part | Flat by hand |
 |---|---|---|
@@ -19,6 +21,22 @@ checks the generated parts at K 0.33, 0.44 and 0.5, and these files at K 0.44.
 | `box_thin` | box 120 × 70 × 25, t 1.5, R 1, gap 1, reliefs 3 | as `box_relief` |
 | `box_deep_closed` | box 60 × 40 × 40, t 1, R 1.5, closed corners 0.5 apart, reliefs 3 | as `box_closed` |
 | `box_window` | `box_relief` with a 20 wide window across a long bend, 10 into the wall, 15 into the base | less 20 × (10 + BA + 15) |
+| `hem_open_U` | U channel, t 1.5, an open hem (R 1, 2 mm gap) folded into the channel | width × (flats + 2 BA + BA_hem) |
+| `hem_closed_both` | plate, t 1, closed hems (R 0.1, 0.2 mm gap) at both ends on opposite sides | width × (flats + 2 BA_hem) |
+| `hem_rolled_270` | a rolled edge: one 270° bend, R 3, a 2 mm leg | width × (40 + 2 + BA_270) |
+| `hem_hole_through_both` | L with a hem (R 0.5); a Ø5 hole drilled through the hem leg and the flange behind it | two Ø5 holes BA_hem + 10 apart |
+| `joggle_offset` | 45° joggle, 5 mm between its bends, a Ø6 hole either side | holes 20 + BA + 5 + BA + 20 apart along, 20 across |
+| `joggle_z_tight` | Z joggle: two 90° bends, R 1, 2 mm apart, t 1.5 | width × (flats + 2 BA) |
+| `joggle_on_flange` | L whose flange is joggled: two tangent 20° bends, R 4, no flat between | width × (flats + 3 BA) |
+| `csk_U` | U channel, t 3: 90° countersinks on the base and both flanges, both sides | through holes cut; centres at s = flats + BA + f·flat |
+| `csk_angles` | L, t 3: 82°, 100° and 120° countersinks | as `csk_U`; each angle reported |
+| `cbore_Z` | Z, t 5: counterbores Ø6.6 / Ø11, 3 deep, on the outer flats on opposite sides; a countersink in the web | as `csk_U`; depth reported |
+| `panel_hem_joggle_csk` | t 1.5: a hem at one end, a joggle at the other, two countersinks between | as `csk_U` |
+
+The JSON of the parts with holes gives each hole's centre as (s along the flat, z across):
+the tests compare their distances to each other, which do not depend on where the flat is
+placed. `features` lists the countersinks and counterbores, `side` +1 for one skin and −1
+for the other (which one flatmat calls `top` is its reference skin's choice).
 
 A hole cut in the flat and then bent has a radial wall: a ruled B-spline surface between
 the hole's images on the two skins. Flatmat reports it as `SURFACE_CONVERTED` (its

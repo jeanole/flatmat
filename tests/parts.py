@@ -13,7 +13,7 @@ index in ``sharp_outer`` makes the outer corner sharp too. The flat length is th
 same formula with r = 0 (inner legs plus the neutral fibre through the corner).
 
 ``features`` adds countersinks and counterbores to flats:
-("csk", flat, frac, z, d_through, d_top, side) with a 90° cone, or
+("csk", flat, frac, z, d_through, d_top, side[, angle]) with a cone of that included angle (90°), or
 ("cbore", flat, frac, z, d_through, d_bore, side, depth); side +1 = left skin.
 
 ``formed`` adds formed features to flats, made by revolving their cross-section:
@@ -168,9 +168,12 @@ def make_solid(part: Part):
             eps = 0.05
             top = gp_Pnt(c[0] + side * n[0] * (part.t / 2 + eps), c[1] + side * n[1] * (part.t / 2 + eps), z)
             down = gp_Dir(-side * n[0], -side * n[1], 0)
-            if kind == "csk":  # 90° included angle: the radius shrinks by 1 per unit depth
+            if kind == "csk":  # included angle rest[0] (default 90°): the radius shrinks by tan(angle/2) per depth
+                tan = math.tan(math.radians(rest[0] if rest else 90.0) / 2)
                 tools.Append(
-                    BRepPrimAPI_MakeCone(gp_Ax2(top, down), big / 2 + eps, d / 2, big / 2 + eps - d / 2).Shape()
+                    BRepPrimAPI_MakeCone(
+                        gp_Ax2(top, down), big / 2 + eps * tan, d / 2, eps + (big - d) / 2 / tan
+                    ).Shape()
                 )
             else:
                 tools.Append(BRepPrimAPI_MakeCylinder(gp_Ax2(top, down), big / 2, rest[0] + eps).Shape())

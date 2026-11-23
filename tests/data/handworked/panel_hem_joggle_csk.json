@@ -1,0 +1,60 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 1.5,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 180,
+      "r_in": 0.5,
+      "ba": 3.6442474781641603
+    },
+    {
+      "angle_deg": 30,
+      "r_in": 3.0,
+      "ba": 1.9163715186897738
+    },
+    {
+      "angle_deg": 30,
+      "r_in": 3.0,
+      "ba": 1.9163715186897738
+    }
+  ],
+  "flat": {
+    "area_mm2": 8478.25659485934,
+    "size": [
+      70,
+      121.4769905155437
+    ],
+    "holes": 2,
+    "hole_centres_s_z": [
+      [
+        34.64424747816416,
+        20.0
+      ],
+      [
+        62.64424747816416,
+        50.0
+      ]
+    ],
+    "hems": 1,
+    "features": [
+      {
+        "kind": "countersink",
+        "side": -1,
+        "through_diameter": 4.0,
+        "outer_diameter": 6.5,
+        "angle_deg": 90.0,
+        "depth": null
+      },
+      {
+        "kind": "countersink",
+        "side": -1,
+        "through_diameter": 4.0,
+        "outer_diameter": 6.5,
+        "angle_deg": 90.0,
+        "depth": null
+      }
+    ]
+  },
+  "note": "a panel: a hem at one end, a joggle at the other, two countersinks between"
+}

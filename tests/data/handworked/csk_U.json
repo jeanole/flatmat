@@ -1,0 +1,66 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 3.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 6.785840131753954
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 6.785840131753954
+    }
+  ],
+  "flat": {
+    "area_mm2": 10630.167501020263,
+    "size": [
+      80,
+      133.57168026350791
+    ],
+    "holes": 3,
+    "hole_centres_s_z": [
+      [
+        66.78584013175396,
+        40.0
+      ],
+      [
+        12.0,
+        20.0
+      ],
+      [
+        121.57168026350791,
+        60.0
+      ]
+    ],
+    "features": [
+      {
+        "kind": "countersink",
+        "side": 1,
+        "through_diameter": 5.5,
+        "outer_diameter": 10.0,
+        "angle_deg": 90.0,
+        "depth": null
+      },
+      {
+        "kind": "countersink",
+        "side": -1,
+        "through_diameter": 4.5,
+        "outer_diameter": 8.0,
+        "angle_deg": 90.0,
+        "depth": null
+      },
+      {
+        "kind": "countersink",
+        "side": 1,
+        "through_diameter": 4.5,
+        "outer_diameter": 8.0,
+        "angle_deg": 90.0,
+        "depth": null
+      }
+    ]
+  },
+  "note": "U channel: 90 deg countersinks on the base and both flanges, on both sides"
+}

@@ -1,0 +1,27 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 1.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 180,
+      "r_in": 0.1,
+      "ba": 1.6964600329384885
+    },
+    {
+      "angle_deg": 180,
+      "r_in": 0.1,
+      "ba": 1.6964600329384885
+    }
+  ],
+  "flat": {
+    "area_mm2": 5003.575203952619,
+    "size": [
+      60,
+      83.39292006587698
+    ],
+    "holes": 0,
+    "hems": 2
+  },
+  "note": "a plate with closed hems (R 0.1, 0.2 mm gap) at both ends, on opposite sides"
+}

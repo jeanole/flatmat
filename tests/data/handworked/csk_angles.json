@@ -1,0 +1,61 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 3.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 2.0,
+      "ba": 5.215043804959057
+    }
+  ],
+  "flat": {
+    "area_mm2": 7558.2986421419155,
+    "size": [
+      80,
+      95.21504380495905
+    ],
+    "holes": 3,
+    "hole_centres_s_z": [
+      [
+        15.0,
+        20.0
+      ],
+      [
+        35.0,
+        60.0
+      ],
+      [
+        75.21504380495907,
+        40.0
+      ]
+    ],
+    "features": [
+      {
+        "kind": "countersink",
+        "side": 1,
+        "through_diameter": 5.0,
+        "outer_diameter": 9.0,
+        "angle_deg": 82.0,
+        "depth": null
+      },
+      {
+        "kind": "countersink",
+        "side": 1,
+        "through_diameter": 5.0,
+        "outer_diameter": 9.0,
+        "angle_deg": 100.0,
+        "depth": null
+      },
+      {
+        "kind": "countersink",
+        "side": -1,
+        "through_diameter": 5.0,
+        "outer_diameter": 9.0,
+        "angle_deg": 120.0,
+        "depth": null
+      }
+    ]
+  },
+  "note": "an L with 82, 100 and 120 deg countersinks"
+}

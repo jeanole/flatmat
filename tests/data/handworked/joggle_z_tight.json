@@ -1,0 +1,26 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 1.5,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 1.0,
+      "ba": 2.6075219024795286
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 1.0,
+      "ba": 2.6075219024795286
+    }
+  ],
+  "flat": {
+    "area_mm2": 3360.7521902479525,
+    "size": [
+      50,
+      67.21504380495905
+    ],
+    "holes": 0
+  },
+  "note": "a Z joggle: two 90 deg bends, R 1, 2 mm apart"
+}

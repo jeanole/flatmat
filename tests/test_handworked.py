@@ -6,6 +6,7 @@ folded volume (SolidCraft's check), except for a hole drilled radially through a
 whose two skins see different holes.
 """
 
+import itertools
 import json
 import math
 import os
@@ -16,6 +17,7 @@ from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 
 import flatmat as fm
+from flatmat.model import Arc
 
 CASES = {c.name: c for c in cases()}
 DATA = os.path.join(os.path.dirname(__file__), "data", "handworked")
@@ -81,6 +83,40 @@ def test_a_hole_cut_flat_unfolds_to_its_circle(built, name):
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
     centre = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
     assert [math.dist(p, centre) for p in pts] == pytest.approx([radius] * len(pts), abs=1e-6)
+
+
+@pytest.mark.parametrize("name", [n for n, c in CASES.items() if c.hems])
+def test_hems(built, name):
+    assert sum(b.kind == "hem" for b in built[name][1].bends) == CASES[name].hems
+
+
+@pytest.mark.parametrize("name", [n for n, c in CASES.items() if c.features])
+def test_countersinks_and_counterbores(built, name):
+    c, sheet = CASES[name], built[name][1]
+
+    def key(kind, side, through, outer, angle, depth):
+        r = lambda x: None if x is None else round(x, 6)  # noqa: E731
+        return (kind, side, r(through), r(outer), r(angle), r(depth))
+
+    got = sorted(
+        key(f.kind, f.side, f.through_diameter, f.outer_diameter, f.angle_deg, f.depth) for f in sheet.features
+    )
+    # which skin is "top" is the reference skin's choice: the sides must match up to a flip
+    flips = [{1: "top", -1: "bottom"}, {1: "bottom", -1: "top"}]
+    assert got in [sorted(key(f[0], m[f[1]], *f[2:]) for f in c.features) for m in flips]
+
+
+@pytest.mark.parametrize("name", [n for n, c in CASES.items() if c.centres])
+@pytest.mark.parametrize("k", [0.33, 0.44, 0.5])
+def test_hole_centres(built, name, k):
+    """The flat's round holes are where the hand-worked flat puts them: their distances to each
+    other, which do not depend on where the flat is placed."""
+    c, sheet = CASES[name], built[name][1]
+    holes = fm.unfold(sheet, k=k).holes
+    assert all(len(h.segments) == 1 and isinstance(h.segments[0], Arc) for h in holes)
+    got = sorted(math.dist(a, b) for a, b in itertools.combinations([h.segments[0].center for h in holes], 2))
+    want = sorted(math.dist(a, b) for a, b in itertools.combinations(c.centres(k), 2))
+    assert got == pytest.approx(want, abs=1e-9)
 
 
 def test_the_radial_hole_skins_differ(built):

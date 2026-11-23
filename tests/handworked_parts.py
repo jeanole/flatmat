@@ -1,4 +1,5 @@
-"""Sheet metal test parts with holes across bends and box corners, with flats worked out by hand.
+"""Sheet metal test parts with flats worked out by hand: holes across bends, box corners, hems,
+joggles, countersinks and counterbores.
 
 Every part is built in OCP from primitives, and every expected flat is a closed form:
 
@@ -15,6 +16,9 @@ Every part is built in OCP from primitives, and every expected flat is a closed 
   the complete elliptic integrals. It depends on the skin: ``flat_area`` gives both;
 - **open boxes** (``parts.box_solid``): base + 4 bends + 4 walls, less the corner reliefs,
   plus the corner tabs of a closed corner.
+- **hems, joggles, countersinks and counterbores** (``parts.Part`` profiles): width x
+  (flats + bend allowances), less the through holes; a hole at fraction f of flat i is at
+  s = flats[:i] + BA(bends[:i]) + f * flats[i] along the flat.
 
     python tests/handworked_parts.py OUTDIR     # writes <name>.step and <name>.json per part
 """
@@ -26,7 +30,7 @@ import math
 import os
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCP.BRepBuilderAPI import (
@@ -89,6 +93,12 @@ class HandPart:
     volume_rel: float | None = 1e-9  # flat area (K 0.5) x t = volume within this; None: not an identity
     circle: tuple[float, float] | None = None  # (radius, at K): the flat hole is this circle
     skin_cylinder: Callable[[str], float] | None = None  # radial holes: the skin's bend face area
+    hems: int = 0  # bends of kind "hem"
+    # countersinks and counterbores: (kind, side, through, outer, angle, depth), side +1 the left skin
+    features: list[tuple] = field(default_factory=list)
+    # where the flat's circular holes' centres are, (s along the flat, z across) at K: their
+    # distances to each other do not depend on where the flat is placed
+    centres: Callable[[float], list[tuple[float, float]]] | None = None
     note: str = ""
 
 
@@ -310,8 +320,175 @@ def _box_cases() -> list[HandPart]:
     ]
 
 
+# ---- hems, joggles, countersinks and counterbores: profile parts (parts.Part), so the flat
+# is width x (flats + bend allowances); a hole or feature at fraction f of flat i sits at
+# s = flats[:i] + BA(bends[:i]) + f * flats[i] along it
+
+
+def _s(p: Part, i: int, frac: float, k: float) -> float:
+    return sum(p.flats[:i]) + sum(ba(abs(a), r, p.t, k) for a, r in p.bends[:i]) + frac * p.flats[i]
+
+
+def _profile_case(name, p: Part, note, **kw) -> HandPart:
+    through = sum(math.pi * d * d / 4 for _, _, _, _, d in p.holes) + sum(math.pi * f[4] ** 2 / 4 for f in p.features)
+    spots = [(i, frac, z) for _, i, frac, z, _ in p.holes] + [(f[1], f[2], f[3]) for f in p.features]
+    feats = [
+        (
+            "countersink" if f[0] == "csk" else "counterbore",
+            f[6],
+            f[4],
+            f[5],
+            (f[7] if len(f) > 7 else 90.0) if f[0] == "csk" else None,
+            f[7] if f[0] == "cbore" else None,
+        )
+        for f in p.features
+    ]
+    args = dict(
+        flat_area=lambda k: p.width * p.flat_length(k) - through,
+        flat_size=lambda k: tuple(sorted((p.width, p.flat_length(k)))),
+        holes=len(spots), hems=sum(abs(a) >= 179 for a, _ in p.bends), features=feats, note=note,
+        centres=(lambda k: [(_s(p, i, frac, k), z) for i, frac, z in spots]) if spots else None,
+        volume_rel=None if p.features else 1e-9,  # the flat cuts only the through hole of a countersink
+    )  # fmt: skip
+    args.update(kw)
+    return HandPart(name, p.t, lambda: make_solid(p), [(abs(a), r) for a, r in p.bends], **args)
+
+
+def _hem_cases() -> list[HandPart]:
+    return [
+        _profile_case(
+            "hem_open_U",
+            Part("hem_open_U", t=1.5, width=80, flats=[20, 50, 20, 8], bends=[(90, 1.5), (90, 1.5), (180, 1.0)]),
+            "U channel, an open hem (R 1, 2 mm gap) folded into the channel on one flange",
+        ),
+        _profile_case(
+            "hem_closed_both",
+            Part("hem_closed_both", t=1.0, width=60, flats=[10, 60, 10], bends=[(180, 0.1), (-180, 0.1)]),
+            "a plate with closed hems (R 0.1, 0.2 mm gap) at both ends, on opposite sides",
+        ),
+        _profile_case(
+            "hem_rolled_270",
+            Part("hem_rolled_270", t=1.5, width=60, flats=[40, 2], bends=[(270, 3.0)]),
+            "a rolled edge: one 270 deg bend, R 3, a 2 mm leg",
+        ),
+        _profile_case(
+            "hem_hole_through_both",
+            Part(
+                "hem_hole_through_both",
+                t=2.0,
+                width=60,
+                flats=[40, 25, 10],
+                bends=[(90, 2.0), (180, 0.5)],
+                holes=[("flat", 2, 0.5, 30.0, 5.0)],
+            ),  # fmt: skip
+            "an L with a hem (R 0.5) on its flange; a d5 hole drilled through the hem leg and the flange "
+            "behind it: two holes BA_hem + 10 apart in the flat",
+            holes=2,
+            flat_area=lambda k: 60 * (75 + ba(90, 2.0, 2.0, k) + ba(180, 0.5, 2.0, k)) - 2 * math.pi * 2.5**2,
+            centres=lambda k: [
+                (40 + ba(90, 2.0, 2.0, k) + 25 - 5, 30.0),
+                (40 + ba(90, 2.0, 2.0, k) + 25 + ba(180, 0.5, 2.0, k) + 5, 30.0),
+            ],
+        ),
+    ]
+
+
+def _joggle_cases() -> list[HandPart]:
+    return [
+        _profile_case(
+            "joggle_offset",
+            Part(
+                "joggle_offset",
+                t=2.0,
+                width=60,
+                flats=[40, 5, 40],
+                bends=[(45, 2.0), (-45, 2.0)],
+                holes=[("flat", 0, 0.5, 20.0, 6.0), ("flat", 2, 0.5, 40.0, 6.0)],
+            ),  # fmt: skip
+            "a 45 deg joggle with a 5 mm flat between its bends; a d6 hole either side",
+        ),
+        _profile_case(
+            "joggle_z_tight",
+            Part("joggle_z_tight", t=1.5, width=50, flats=[30, 2, 30], bends=[(90, 1.0), (-90, 1.0)]),
+            "a Z joggle: two 90 deg bends, R 1, 2 mm apart",
+        ),
+        _profile_case(
+            "joggle_on_flange",
+            Part(
+                "joggle_on_flange", t=2.0, width=60, flats=[30, 25, 0.0, 20], bends=[(90, 2.0), (20, 4.0), (-20, 4.0)]
+            ),
+            "an L whose flange is joggled: two tangent 20 deg bends, R 4, no flat between",
+        ),
+    ]
+
+
+def _countersink_cases() -> list[HandPart]:
+    return [
+        _profile_case(
+            "csk_U",
+            Part(
+                "csk_U",
+                t=3.0,
+                width=80,
+                flats=[30, 60, 30],
+                bends=[(90, 3.0), (90, 3.0)],
+                features=[
+                    ("csk", 1, 0.5, 40.0, 5.5, 10.0, +1),
+                    ("csk", 0, 0.4, 20.0, 4.5, 8.0, -1),
+                    ("csk", 2, 0.6, 60.0, 4.5, 8.0, +1),
+                ],
+            ),  # fmt: skip
+            "U channel: 90 deg countersinks on the base and both flanges, on both sides",
+        ),
+        _profile_case(
+            "csk_angles",
+            Part(
+                "csk_angles",
+                t=3.0,
+                width=80,
+                flats=[50, 40],
+                bends=[(90, 2.0)],
+                features=[
+                    ("csk", 0, 0.3, 20.0, 5.0, 9.0, +1, 82.0),
+                    ("csk", 0, 0.7, 60.0, 5.0, 9.0, +1, 100.0),
+                    ("csk", 1, 0.5, 40.0, 5.0, 9.0, -1, 120.0),
+                ],
+            ),  # fmt: skip
+            "an L with 82, 100 and 120 deg countersinks",
+        ),
+        _profile_case(
+            "cbore_Z",
+            Part(
+                "cbore_Z",
+                t=5.0,
+                width=60,
+                flats=[40, 30, 40],
+                bends=[(90, 3.0), (-90, 3.0)],
+                features=[
+                    ("cbore", 0, 0.5, 30.0, 6.6, 11.0, +1, 3.0),
+                    ("cbore", 2, 0.5, 30.0, 6.6, 11.0, -1, 3.0),
+                    ("csk", 1, 0.5, 30.0, 5.5, 10.0, +1),
+                ],
+            ),  # fmt: skip
+            "a Z, t 5: counterbores (d6.6 / d11, 3 deep) on the outer flats, opposite sides; a countersink in the web",
+        ),
+        _profile_case(
+            "panel_hem_joggle_csk",
+            Part(
+                "panel_hem_joggle_csk",
+                t=1.5,
+                width=70,
+                flats=[10, 70, 4, 30],
+                bends=[(180, 0.5), (30, 3.0), (-30, 3.0)],
+                features=[("csk", 1, 0.3, 20.0, 4.0, 6.5, -1), ("csk", 1, 0.7, 50.0, 4.0, 6.5, -1)],
+            ),  # fmt: skip
+            "a panel: a hem at one end, a joggle at the other, two countersinks between",
+        ),
+    ]
+
+
 def cases() -> list[HandPart]:
-    return _l_cases() + _box_cases()
+    return _l_cases() + _box_cases() + _hem_cases() + _joggle_cases() + _countersink_cases()
 
 
 def expected(c: HandPart, k: float | None = None) -> dict:
@@ -322,6 +499,13 @@ def expected(c: HandPart, k: float | None = None) -> dict:
         flat["area_mm2_by_developed_skin"] = flat.pop("area_mm2")
     if c.circle:
         flat["hole_circle_radius"] = c.circle[0]
+    if c.centres:
+        flat["hole_centres_s_z"] = [list(p) for p in c.centres(k)]
+    if c.hems:
+        flat["hems"] = c.hems
+    if c.features:
+        keys = ("kind", "side", "through_diameter", "outer_diameter", "angle_deg", "depth")
+        flat["features"] = [dict(zip(keys, f, strict=True)) for f in c.features]
     return {
         "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
         "thickness": c.t,

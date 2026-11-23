@@ -1,0 +1,37 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 2.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 2.0,
+      "ba": 4.523893421169302
+    },
+    {
+      "angle_deg": 180,
+      "r_in": 0.5,
+      "ba": 4.335397861953914
+    }
+  ],
+  "flat": {
+    "area_mm2": 4992.287568817521,
+    "size": [
+      60,
+      83.85929128312321
+    ],
+    "holes": 2,
+    "hole_centres_s_z": [
+      [
+        64.5238934211693,
+        30.0
+      ],
+      [
+        78.85929128312321,
+        30.0
+      ]
+    ],
+    "hems": 1
+  },
+  "note": "an L with a hem (R 0.5) on its flange; a d5 hole drilled through the hem leg and the flange behind it: two holes BA_hem + 10 apart in the flat"
+}
