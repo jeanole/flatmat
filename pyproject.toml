@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flatmat"
-version = "0.2.0.dev0"
+dynamic = ["version"]  # from src/flatmat/__init__.py
 description = "Sheet metal recognition and unfolding for STEP files, on OpenCascade"
 readme = "README.md"
 license = "Apache-2.0"
@@ -36,9 +36,19 @@ flatmat = "flatmat.cli:main"
 
 [project.urls]
 Source = "https://github.com/jeanole/flatmat"
+Documentation = "https://github.com/jeanole/flatmat/blob/main/docs/design.md"
+"Test results" = "https://github.com/jeanole/flatmat/blob/main/docs/test-results.md"
+Issues = "https://github.com/jeanole/flatmat/issues"
+
+[tool.hatch.version]
+path = "src/flatmat/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flatmat"]
+
+[tool.hatch.build.targets.sdist]
+# the package, its tests with their STEP parts, and the docs; not the spike or the CI files
+include = ["src/flatmat", "tests", "docs/*.md", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

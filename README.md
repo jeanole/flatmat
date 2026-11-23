@@ -6,7 +6,7 @@ Sheet metal recognition and unfolding for STEP files, in Python on
 OpenCascade.
 
 > **Checked, not claimed.** Every test part's flat pattern is compared with one worked
-> out by hand, on every push to `main`. **[See the test results](docs/test-results.md)**:
+> out by hand, on every push to `main`. **[See the test results](https://github.com/jeanole/flatmat/blob/main/docs/test-results.md)**:
 > a picture of each part and its flat, the formula behind the expected flat, and
 > flatmat's error against it. No expected value comes from a commercial CAD product.
 
@@ -32,14 +32,14 @@ diagnostic that names the faces involved, never silently unfolded wrong.
 **v0.1 in development.** The package works end to end for planes and
 cylindrical bends, joggles (with a shop's joggle table), embosses, extruded holes,
 louvres, bridges and lances.
-Tested on (latest results, part by part: [`docs/test-results.md`](docs/test-results.md)):
+Tested on (latest results, part by part: [`docs/test-results.md`](https://github.com/jeanole/flatmat/blob/main/docs/test-results.md)):
 
 - generated parts and random profiles (hypothesis): exact to 1e-9;
 - 6 BenDFM samples: they match BenDFM's own unfolds;
 - SolidCraft's 9 analytic sheet metal reference parts, rebuilt as STEP in
-  [`tests/data/solidcraft_oracle`](tests/data/solidcraft_oracle/README.md): flat
+  [`tests/data/solidcraft_oracle`](https://github.com/jeanole/flatmat/blob/main/tests/data/solidcraft_oracle/README.md): flat
   area, size and bend allowances exact to 1e-9 against the hand-worked flat;
-- 23 hand-worked parts in [`tests/data/handworked`](tests/data/handworked/README.md):
+- 23 hand-worked parts in [`tests/data/handworked`](https://github.com/jeanole/flatmat/blob/main/tests/data/handworked/README.md):
   holes across bends (windows, a notch, a slot, a radial hole, holes cut flat and then
   bent), box corners (open, relieved, closed), hems (open, closed, rolled 270°, a hole
   through both layers), joggles, and countersinks (82° to 120°) and counterbores: exact
@@ -50,9 +50,9 @@ Needs OCP 8.0 (`cadquery-ocp-novtk` 8.0.x).
 
 | | |
 |---|---|
-| [`docs/design.md`](docs/design.md) | algorithm, API, diagnostics, tests, hard cases, robustness, manufacturing checks, roadmap |
-| [`docs/research.md`](docs/research.md) | the research behind it, with sources |
-| [`spike/`](spike/README.md) | the phase-0 prototype and its measurements |
+| [`docs/design.md`](https://github.com/jeanole/flatmat/blob/main/docs/design.md) | algorithm, API, diagnostics, tests, hard cases, robustness, manufacturing checks, roadmap |
+| [`docs/research.md`](https://github.com/jeanole/flatmat/blob/main/docs/research.md) | the research behind it, with sources |
+| [`spike/`](https://github.com/jeanole/flatmat/blob/main/spike/README.md) | the phase-0 prototype and its measurements |
 
 ### Usage
 
@@ -160,7 +160,8 @@ DXF. `load_step(path, pmi=False)` skips the XCAF read.
 ### Tests
 
 The latest results, with every sheet metal test part, are in
-[`docs/test-results.md`](docs/test-results.md): CI writes it on every push to `main`
+[`docs/test-results.md`](https://github.com/jeanole/flatmat/blob/main/docs/test-results.md): CI writes it on every push to `main`
+and commits it when a result changed
 (`pytest tests --results-page docs/test-results.md` writes it locally). Its pictures of the
 parts are drawn by `pip install -e ".[docs]" && python tests/render_parts.py` when a part
 changes.
@@ -170,6 +171,25 @@ pip install -e ".[test]" && pytest
 FLATMAT_BENDFM_DIR=/path/to/bendfm/example_files pytest tests/test_external.py
 FLATMAT_PARTS_DIR=/path/to/private/step/files pytest tests/test_external.py   # never committed
 ```
+
+CI runs lint, mypy and the tests on every pull request and every push to `main`.
+
+### Releasing
+
+`.github/workflows/release.yml` builds the sdist and wheel, checks them (`twine check`,
+the wheel's `flatmat --version`, the tests from the unpacked sdist) and publishes with
+PyPI trusted publishing: no token is stored. The version lives in one place,
+`__version__` in `src/flatmat/__init__.py`.
+
+1. Once: on pypi.org and test.pypi.org, add a pending trusted publisher for `flatmat`
+   (owner `jeanole`, repository `flatmat`, workflow `release.yml`, environment `pypi`
+   and `testpypi`), and create those two environments under the repository's
+   Settings → Environments (give `pypi` a required reviewer to approve each release).
+2. Dry run: Actions → Release → Run workflow publishes the current version to TestPyPI.
+   A version can be uploaded once, so a second dry run needs a new `.devN`.
+3. Release: set `__version__`, merge to `main`, then tag that commit `v<version>` and push the tag.
+   The workflow refuses a tag that does not match `__version__`, publishes to PyPI and
+   makes a GitHub release with the built files.
 
 ## Why another unfolder
 
@@ -211,7 +231,7 @@ FreeCAD and no build123d at runtime.
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](https://github.com/jeanole/flatmat/blob/main/LICENSE).
 
 flatmat uses Open CASCADE Technology (OCCT) through the OCP bindings. OCCT
 is licensed under the LGPL-2.1 with the Open CASCADE exception; its source is

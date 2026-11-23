@@ -1,0 +1,101 @@
+name: Release
+
+# Push a tag v<version> (the version in src/flatmat/__init__.py) to publish to PyPI and
+# make a GitHub release. "Run workflow" in the Actions tab publishes the same build to
+# TestPyPI instead: a dry run. Both use PyPI trusted publishing, so no token is stored:
+# see "Releasing" in the README for the one-time setup on pypi.org and test.pypi.org.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Tag matches the package version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/flatmat/__init__.py)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but src/flatmat/__init__.py says $version"
+            exit 1
+          fi
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check the metadata PyPI will show
+        run: uvx twine check --strict dist/*
+      - name: The wheel installs and runs
+        run: |
+          uv venv /tmp/wheel-env
+          uv pip install --python /tmp/wheel-env dist/*.whl
+          /tmp/wheel-env/bin/flatmat --version
+          /tmp/wheel-env/bin/python -c "import flatmat; print(flatmat.__version__)"
+      - name: The sdist's tests pass
+        run: |
+          mkdir /tmp/sdist && tar -xzf dist/*.tar.gz -C /tmp/sdist --strip-components 1
+          cd /tmp/sdist
+          uv venv
+          uv pip install ".[test]"
+          uv run --no-sync pytest -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/flatmat/
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/flatmat/
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create the release with the built files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
