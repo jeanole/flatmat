@@ -1,7 +1,14 @@
 # flatmat
 
+[![CI](https://github.com/jeanole/flatmat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jeanole/flatmat/actions/workflows/ci.yml)
+
 Sheet metal recognition and unfolding for STEP files, in Python on
 OpenCascade.
+
+> **Checked, not claimed.** Every test part's flat pattern is compared with one worked
+> out by hand, on every push to `main`. **[See the test results](docs/test-results.md)**:
+> a picture of each part and its flat, the formula behind the expected flat, and
+> flatmat's error against it. No expected value comes from a commercial CAD product.
 
 flatmat is meant to take a bent sheet metal part from a STEP file and:
 
@@ -25,7 +32,7 @@ diagnostic that names the faces involved, never silently unfolded wrong.
 **v0.1 in development.** The package works end to end for planes and
 cylindrical bends, joggles (with a shop's joggle table), embosses, extruded holes,
 louvres, bridges and lances.
-Tested on:
+Tested on (latest results, part by part: [`docs/test-results.md`](docs/test-results.md)):
 
 - generated parts and random profiles (hypothesis): exact to 1e-9;
 - 6 BenDFM samples: they match BenDFM's own unfolds;
