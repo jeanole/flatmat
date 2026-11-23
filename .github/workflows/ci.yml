@@ -17,8 +17,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - run: uvx ruff@0.6.9 check src tests
       - run: uvx ruff@0.6.9 format --check src tests
 
@@ -35,8 +35,8 @@ jobs:
           - { os: macos-latest, python: "3.13", ocp: "8.0.1.1.0" }
           - { os: windows-latest, python: "3.12", ocp: "8.0.1.1.0" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python }}
       - name: Install
@@ -73,8 +73,8 @@ jobs:
       group: results-page
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.13"
       - name: Install
