@@ -24,7 +24,7 @@ flatmat's flat pattern (bend lines: up red, down blue, joggle orange); they are 
 
 **32 / 32 parts pass**; sources: 9 solidcraft reference parts, 23 hand-worked parts. All tests: 723 passed, 0 failed, 2 skipped.
 
-Run 2026-11-23 16:18 UTC, commit `8f12f195de`, Python 3.13.18, OCP 8.0.1.1, Linux x86_64.
+Run 2026-11-23 16:22 UTC, commit `350061a53e`, Python 3.13.18, OCP 8.0.1.1, Linux x86_64.
 
 ## SolidCraft reference parts
 
