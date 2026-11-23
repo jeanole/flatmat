@@ -1,0 +1,36 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 1.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 1.5,
+      "ba": 3.0473448739820994
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 1.5,
+      "ba": 3.0473448739820994
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 1.5,
+      "ba": 3.0473448739820994
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 1.5,
+      "ba": 3.0473448739820994
+    }
+  ],
+  "flat": {
+    "area_mm2": 11497.184905552527,
+    "size": [
+      126.0946897479642,
+      146.0946897479642
+    ],
+    "holes": 0
+  },
+  "note": "t 1, R 1.5, 60 x 40 x 40, closed corners 0.5 apart, reliefs 3"
+}

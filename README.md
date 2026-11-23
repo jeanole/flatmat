@@ -31,6 +31,9 @@ Tested on:
 - SolidCraft's 9 analytic sheet metal reference parts, rebuilt as STEP in
   [`tests/data/solidcraft_oracle`](tests/data/solidcraft_oracle/README.md): flat
   area, size and bend allowances exact to 1e-9 against the hand-worked flat;
+- 12 hand-worked parts with holes across bends (windows, a notch, a slot, a radial
+  hole, holes cut flat and then bent) and box corners (open, relieved, closed), in
+  [`tests/data/handworked`](tests/data/handworked/README.md): exact to 1e-9 at three K;
 - 4 real SolidWorks 2023/2026 exports.
 
 Results are identical on OCP 7.8 and 8.0.

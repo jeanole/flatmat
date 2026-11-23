@@ -1,0 +1,24 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 3.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 8.0,
+      "ba": 14.639821765728437
+    }
+  ],
+  "flat": {
+    "size": [
+      60,
+      84.63982176572844
+    ],
+    "holes": 1,
+    "area_mm2_by_developed_skin": {
+      "inner": 4981.591474207763,
+      "outer": 5009.976453072176
+    }
+  },
+  "note": "the flat hole is not a circle and its area depends on the skin developed"
+}

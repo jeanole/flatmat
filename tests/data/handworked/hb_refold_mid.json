@@ -1,0 +1,22 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 2.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 10.0,
+      "ba": 17.090264035528477
+    }
+  ],
+  "flat": {
+    "area_mm2": 5175.150359674272,
+    "size": [
+      60,
+      87.09026403552848
+    ],
+    "holes": 1,
+    "hole_circle_radius": 4.0
+  },
+  "note": "cut flat, folded at K 0.44: unfolded at 0.44 it is the d8 circle again"
+}

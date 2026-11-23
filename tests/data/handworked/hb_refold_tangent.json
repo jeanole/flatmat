@@ -1,0 +1,22 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 2.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 6.0,
+      "ba": 10.807078728348888
+    }
+  ],
+  "flat": {
+    "area_mm2": 4820.150389818625,
+    "size": [
+      60,
+      80.80707872834888
+    ],
+    "holes": 1,
+    "hole_circle_radius": 3.0
+  },
+  "note": "half the hole in the flange, half in the bend"
+}

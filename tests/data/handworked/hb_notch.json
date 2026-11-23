@@ -1,0 +1,21 @@
+{
+  "source": "flatmat tests/handworked_parts.py: flat worked out by hand",
+  "thickness": 2.0,
+  "k": 0.44,
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 6.094689747964199
+    }
+  ],
+  "flat": {
+    "area_mm2": 6270.438902861565,
+    "size": [
+      80,
+      81.0946897479642
+    ],
+    "holes": 0
+  },
+  "note": "a bend relief cut in from the edge: the outline steps in, no hole"
+}
