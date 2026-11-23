@@ -4,18 +4,13 @@ import numpy as np
 import pytest
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
 from OCP.BRepGProp import BRepGProp
+from OCP.collections import Array1_double as TColStd_Array1OfReal
+from OCP.collections import Array1_gp_Pnt2d as TColgp_Array1OfPnt2d
+from OCP.collections import Array1_int as TColStd_Array1OfInteger
 from OCP.Geom2d import Geom2d_BSplineCurve
 from OCP.GeomAPI import GeomAPI
 from OCP.gp import gp_Ax3, gp_Pln, gp_Pnt, gp_Pnt2d
 from OCP.GProp import GProp_GProps
-
-try:  # OCP 7.8
-    from OCP.TColgp import TColgp_Array1OfPnt2d
-    from OCP.TColStd import TColStd_Array1OfInteger, TColStd_Array1OfReal
-except ImportError:  # OCP 8.0
-    from OCP.collections import Array1_double as TColStd_Array1OfReal
-    from OCP.collections import Array1_gp_Pnt2d as TColgp_Array1OfPnt2d
-    from OCP.collections import Array1_int as TColStd_Array1OfInteger
 
 from flatmat.model import Line, Loop2D, Spline
 

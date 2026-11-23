@@ -10,12 +10,8 @@ Healing modes:
     (SolidWorks writes none for cylindrical faces). Solid orientation is checked
     by volume.
 
-    - OCP 8.0: ``XSControl_Reader.SetShapeFixParameters`` with a complete map,
-      set *after* ``ReadFile`` (the actor that stores it only exists then).
-    - OCP 7.8: the reader takes its sequence from a resource file named ``STEP`` in
-      ``$CSF_STEPDefaults``, read once per process at the first STEP read. flatmat
-      writes such a file and sets the variable before its first read, unless the
-      variable is already set. This affects every STEP read in the process.
+    ``XSControl_Reader.SetShapeFixParameters`` with a complete map, set *after*
+    ``ReadFile`` (the actor that stores it only exists then).
 
 ``full``
     The reader's default healing.
@@ -25,8 +21,8 @@ Reading through XCAF (``pmi=True``, the default):
 The file is read with ``STEPCAFControl_Reader`` into a ``TDocStd_Document`` so the
 semantic PMI (AP242 GD&T) can be read from it later; :attr:`StepModel.doc` keeps it.
 The XCAF reader drives the same ``STEPControl_Reader`` (``ChangeReader()``), so the
-healing above applies unchanged: on 8.0 the fix parameters are set on that inner
-reader after ``ReadFile``; on 7.8 the resource file is process-wide anyway. Colours
+healing above applies unchanged: the fix parameters are set on that inner reader
+after ``ReadFile``. Colours
 are not read. The solids are taken from ``XCAFDoc_ShapeTool.GetFreeShapes``, one
 free shape per transferred root in root order, which is the order ``OneShape()``
 gives. If the XCAF read fails or finds no solid, the plain reader reads the file
@@ -38,7 +34,6 @@ without the warning.
 from __future__ import annotations
 
 import os
-import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -64,16 +59,6 @@ from .pmi import PmiData, read_pmi
 Heal = Literal["fast", "full"]
 
 _FAST_OVERRIDES = {"FixShape.FixShellMode": "0", "FixShape.FixSolidMode": "0"}
-_RESOURCE_78 = """FromSTEP.exec.op : FixShape
-FromSTEP.FixShape.Tolerance3d : &Runtime.Tolerance
-FromSTEP.FixShape.MaxTolerance3d : &Runtime.MaxTolerance
-FromSTEP.FixShape.MinTolerance3d : 1.e-7
-FromSTEP.FixShape.FixShellMode : 0
-FromSTEP.FixShape.FixSolidMode : 0
-ToSTEP.exec.op : SplitCommonVertex,DirectFaces
-"""
-_HAS_FIX_PARAMETERS = hasattr(STEPControl_Reader, "SetShapeFixParameters")
-_state = {"read_once": False, "fast_78": False}
 
 
 @dataclass(frozen=True)
@@ -112,17 +97,7 @@ class StepModel:
         return self._pmi[index]
 
 
-def _prepare_78_fast() -> None:
-    if _state["read_once"] or "CSF_STEPDefaults" in os.environ:
-        return
-    d = tempfile.mkdtemp(prefix="flatmat_occt78_")
-    with open(os.path.join(d, "STEP"), "w") as fh:
-        fh.write(_RESOURCE_78)
-    os.environ["CSF_STEPDefaults"] = d
-    _state["fast_78"] = True
-
-
-def _apply_fast_80(reader) -> None:
+def _apply_fast(reader) -> None:
     from OCP.DE import DE_ShapeFixParameters
     from OCP.TCollection import TCollection_AsciiString as A
 
@@ -159,11 +134,10 @@ def _read_plain(path: str, heal: Heal):
     """The solids' container from ``STEPControl_Reader``: ``OneShape()``."""
     reader = STEPControl_Reader()
     status = reader.ReadFile(path)
-    _state["read_once"] = True
     if status != IFSelect_RetDone:
         raise refuse(Code.READ_FAILED, f"cannot read STEP file {path}")
-    if heal == "fast" and _HAS_FIX_PARAMETERS:
-        _apply_fast_80(reader)
+    if heal == "fast":
+        _apply_fast(reader)
     reader.TransferRoots()
     return reader.OneShape()
 
@@ -187,11 +161,10 @@ def _read_xcaf(path: str, heal: Heal):
     reader.SetNameMode(True)
     reader.SetColorMode(False)
     status = reader.ReadFile(path)
-    _state["read_once"] = True
     if status != IFSelect_RetDone:
         raise _XcafFailed(f"XCAF ReadFile failed ({status})")
-    if heal == "fast" and _HAS_FIX_PARAMETERS:
-        _apply_fast_80(reader.ChangeReader())
+    if heal == "fast":
+        _apply_fast(reader.ChangeReader())
     doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
     XCAFApp_Application.GetApplication_s().InitDocument(doc)
     if not reader.Transfer(doc):
@@ -231,10 +204,6 @@ def load_step(path: str | os.PathLike, heal: Heal = "fast", *, pmi: bool = True)
     """
     path = os.fspath(path)
     diags: list[Diagnostic] = []
-    if heal == "fast" and not _HAS_FIX_PARAMETERS:
-        _prepare_78_fast()
-    if heal == "full" and _state["fast_78"]:
-        diags.append(warn(Code.READ_FAILED, "full healing is unavailable on OCP 7.8 after a fast read in this process"))
     doc, solids, pmi_failure, step_dims = None, [], "", ()
     if pmi:
         try:

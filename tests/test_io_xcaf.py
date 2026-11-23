@@ -53,16 +53,15 @@ def test_xcaf_read_is_identical_with_full_healing(name, step_dir, tmp_path):
     assert_pmi_read_identical(path, tmp_path, k=0.44, heal="full")
 
 
-@pytest.mark.skipif(not fm.io._HAS_FIX_PARAMETERS, reason="OCP 7.8 heals through a process-wide resource file")
 def test_fast_healing_reaches_the_xcaf_reader(any_case_path, monkeypatch):
     seen = []
-    real = fm.io._apply_fast_80
+    real = fm.io._apply_fast
 
     def spy(reader):
         seen.append(type(reader).__name__)
         real(reader)
 
-    monkeypatch.setattr(fm.io, "_apply_fast_80", spy)
+    monkeypatch.setattr(fm.io, "_apply_fast", spy)
     model = fm.load_step(any_case_path, pmi=True)
     assert seen == ["STEPControl_Reader"]
     assert model.doc is not None

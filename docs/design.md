@@ -21,7 +21,7 @@ bend table and a DXF that a laser cutter and a press brake can use.
 |---|---|---|
 | Licence | Apache-2.0 | Same as build123d and the OCP bindings; patent grant; usable from proprietary software. FreeCAD (LGPL) code is read for ideas, never copied. |
 | Language | Python | Run time is dominated by OCCT's STEP reader and healing, which is C++ in every option. Unfolding is O(faces): milliseconds. |
-| Kernel | `cadquery-ocp-novtk` | Headless OCCT bindings, wheels for CPython 3.11–3.14 on Linux/macOS/Windows. Target 8.0.x, CI also on 7.8.x. |
+| Kernel | `cadquery-ocp-novtk` | Headless OCCT bindings, wheels for CPython 3.11–3.14 on Linux/macOS/Windows. OCP 8.0.x only (7.8 dropped 2026-11). |
 | Runtime dependencies | OCP, ezdxf (+ pyclipper or shapely for 2D checks) | No build123d (unreleased sheet metal, pins OCP 8.0, pulls scipy/sympy/ipython), no networkx (a plain BFS suffices). |
 | Concurrency | one process per part | OCCT's STEP reader was not reliably thread-safe up to 7.9; OCP has no free-threaded wheels. |
 | C++ | only if the phase-0 benchmark shows a need | A C++ extension can only exchange `TopoDS_Shape` with OCP when built against the identical OCCT build. |
@@ -362,8 +362,9 @@ with `spike/run.py`.
 
 ### CI
 
-ubuntu / macOS / windows × Python 3.11 and 3.14 × OCP 7.8 and 8.0 (reduced
-matrix); ruff, mypy, pytest.
+On push to `main` and by hand (`workflow_dispatch`): ubuntu (Python 3.11 and
+3.14), macOS (3.13), windows (3.12), all OCP 8.0; ruff, mypy, pytest. OCP 7.8
+was dropped in 2026-11; the 7.8 notes below are history.
 
 ---
 
@@ -419,7 +420,7 @@ All in `src/flatmat/`:
 | `export.py` | DXF, bend table (JSON/CSV), SVG (§2) |
 | `geom2d.py` | 2D vectors, rigid transforms and slit cutting, shared by `unfold`, `fold`, `dfm` and `export` |
 | `model.py`, `diagnostics.py` | the public dataclasses, `FEATURE_KINDS` (how each stage treats each kind of feature) and the diagnostic codes |
-| `_occ.py` | the differences between OCP 7.8 and 8.0 |
+| `_occ.py` | the OCP 8.0 names flatmat uses (collections, TopoDS downcasts) |
 | `cli.py` | `flatmat unfold` |
 
 ### Scope by version
@@ -866,12 +867,9 @@ read ─▶ (heal: full | fast | off) ─▶ validate ─▶ canonicalize ─▶
        parameters" does not override existing keys.
        `SetShapeProcessFlags` cannot be called from Python, because
        `std::bitset` is not bound.
-     - **OCP 7.8**: a resource file named `STEP` in a directory pointed to
-       by `$CSF_STEPDefaults`, set before the first read in the process,
-       with `FromSTEP.exec.op : FixShape` and the two modes at 0.
-   - `full`: the reader's default healing. On 7.8 that needs a process
-     without the resource override, so the worker pool keeps one 7.8
-     process per mode.
+     - (OCP 7.8, no longer supported, took a resource file named `STEP`
+       in `$CSF_STEPDefaults` instead, process-wide.)
+   - `full`: the reader's default healing.
    - **`FixShellMode = 0` also skips all face- and wire-level fixes**
      (*spike*, on a real SolidWorks file). So `fast` must add missing
      pcurves itself: `ShapeFix_Wire(w, f, tol).FixEdgeCurves()` on every

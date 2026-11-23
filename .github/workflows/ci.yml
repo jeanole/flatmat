@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-  pull_request:
+    branches: [main]
+  workflow_dispatch:  # "Run workflow" in the Actions tab, for any branch
 
 permissions:
   contents: read
@@ -23,14 +24,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # OCP 8.0: Python 3.11-3.14; OCP 7.8: Python 3.10-3.13
+          # OCP 8.0: Python 3.11-3.14
           - { os: ubuntu-latest, python: "3.11", ocp: "8.0.1.1.0" }
           - { os: ubuntu-latest, python: "3.14", ocp: "8.0.1.1.0" }
-          - { os: ubuntu-latest, python: "3.11", ocp: "7.8.1.1.post1" }
-          - { os: ubuntu-latest, python: "3.13", ocp: "7.8.1.1.post1" }
           - { os: macos-latest, python: "3.13", ocp: "8.0.1.1.0" }
-          - { os: windows-latest, python: "3.13", ocp: "8.0.1.1.0" }
-          - { os: windows-latest, python: "3.12", ocp: "7.8.1.1.post1" }
+          - { os: windows-latest, python: "3.12", ocp: "8.0.1.1.0" }
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -48,7 +46,8 @@ jobs:
           mkdir -p bendfm && cd bendfm
           for i in 0 1 2 3 4 5; do
             for f in $i.stp ${i}_unfolded.stp ${i}_sequence.json; do
-              curl -sSfLO "https://raw.githubusercontent.com/UGent-CVAMO/bendfm/main/example_files/$f" || true
+              curl -sSfLO --retry 5 --retry-all-errors --retry-delay 2 \
+                "https://raw.githubusercontent.com/UGent-CVAMO/bendfm/main/example_files/$f"
             done
           done
       - name: Test
