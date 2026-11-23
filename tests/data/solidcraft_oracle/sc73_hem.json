@@ -1,0 +1,30 @@
+{
+  "source": "SolidCraft tests/oracle/73-sm-hem (folded volume and area); flat by hand",
+  "thickness": 2.5,
+  "k": 0.44,
+  "folded": {
+    "volume_mm3": 21332.046251434014,
+    "area_mm2": 17992.27792617589
+  },
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 2.5,
+      "ba": 5.654866776461628
+    },
+    {
+      "angle_deg": 180,
+      "r_in": 0.005,
+      "ba": 3.4714598822167213
+    }
+  ],
+  "flat": {
+    "area_mm2": 8462.132665867835,
+    "size": [
+      84.62132665867836,
+      100
+    ],
+    "holes": 0
+  },
+  "note": "the hem leg lies 0.01 mm from the flange it folds over"
+}

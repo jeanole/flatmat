@@ -1,0 +1,30 @@
+{
+  "source": "SolidCraft tests/oracle/75-sm-bracket-holes (folded volume and area); flat by hand",
+  "thickness": 2.5,
+  "k": 0.44,
+  "folded": {
+    "volume_mm3": 13667.58243421114,
+    "area_mm2": 11819.540919701749
+  },
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 2.5,
+      "ba": 5.654866776461628
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 2.5,
+      "ba": 5.654866776461628
+    }
+  ],
+  "flat": {
+    "area_mm2": 5441.114834291162,
+    "size": [
+      65.65486677646163,
+      90.65486677646163
+    ],
+    "holes": 2
+  },
+  "note": ""
+}

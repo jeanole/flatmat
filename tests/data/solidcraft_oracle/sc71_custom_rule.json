@@ -1,0 +1,30 @@
+{
+  "source": "SolidCraft tests/oracle/71-sm-custom-rule (folded volume and area); flat by hand",
+  "thickness": 1.5,
+  "k": 0.33,
+  "folded": {
+    "volume_mm3": 10053.716694115408,
+    "area_mm2": 13896.29850950676
+  },
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 5.489933162148164
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 5.489933162148164
+    }
+  ],
+  "flat": {
+    "area_mm2": 6638.389305943706,
+    "size": [
+      80,
+      82.97986632429632
+    ],
+    "holes": 0
+  },
+  "note": ""
+}

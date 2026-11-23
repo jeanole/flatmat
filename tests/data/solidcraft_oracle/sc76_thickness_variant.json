@@ -1,0 +1,25 @@
+{
+  "source": "SolidCraft tests/oracle/76-sm-thickness-variant (folded volume and area); flat by hand",
+  "thickness": 3.0,
+  "k": 0.44,
+  "folded": {
+    "volume_mm3": 22520.575041173113,
+    "area_mm2": 16064.12819493887
+  },
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 3.0,
+      "ba": 6.785840131753954
+    }
+  ],
+  "flat": {
+    "area_mm2": 7478.584013175396,
+    "size": [
+      74.78584013175396,
+      100
+    ],
+    "holes": 0
+  },
+  "note": ""
+}

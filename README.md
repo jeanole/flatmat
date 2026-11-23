@@ -28,6 +28,9 @@ Tested on:
 
 - generated parts and random profiles (hypothesis): exact to 1e-9;
 - 6 BenDFM samples: they match BenDFM's own unfolds;
+- SolidCraft's 9 analytic sheet metal reference parts, rebuilt as STEP in
+  [`tests/data/solidcraft_oracle`](tests/data/solidcraft_oracle/README.md): flat
+  area, size and bend allowances exact to 1e-9 against the hand-worked flat;
 - 4 real SolidWorks 2023/2026 exports.
 
 Results are identical on OCP 7.8 and 8.0.

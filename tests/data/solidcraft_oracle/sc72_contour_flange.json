@@ -1,0 +1,30 @@
+{
+  "source": "SolidCraft tests/oracle/72-sm-contour-flange (folded volume and area); flat by hand",
+  "thickness": 2.5,
+  "k": 0.44,
+  "folded": {
+    "volume_mm3": 12097.621556370217,
+    "area_mm2": 10412.00210735098
+  },
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 2.5,
+      "ba": 5.654866776461628
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 2.5,
+      "ba": 5.654866776461628
+    }
+  ],
+  "flat": {
+    "area_mm2": 4815.486677646163,
+    "size": [
+      50,
+      96.30973355292326
+    ],
+    "holes": 0
+  },
+  "note": ""
+}

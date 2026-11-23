@@ -1,0 +1,30 @@
+{
+  "source": "SolidCraft tests/oracle/74-sm-unfold-refold (folded volume and area); flat by hand",
+  "thickness": 2.5,
+  "k": 0.44,
+  "folded": {
+    "volume_mm3": 15800.304003966867,
+    "area_mm2": 13610.326162673397
+  },
+  "bends": [
+    {
+      "angle_deg": 90,
+      "r_in": 2.5,
+      "ba": 5.654866776461628
+    },
+    {
+      "angle_deg": 90,
+      "r_in": 2.5,
+      "ba": 5.654866776461628
+    }
+  ],
+  "flat": {
+    "area_mm2": 6284.778684233861,
+    "size": [
+      80,
+      81.30973355292326
+    ],
+    "holes": 1
+  },
+  "note": ""
+}
