@@ -55,3 +55,53 @@ jobs:
         env:
           FLATMAT_BENDFM_DIR: ${{ github.workspace }}/bendfm
         run: uv run --no-sync pytest -q
+
+  results-page:
+    # docs/test-results.md: the tests once more on main, written down and committed back.
+    # A push with the workflow's own token starts no new run; [skip ci] says so as well.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: results-page
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[test]" "cadquery-ocp-novtk==8.0.1.1.0"
+      - name: Fetch BenDFM samples (MIT repository; data not committed here)
+        run: |
+          mkdir -p bendfm && cd bendfm
+          for i in 0 1 2 3 4 5; do
+            for f in $i.stp ${i}_unfolded.stp ${i}_sequence.json; do
+              curl -sSfLO --retry 5 --retry-all-errors --retry-delay 2 \
+                "https://raw.githubusercontent.com/UGent-CVAMO/bendfm/main/example_files/$f"
+            done
+          done
+      - name: Test and write the page
+        id: tests
+        continue-on-error: true  # the page shows failures too; the last step fails the job
+        env:
+          FLATMAT_BENDFM_DIR: ${{ github.workspace }}/bendfm
+        run: uv run --no-sync pytest tests -q --results-page docs/test-results.md
+      - name: Commit the page
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/test-results.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Test results for ${GITHUB_SHA::10} [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
+      - name: Fail if the tests failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1

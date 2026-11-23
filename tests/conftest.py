@@ -71,3 +71,34 @@ def assert_pmi_read_identical(path, out_dir, k: float = 0.44, heal: str = "fast"
     old = _outcome(path, False, k, os.path.join(out_dir, "old.dxf"), heal)
     new = _outcome(path, True, k, os.path.join(out_dir, "new.dxf"), heal)
     assert old == new
+
+
+# ------------------------------------------------------------------ the results page (tests/results_page.py)
+
+_RESULTS: dict = {}  # outcomes and part names, while a session writes the page
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--results-page", metavar="PATH", help="write a markdown page of the results and the test parts to PATH"
+    )
+
+
+def pytest_configure(config):
+    if config.getoption("--results-page"):
+        import results_page
+
+        _RESULTS.update(outcomes=results_page.Outcomes(), names=results_page.part_names())
+
+
+def pytest_runtest_logreport(report):
+    if _RESULTS:
+        _RESULTS["outcomes"].add(report, _RESULTS["names"])
+
+
+def pytest_sessionfinish(session):
+    path = session.config.getoption("--results-page")
+    if path and _RESULTS:
+        import results_page
+
+        results_page.write(path, _RESULTS["outcomes"])

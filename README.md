@@ -152,6 +152,10 @@ DXF. `load_step(path, pmi=False)` skips the XCAF read.
 
 ### Tests
 
+The latest results, with every sheet metal test part, are in
+[`docs/test-results.md`](docs/test-results.md): CI writes it on every push to `main`
+(`pytest tests --results-page docs/test-results.md` writes it locally).
+
 ```sh
 pip install -e ".[test]" && pytest
 FLATMAT_BENDFM_DIR=/path/to/bendfm/example_files pytest tests/test_external.py
