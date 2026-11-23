@@ -39,7 +39,7 @@ Tested on:
   to 1e-9 at three K;
 - 4 real SolidWorks 2023/2026 exports.
 
-Results are identical on OCP 7.8 and 8.0.
+Needs OCP 8.0 (`cadquery-ocp-novtk` 8.0.x).
 
 | | |
 |---|---|
@@ -193,7 +193,7 @@ today:
 ## Stack
 
 Python ≥ 3.11 on [`cadquery-ocp-novtk`](https://pypi.org/project/cadquery-ocp-novtk/)
-(OCCT 8.0, also tested on 7.8) and [ezdxf](https://ezdxf.mozman.at/). No
+(OCCT 8.0) and [ezdxf](https://ezdxf.mozman.at/). No
 FreeCAD and no build123d at runtime.
 
 ## License

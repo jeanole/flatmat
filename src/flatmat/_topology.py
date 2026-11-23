@@ -127,7 +127,7 @@ def surface_props(face, ad, u: float, v: float) -> tuple[gp_Vec, float]:
 def pcurve(e, f) -> BRepAdaptor_Curve2d:
     """BRepAdaptor_Curve2d, refusing instead of crashing when the pcurve is missing.
 
-    On a missing pcurve the adaptor raises on OCP 7.8 and segfaults on 8.0.
+    On a missing pcurve the adaptor segfaults (OCP 8.0).
     """
     if BRep_Tool.CurveOnSurface_s(e, f, 0.0, 0.0) is None:
         raise refuse(Code.MISSING_PCURVE, "an edge has no pcurve on its face")
