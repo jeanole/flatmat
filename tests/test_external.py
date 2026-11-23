@@ -22,7 +22,8 @@ PARTS = os.environ.get("FLATMAT_PARTS_DIR")
 def _bendfm_ids():
     if not BENDFM:
         return []
-    return sorted(int(os.path.basename(p)[:-4]) for p in glob.glob(os.path.join(BENDFM, "*.stp")) if "_" not in p[-14:])
+    names = (os.path.basename(p)[:-4] for p in glob.glob(os.path.join(BENDFM, "*.stp")))
+    return sorted(int(n) for n in names if n.isdigit())
 
 
 def _top_skin_area(path):
