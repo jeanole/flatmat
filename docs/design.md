@@ -362,7 +362,7 @@ with `spike/run.py`.
 
 ### CI
 
-On push to `main` and by hand (`workflow_dispatch`): ubuntu (Python 3.11 and
+On pull requests, on push to `main` and by hand (`workflow_dispatch`): ubuntu (Python 3.11 and
 3.14), macOS (3.13), windows (3.12), all OCP 8.0; ruff, mypy, pytest. OCP 7.8
 was dropped in 2026-11; the 7.8 notes below are history.
 
