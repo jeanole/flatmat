@@ -1,6 +1,6 @@
 # flatmat — design
 
-Status: **v0.1 implemented, v0.2 in progress** (see the
+Status: **v0.1 and v0.2 implemented, released as 0.2.0** (see the
 [README](../README.md)). This document began as the design. The phase-0
 spike ([`spike/`](../spike/README.md)) ran §1 end to end on OCP 7.8 and 8.0;
 its results are folded in (marked *spike*). Where the code differs from the
@@ -395,7 +395,8 @@ was dropped in 2026-11; the 7.8 notes below are history.
 
    Tests: 77 in total, including hypothesis profiles, the BenDFM samples
    and private parts via environment variables.
-4. Benchmark and BenDFM evaluation; v0.1 on PyPI (check the name is free).
+4. Benchmark and BenDFM evaluation (not built yet); ~~on PyPI~~ **done**: v0.1 and v0.2
+   together as 0.2.0, the first release (`.github/workflows/release.yml`).
 5. v0.2: canonical recognition, sharp bends, countersinks, DFM checks;
    embosses and extruded holes, the corner rule, tooling, collisions and the
    bend order (done).
