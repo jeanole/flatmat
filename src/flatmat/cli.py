@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable
 
 from . import __version__
-from .bendmodel import KDin6935
+from .bendmodel import JoggleTable, KDin6935
 from .dfm import MATERIALS, check
 from .diagnostics import FlatmatError
 from .export import write_bend_table, write_dxf, write_svg
@@ -52,6 +52,17 @@ def _parser() -> argparse.ArgumentParser:
         help="with --check: find a collision-free bend order, or check ORDER (bend ids, e.g. 3,1,2)",
     )
     u.add_argument("--pre-hole", type=float, help="pre-hole diameter for extruded holes (default: neutral fibre)")
+    u.add_argument(
+        "--joggle-table",
+        metavar="CSV",
+        help="joggle allowances, rows offset,allowance in mm (default: the joggle's bends at the K-factor)",
+    )
+    u.add_argument(
+        "--joggle-max-offset",
+        type=float,
+        metavar="MM",
+        help="two opposite bends are a joggle up to this offset (default 5 x thickness; 0: no joggles)",
+    )
     u.add_argument(
         "--engrave",
         action="store_true",
@@ -99,8 +110,14 @@ _DETAILS: dict[str, Callable[[Feature], str]] = {
 def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
     try:
-        sheet = recognize(load_step(a.step, heal=a.heal), solid=a.solid, thickness=a.thickness, engrave=a.engrave)
-        pat = unfold(sheet, k=KDin6935() if a.din else a.k_factor, sharp_radius=a.sharp_radius, pre_hole=a.pre_hole)
+        sheet = recognize(load_step(a.step, heal=a.heal), solid=a.solid, thickness=a.thickness, engrave=a.engrave,
+                          joggle_max_offset=a.joggle_max_offset)  # fmt: skip
+        jt = JoggleTable.load(a.joggle_table, thickness=sheet.thickness) if a.joggle_table else None
+        pat = unfold(sheet, k=KDin6935() if a.din else a.k_factor, sharp_radius=a.sharp_radius, pre_hole=a.pre_hole,
+                     joggle=jt)  # fmt: skip
+    except (OSError, ValueError, IndexError) as e:
+        print(f"flatmat: bad joggle table: {e}", file=sys.stderr)
+        return 2
     except FlatmatError as e:
         print(json.dumps(e.diagnostic.to_dict()), file=sys.stderr)
         return 2
@@ -110,6 +127,9 @@ def main(argv: list[str] | None = None) -> int:
     for b in pat.bends:
         print(f"  bend {b.id}: {b.direction:4} {b.angle_deg:7.2f}°  r_in {b.r_in:g}  K {b.k:.4f}  BA {b.ba:.4f}"
               f"  segments {len(b.segments)}")  # fmt: skip
+    for j in pat.joggles:
+        print(f"  joggle {j.id}: bends {j.bends[0]}+{j.bends[1]}  offset {j.offset:.4f}  run {j.run:.4f}"
+              f"  length {j.length:.4f}  allowance {j.allowance:.4f} ({j.source})")  # fmt: skip
     for f in pat.features:
         print(f"  {f.kind_info.name} {f.side}{_DETAILS[f.kind](f)}")
     for d in pat.diagnostics:
@@ -143,7 +163,8 @@ def main(argv: list[str] | None = None) -> int:
                 print("  bend order: none found" + (f"; longest tail {plan.order}" if plan.order else ""))
             if plan.unchecked:
                 ids = ", ".join(map(str, plan.unchecked))
-                print(f"  not simulated: bends {ids} (hems and lances, made with their own tools; or not separable)")
+                print(f"  not simulated: bends {ids} (hems, joggles and lances, made with their own tools;"
+                      " or not separable)")  # fmt: skip
     if a.dxf:
         write_dxf(pat, a.dxf, labels=None if a.labels == "none" else a.labels, dfm=report)
     if a.table:

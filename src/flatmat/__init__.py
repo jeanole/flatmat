@@ -10,7 +10,16 @@ from __future__ import annotations
 
 __version__ = "0.2.0.dev0"
 
-from .bendmodel import KDin6935, KScalar, KTable, bend_allowance, bend_deduction, din6935_k, din6935_v
+from .bendmodel import (
+    JoggleTable,
+    KDin6935,
+    KScalar,
+    KTable,
+    bend_allowance,
+    bend_deduction,
+    din6935_k,
+    din6935_v,
+)
 from .dfm import MATERIALS, DfmReport, DfmRules, Material, check
 from .diagnostics import Code, Diagnostic, FlatmatError, Severity
 from .export import LayerMap, bend_table, write_bend_table, write_dxf, write_svg
@@ -24,6 +33,7 @@ from .model import (
     Feature,
     FeatureKind,
     FlatPattern,
+    Joggle,
     Line,
     Loop2D,
     SheetPart,
@@ -70,6 +80,8 @@ __all__ = [
     "KDin6935",
     "KScalar",
     "KTable",
+    "JoggleTable",
+    "Joggle",
     "LayerMap",
     "Line",
     "Loop2D",

@@ -70,7 +70,7 @@ class BendPlan:
     steps: tuple[BendStep, ...]
     feasible: bool
     collisions: tuple[Collision, ...] = ()
-    unchecked: tuple[int, ...] = ()  # hems and lances (made first, with their own tools) and bends not placed
+    unchecked: tuple[int, ...] = ()  # hems, joggles and lances (made first, with their own tools); bends not placed
     tooling: Tooling | None = None
     nodes: int = 0
 
@@ -255,10 +255,11 @@ def plan_bends(
     sim.exteriors = {i: Polygon(r.exterior.coords) for i, r in enumerate(model.regions)}
     sim.points = {i: np.asarray(p.exterior.coords)[:, :2] for i, p in sim.exteriors.items()}
     bends = {b.id: b for b in pattern.bends}
-    # hems (pre-bent, closed with a flattening tool) and lances (formed with the blank, in a
-    # punching tool) are not made on the press brake: not simulated, made first
+    # hems (pre-bent, closed with a flattening tool), joggles (one stroke of an offset tool) and
+    # lances (formed with the blank, in a punching tool) are not ordinary press-brake bends: not
+    # simulated, made first
     lances = {f.bend_id for f in pattern.features if f.kind_info.tool_bent}
-    hems = frozenset(b for b in model.bend_ids() if bends[b].kind == "hem" or b in lances)
+    hems = frozenset(b for b in model.bend_ids() if bends[b].kind in ("hem", "joggle") or b in lances)
     ids = [b for b in model.bend_ids() if b not in hems]
     unchecked = tuple(sorted(set(bends) - set(ids)))
     direction = {b: bends[b].direction for b in ids}

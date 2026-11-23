@@ -9,11 +9,17 @@ See docs/research.md §6 for sources.
 from __future__ import annotations
 
 import bisect
+import csv
 import math
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .diagnostics import Code, Diagnostic, warn
+
+if TYPE_CHECKING:
+    from .model import Joggle
 
 
 def bend_allowance(angle_rad: float, r_in: float, t: float, k: float) -> float:
@@ -177,3 +183,93 @@ class _KFunc:
 
     def describe(self) -> str:
         return getattr(self.fn, "__name__", "callable")
+
+
+# ------------------------------------------------------------------------------ joggles
+
+
+@dataclass(frozen=True)
+class JoggleTable:
+    """A shop's joggle allowances: the allowance as a function of the offset.
+
+    The allowance is what the flat gains over the joggle's run: the joggle's length along
+    the neutral fibre, from its first bend's outer tangent line to its second's, less the
+    same stretch measured along the outer flanges (:class:`~flatmat.model.Joggle`). With
+    a table, :func:`~flatmat.unfold.unfold` lays each joggle out ``run + allowance`` long,
+    whatever K the bends would otherwise get. Rows are interpolated linearly and clamped
+    outside the table (``JOGGLE_EXTRAPOLATED``). A table is for one thickness: give it as
+    ``thickness`` and a part of another thickness gets ``JOGGLE_TABLE_THICKNESS``.
+    """
+
+    offset: tuple[float, ...]
+    allowance: tuple[float, ...]
+    thickness: float | None = None
+    name: str = "joggle table"
+
+    def __post_init__(self) -> None:
+        if len(self.offset) != len(self.allowance) or len(self.offset) < 1:
+            raise ValueError("offset and allowance must have the same, non-zero length")
+        if list(self.offset) != sorted(self.offset):
+            raise ValueError("offset must be ascending")
+
+    @classmethod
+    def from_rows(
+        cls, rows: Sequence[tuple[float, float]], thickness: float | None = None, name: str = "joggle table"
+    ) -> JoggleTable:
+        rows = sorted(rows)
+        return cls(tuple(o for o, _ in rows), tuple(a for _, a in rows), thickness, name)
+
+    @classmethod
+    def load(cls, path: str | os.PathLike, thickness: float | None = None) -> JoggleTable:
+        """A CSV of ``offset,allowance`` rows (mm); a header row and ``#`` lines are skipped."""
+        rows = []
+        with open(path, newline="") as fh:
+            for row in csv.reader(fh):
+                if not row or row[0].lstrip().startswith("#"):
+                    continue
+                try:
+                    rows.append((float(row[0]), float(row[1])))
+                except ValueError:
+                    if rows:
+                        raise
+        return cls.from_rows(rows, thickness, os.path.basename(os.fspath(path)))
+
+    def __call__(self, joggle: Joggle, t: float) -> tuple[float, Diagnostic | None]:
+        x, xs, ys = joggle.offset, self.offset, self.allowance
+        d = None
+        if self.thickness is not None and abs(self.thickness - t) > 1e-6 * max(t, 1.0):
+            d = warn(Code.JOGGLE_TABLE_THICKNESS, f"{self.name} is for t={self.thickness:g}, the part is t={t:g}",
+                     table_thickness=self.thickness)  # fmt: skip
+        if x <= xs[0] or x >= xs[-1]:
+            outside = x < xs[0] - 1e-9 or x > xs[-1] + 1e-9
+            if outside:
+                d = warn(Code.JOGGLE_EXTRAPOLATED, f"joggle offset {x:.4g} outside the {self.name}", offset=x)
+            return (ys[0] if x <= xs[0] else ys[-1]), d
+        i = bisect.bisect_right(xs, x)
+        x0, x1, y0, y1 = xs[i - 1], xs[i], ys[i - 1], ys[i]
+        return y0 + (y1 - y0) * (x - x0) / (x1 - x0), d
+
+    def describe(self) -> str:
+        return self.name
+
+
+JoggleCallable = Callable[["Joggle", float], float]
+
+
+@dataclass(frozen=True)
+class _JoggleFunc:
+    fn: JoggleCallable
+
+    def __call__(self, joggle: Joggle, t: float) -> tuple[float, Diagnostic | None]:
+        return float(self.fn(joggle, t)), None
+
+    def describe(self) -> str:
+        return getattr(self.fn, "__name__", "callable")
+
+
+def as_joggle_model(model: JoggleTable | JoggleCallable | None) -> JoggleTable | _JoggleFunc | None:
+    if model is None or isinstance(model, JoggleTable):
+        return model
+    if callable(model):
+        return _JoggleFunc(model)
+    raise TypeError(f"unsupported joggle model: {model!r}")

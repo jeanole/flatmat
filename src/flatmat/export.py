@@ -38,9 +38,9 @@ class LayerMap:
 def _label(b, style: Labels) -> str:
     if style == "delem":
         sign = "+" if b.direction == "up" else "-"
-        head = f"H{sign}{b.angle_deg:.0f}" if b.kind == "hem" else f"{sign}{b.angle_deg:.0f}"
-        return f"{head} R{b.r_in:g}"
-    return f"{b.direction.upper()} {b.angle_deg:.1f}° R{b.r_in:g}"
+        prefix = {"hem": "H", "joggle": "J"}.get(b.kind, "")
+        return f"{prefix}{sign}{b.angle_deg:.0f} R{b.r_in:g}"
+    return ("JOGGLE " if b.kind == "joggle" else "") + f"{b.direction.upper()} {b.angle_deg:.1f}° R{b.r_in:g}"
 
 
 def write_dxf(
@@ -220,6 +220,23 @@ def bend_table(pattern: FlatPattern) -> dict:
                 "segments": segs,
             }
         )
+    joggle_of = {b: j.id for j in pattern.joggles for b in j.bends}
+    for row, b in zip(bends, pattern.bends, strict=True):
+        row["joggle"] = joggle_of.get(b.id)
+    joggles = [
+        {
+            "id": j.id,
+            "bends": list(j.bends),
+            "angle_deg": j.angle_deg,
+            "offset": j.offset,
+            "flat": j.flat,
+            "run": j.run,
+            "length": j.length,
+            "allowance": j.allowance,
+            "source": j.source,
+        }
+        for j in pattern.joggles
+    ]
     w, h = pattern.size
     features = [
         {
@@ -249,6 +266,7 @@ def bend_table(pattern: FlatPattern) -> dict:
         "flat_size": [w, h],
         "flat_area": pattern.area,
         "bends": bends,
+        "joggles": joggles,
         "features": features,
         "slits": [[list(p) for p in sl.polyline(SAMPLE_TOL)] for sl in pattern.slits],
         "generator": {"flatmat": __version__, "ocp": OCP_VERSION},
@@ -271,6 +289,7 @@ def write_bend_table(pattern: FlatPattern, path: str | os.PathLike, *, dfm=None)
             b["step"] = steps.get(b["id"])
     if path.lower().endswith(".csv"):
         cols = ["bend", "segment", "direction", "angle_deg", "r_in", "k", "ba", "bd", "x0", "y0", "x1", "y1", "length"]
+        cols += ["kind", "joggle"]
         cols += ["step"] if steps else []
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
@@ -293,6 +312,8 @@ def write_bend_table(pattern: FlatPattern, path: str | os.PathLike, *, dfm=None)
                             x1,
                             y1,
                             s["length"],
+                            b["kind"],
+                            b["joggle"] if b["joggle"] is not None else "",
                         ]
                         + ([steps.get(b["id"])] if steps else [])  # fmt: skip
                     )

@@ -26,7 +26,7 @@ from shapely.validation import explain_validity
 
 from ._occ import OCP_VERSION, as_edge
 from ._topology import Context, Face, edge_vertices, inner_uv, pcurve
-from .bendmodel import as_k_model, bend_allowance, bend_deduction, outside_setback
+from .bendmodel import as_joggle_model, as_k_model, bend_allowance, bend_deduction, outside_setback
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .geom2d import IDENTITY, Rigid, cross, dot, heading, offset, perp, rigid_fit, sub, transform, unit
 from .model import (
@@ -36,6 +36,7 @@ from .model import (
     BendLine,
     Feature,
     FlatPattern,
+    Joggle,
     Line,
     Loop2D,
     Point,
@@ -70,7 +71,13 @@ def _vertex_uv(v, e, f) -> tuple[float, float]:
 
 
 def unfold(
-    sheet: SheetPart, k=0.44, *, sharp_radius: float = 0.0, check_overlap: bool = True, pre_hole=None
+    sheet: SheetPart,
+    k=0.44,
+    *,
+    sharp_radius: float = 0.0,
+    check_overlap: bool = True,
+    pre_hole=None,
+    joggle=None,
 ) -> FlatPattern:
     """Develop the recognised sheet into a flat pattern with bend lines.
 
@@ -83,6 +90,12 @@ def unfold(
     ``pre_hole`` sets the pre-hole of extruded holes: a diameter, or a callable
     ``(Feature) -> diameter`` (e.g. a lookup in the tool maker's table). By default it
     comes from the neutral fibre (:func:`~flatmat.bendmodel.extruded_hole_prehole`).
+
+    ``joggle`` sets how long each joggle is laid flat: a
+    :class:`~flatmat.bendmodel.JoggleTable` or a callable ``(Joggle, t) -> allowance``.
+    The joggle is then ``run + allowance`` long along the neutral fibre, shared between its
+    two bends in proportion to their bend allowances from ``k`` (each bend's ``k`` is the
+    K-factor that gives it). Without it a joggle is two bends of the K model.
     """
     ctx: Context = sheet._ctx  # type: ignore[assignment]
     if ctx is None:
@@ -90,6 +103,7 @@ def unfold(
     kmodel = as_k_model(k)
     diags: list[Diagnostic] = list(sheet.diagnostics)
     bv = _bend_values(sheet, kmodel, ctx.thickness, sharp_radius, diags)
+    bv, joggles = _joggle_values(sheet, bv, as_joggle_model(joggle), diags)
     devs, shifts = _developments(ctx, bv)
     place, sharp_geo = _place(ctx, devs, shifts)
     sharp_v = {v: shifts[ei] for ei, se in ctx.sharp_edges.items() for v in se.vertices}
@@ -119,6 +133,7 @@ def unfold(
         },
         features=flat.features,
         slits=tuple(flat.slits),
+        joggles=joggles,
     )
 
 
@@ -214,6 +229,32 @@ def _self_check(ctx: Context, devs, shifts, ol: _Outline, check_overlap: bool) -
         if not poly.is_valid:
             raise refuse(Code.FLAT_OVERLAP, f"the flat pattern overlaps itself: {explain_validity(poly)}")
     return area, rel
+
+
+def _joggle_values(sheet: SheetPart, bv: _BendValues, model, diags: list) -> tuple[_BendValues, tuple[Joggle, ...]]:
+    """Each joggle's length and allowance; with a joggle model, the K of its bends that lay it
+    out ``run + allowance`` long (the two bends' allowances scaled alike)."""
+    t = bv.t
+    k = dict(bv.k)
+    out = []
+    for j in sheet.joggles:
+        th = math.radians(j.angle_deg)
+        ba = [bend_allowance(th, bv.r[b], t, bv.k[b]) for b in j.bends]
+        if model is None:
+            length, source = sum(ba) + j.flat, "k"
+        else:
+            allowance, d = model(j, t)
+            if d is not None:
+                diags.append(d)
+            length, source = j.run + allowance, "table"
+            scale = (length - j.flat) / sum(ba)
+            if scale <= 0:
+                raise refuse(Code.JOGGLE_ALLOWANCE, f"joggle {j.id}: allowance {allowance:g} makes it {length:g} mm "
+                             f"long, not more than its flat of {j.flat:g} mm", joggle=j.id)  # fmt: skip
+            for b, a in zip(j.bends, ba, strict=True):
+                k[b] = (a * scale / th - bv.r[b]) / t
+        out.append(_with(j, length=length, allowance=length - j.run, source=source))
+    return _BendValues(k, bv.r, t), tuple(out)
 
 
 def _bends_and_lines(sheet: SheetPart, ctx: Context, bv: _BendValues, devs, place, sharp_geo):

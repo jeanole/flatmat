@@ -39,8 +39,8 @@ def built(tmp_path_factory):
 
 def _developed_skin(c, sheet):
     """For a radial hole: which skin flatmat develops, from its bend face's area."""
-    (area,) = [f.area for f in sheet.faces if f.role == "skin_a" and f.kind == "cylinder"]
-    (skin,) = [s for s in ("inner", "outer") if c.skin_cylinder(s) == pytest.approx(area, rel=1e-4)]
+    (area,) = (f.area for f in sheet.faces if f.role == "skin_a" and f.kind == "cylinder")
+    (skin,) = (s for s in ("inner", "outer") if c.skin_cylinder(s) == pytest.approx(area, rel=1e-4))
     return skin
 
 

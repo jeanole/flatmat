@@ -319,6 +319,10 @@ class BendSegment:
     edge_id: int | None = None  # the sharp edge, for sharp bends
 
 
+# "joggle": one of the two bends of a :class:`Joggle`
+BendKind = Literal["bend", "hem", "sharp", "joggle"]
+
+
 @dataclass(frozen=True)
 class Bend:
     id: int
@@ -326,7 +330,7 @@ class Bend:
     r_in: float
     angle_deg: float
     direction: Literal["up", "down"]
-    kind: Literal["bend", "hem", "sharp"]
+    kind: BendKind
     flanges: tuple[int, ...] = ()
     # filled by unfold()
     k: float | None = None
@@ -337,6 +341,33 @@ class Bend:
     @property
     def opening_angle_deg(self) -> float:
         return 180.0 - self.angle_deg
+
+
+@dataclass(frozen=True)
+class Joggle:
+    """Two bends of equal angle turning opposite ways, close together: an offset in the sheet.
+
+    The outer flanges are parallel, ``offset`` apart. Lengths are in the bends' cross-section:
+
+    - ``flat``: the straight piece between the two bends (0 when they touch);
+    - ``run``: how far the joggle reaches along the outer flanges, from the first bend's
+      outer tangent line to the second's;
+    - ``length`` (unfold): the joggle laid flat, the same stretch along the neutral fibre,
+      ``BA1 + flat + BA2``;
+    - ``allowance`` (unfold): ``length - run``, what the flat gains over the run: the value
+      a joggle table gives. ``source`` says where it came from: ``"k"`` (the K model) or
+      ``"table"`` (a :class:`~flatmat.bendmodel.JoggleTable` or a callable).
+    """
+
+    id: int
+    bends: tuple[int, int]
+    angle_deg: float
+    offset: float
+    flat: float
+    run: float
+    length: float | None = None
+    allowance: float | None = None
+    source: Literal["k", "table"] | None = None
 
 
 @dataclass(frozen=True)
@@ -451,6 +482,7 @@ class SheetPart:
     source: str = ""
     features: tuple[Feature, ...] = ()
     pmi: SheetPmi = SheetPmi("none")  # the file's PMI on this sheet (flatmat.pmi_map); "none" without
+    joggles: tuple[Joggle, ...] = ()
     # internal: the recognition context unfold() works on (OCP objects); not public API
     _ctx: Any = field(default=None, repr=False, compare=False)
 
@@ -472,7 +504,7 @@ class BendLine:
     direction: Literal["up", "down"]
     angle_deg: float
     r_in: float
-    kind: Literal["bend", "hem", "sharp"] = "bend"
+    kind: BendKind = "bend"
 
 
 @dataclass(frozen=True)
@@ -488,6 +520,7 @@ class FlatPattern:
     meta: dict = field(default_factory=dict)
     features: tuple[Feature, ...] = ()
     slits: tuple[Loop2D, ...] = ()  # open cut paths with no width (slits of louvres, bridges)
+    joggles: tuple[Joggle, ...] = ()
 
     @cached_property
     def bbox(self) -> tuple[float, float, float, float]:

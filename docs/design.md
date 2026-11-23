@@ -779,13 +779,32 @@ with `canonical=False`):
 
 ### 5.7 Joggles, curved flanges, rolled parts, tubes
 
-- **Joggle**:
-  - two parallel-axis cylinders of opposite convexity, adjacent or
-    separated by a short flat;
-  - works with §5.1 automatically;
-  - `Bend.kind = "joggle"` groups the pair;
-  - a `JoggleTable(offset)` (Creo-style `offset_allow`) can override the
-    allowance.
+- **Joggle** (implemented: `recognize._joggles`, `unfold._joggle_values`,
+  `bendmodel.JoggleTable`):
+  - two cylindrical bends of the same angle (at most 90°), parallel axes,
+    opposite directions, touching or either side of a flange no other bend
+    touches; each bend joins one joggle at most;
+  - their outer flanges are parallel, `offset` apart, at most
+    `recognize(joggle_max_offset=)` (5·t by default, 0 for none): a Z or hat
+    with a long web stays two bends;
+  - measured in the cross-section: on skin A the two cylinders touch the flat
+    between them from opposite sides, so their axes are ρ1 + ρ2 apart across
+    it and `flat` along it. With rc = r1 + r2 + t and θ the angle:
+    `offset = rc·(1 − cos θ) + flat·sin θ`, `run = rc·sin θ + flat·cos θ`
+    (how far the joggle reaches along the outer flanges);
+  - both bends get `kind = "joggle"`; `SheetPart.joggles` /
+    `FlatPattern.joggles` hold the pair, with `length` (along the neutral
+    fibre, `BA1 + flat + BA2`) and `allowance = length − run`;
+  - `unfold(joggle=JoggleTable | callable)`: the shop's allowance by offset
+    (linear, clamped with `JOGGLE_EXTRAPOLATED`; `JOGGLE_TABLE_THICKNESS` for
+    a table of another thickness). The joggle is laid out `run + allowance`
+    long: its two bends' allowances from the K model are scaled alike, and
+    each bend's K is the one that gives its share (it may leave [0, 1]). An
+    allowance that leaves no length for the bends is `JOGGLE_ALLOWANCE`;
+  - output: DXF labels `J+30 R3`, bend table `joggles` and each bend's
+    `joggle`, CSV columns `kind`, `joggle`. DFM: no press-brake rules for
+    joggle bends (one stroke of an offset tool), a `DFM_JOGGLE` note instead;
+    the bend order leaves them out like hems (made first).
 - **Curved flange** (a flange along a curved edge, i.e. a torus bend): not
   developable, so `UNSUPPORTED_SURFACE`. A flange on a straight generatrix
   of a rolled base is fine (all cylinders).

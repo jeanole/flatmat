@@ -298,6 +298,11 @@ def check(
     )
 
     checks = _bend_rules(sheet, mat, rules, out, tooling, rolling_direction_deg, machine_max_force_kn)
+    for j in pattern.joggles:
+        jls = sheet.lines_by_bend.get(j.bends[0])
+        out.add(Code.DFM_JOGGLE, f"bends {j.bends[0]} and {j.bends[1]}: a joggle, offset {j.offset:.3g} mm, made in "
+                "one stroke with an offset tool: no press-brake rules for them", jls[0].p0 if jls else None,
+                j.bends[0], info=True, joggle=j.id, offset=j.offset)  # fmt: skip
     if out.on(Code.DFM_U_CHANNEL):
         _u_channel_rules(sheet, checks, rules, out)
     if out.on(Code.DFM_FORM_NEAR_EDGE, Code.DFM_FORM_NEAR_BEND):
@@ -337,7 +342,8 @@ def _bend_rules(
 ) -> list[BendCheck]:
     """Per bend: flanges, hem, radius, angle, tools and tonnage; always measured for the report.
 
-    Lances are formed in a punching tool, not on the press brake: no press-brake rules.
+    Lances are formed in a punching tool and joggles with an offset tool, not on the press
+    brake: no press-brake rules.
     """
     add = out.add
     t, v, bends = sheet.t, sheet.v, sheet.bends
@@ -346,7 +352,7 @@ def _bend_rules(
         bls = sheet.lines_by_bend.get(bid, [])
         if not bls:
             continue
-        brake = bid not in sheet.lance_bends
+        brake = bid not in sheet.lance_bends and b.kind != "joggle"  # a joggle: one stroke of an offset tool
         ba = b.ba or 0.0
         need = max(rules.min_flange_v * v, rules.min_flange_t * t + b.r_in)
         legs: list[list[float]] = [[], []]

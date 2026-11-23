@@ -40,7 +40,7 @@ from .bendmodel import extruded_hole_prehole
 from .canonical import canonicalize
 from .diagnostics import Code, Diagnostic, refuse, warn
 from .io import StepModel
-from .model import FEATURE_KINDS, Bend, BendSegment, FaceInfo, Feature, Flange, SheetPart, Tolerances
+from .model import FEATURE_KINDS, Bend, BendSegment, FaceInfo, Feature, Flange, Joggle, SheetPart, Tolerances
 from .pmi_map import with_pmi
 
 # ------------------------------------------------------------------------------ tables
@@ -1114,6 +1114,72 @@ def _bend(kind: str, members, faces: list[Face], edges, flange_of: dict[int, int
     return Bend(m0.bend_id, tuple(segs), r_in, deg, "up" if m0.concave else "down", bkind, tuple(sorted(adj_flanges)))
 
 
+def _joggle_geometry(b1: Bend, b2: Bend, faces: list[Face], t: float) -> tuple[float, float, float]:
+    """(flat, offset, run) of two parallel bends turning opposite ways by the same angle.
+
+    On skin A the two bend cylinders (radii rho1, rho2) touch the flat between them from
+    opposite sides, so their axes are rho1 + rho2 apart across it and ``flat`` apart along
+    it. Offset and run follow from the centre line (radii r + t/2) and the angle.
+    """
+    f1, f2 = faces[b1.segments[0].face_id - 1], faces[b2.segments[0].face_id - 1]
+    d = f1.axis_d
+    w = gp_Vec(f1.axis_p, f2.axis_p)
+    across = w - gp_Vec(d.XYZ()) * w.Dot(gp_Vec(d.XYZ()))
+    flat = math.sqrt(max(0.0, across.SquareMagnitude() - (f1.radius + f2.radius) ** 2))
+    th = math.radians(b1.angle_deg)
+    rc = b1.r_in + b2.r_in + t
+    return flat, rc * (1 - math.cos(th)) + flat * math.sin(th), rc * math.sin(th) + flat * math.cos(th)
+
+
+def _joggles(bends: tuple[Bend, ...], faces: list[Face], g: _Graph, t: float, max_offset: float):
+    """Pair bends into joggles; return the bends (a pair's kind "joggle") and the joggles.
+
+    Two bends are a joggle when both are cylindrical bends of at most 90° with parallel
+    axes, the same angle, opposite directions, and they touch or sit either side of a
+    flange no other bend touches, with the outer flanges at most ``max_offset`` apart.
+    Each bend joins one joggle at most, lowest ids first.
+    """
+    if max_offset <= 0:
+        return bends, ()
+    flange_bends: dict[int, list[int]] = defaultdict(list)
+    for b in bends:
+        for fl in b.flanges:
+            flange_bends[fl].append(b.id)
+    face_bend = {s.face_id: b.id for b in bends for s in b.segments if s.face_id}
+    by_id = {b.id: b for b in bends}
+
+    def candidate(b: Bend) -> bool:
+        return b.kind == "bend" and b.angle_deg <= 90.0 + 1e-9 and all(s.face_id for s in b.segments)
+
+    def neighbours(b: Bend) -> set[int]:
+        touching = {face_bend[n] for s in b.segments for n in g.smooth_nb[s.face_id] if n in face_bend}
+        via = {o for fl in b.flanges if len(flange_bends[fl]) == 2 for o in flange_bends[fl]}
+        return (touching | via) - {b.id}
+
+    used: set[int] = set()
+    found: list[Joggle] = []
+    for b1 in sorted(bends, key=lambda b: b.id):
+        if b1.id in used or not candidate(b1):
+            continue
+        for oid in sorted(neighbours(b1)):
+            b2 = by_id[oid]
+            if oid in used or not candidate(b2) or b2.direction == b1.direction:
+                continue
+            if abs(b1.angle_deg - b2.angle_deg) > 0.01:
+                continue
+            d1, d2 = (faces[b.segments[0].face_id - 1].axis_d for b in (b1, b2))
+            if abs(abs(d1.Dot(d2)) - 1.0) > 1e-6:
+                continue
+            flat, offset, run = _joggle_geometry(b1, b2, faces, t)
+            if offset > max_offset + 1e-9:
+                continue
+            used |= {b1.id, b2.id}
+            found.append(Joggle(len(found) + 1, (b1.id, b2.id), b1.angle_deg, offset, flat, run))
+            break
+    paired = {i for j in found for i in j.bends}
+    return tuple(replace(b, kind="joggle") if b.id in paired else b for b in bends), tuple(found)
+
+
 def _skin_adjacency(smooth, sharp, skin_a: set[int]) -> dict[int, list[tuple[int, int]]]:
     """Face -> [(neighbour, edge)] over smooth edges and the sharp bends of the reference skin."""
     adj: dict[int, list[tuple[int, int]]] = defaultdict(list)
@@ -1138,6 +1204,7 @@ def recognize(
     tol: Tolerances | None = None,
     canonical: bool = True,
     engrave: bool = False,
+    joggle_max_offset: float | None = None,
 ) -> SheetPart:
     """Recognise a solid as sheet metal: thickness, skins, bends, flanges, hole features.
 
@@ -1148,6 +1215,11 @@ def recognize(
     With ``engrave``, a recess that does not go through the sheet (a pocket, a groove,
     engraved text, a blind hole) is an ``engraving`` feature: its rim is marked on the flat
     pattern and its depth is not made. Without it such a part is refused (``EDGE_FEATURE``).
+
+    Two bends that offset the sheet (same angle up to 90°, opposite ways, parallel, touching
+    or either side of a short flat) are a :class:`~flatmat.model.Joggle` when their outer
+    flanges are at most ``joggle_max_offset`` apart: 5·t by default, 0 for none. Their kind
+    is ``"joggle"``.
     """
     tol = tol or Tolerances()
     diags: list[Diagnostic] = []
@@ -1208,6 +1280,8 @@ def recognize(
     sharp_edges = {m.edge: m for kind, ms in bend_groups if kind == "sharp" for m in ms if isinstance(m, SharpEdge)}
     flanges, flange_of = _flanges(faces, skin_a, bend_faces, g.smooth)
     bends = tuple(_bend(kind, ms, faces, edges, flange_of, g) for kind, ms in bend_groups)
+    max_offset = 5.0 * t if joggle_max_offset is None else joggle_max_offset
+    bends, joggles = _joggles(bends, faces, g, t, max_offset)
     table = _Features()
     _hole_features(table, feature_groups, faces, g, skin_a)
     _formed_features(table, regions, a_side, faces, edges, t, bends, g)
@@ -1251,6 +1325,7 @@ def recognize(
         diagnostics=tuple(diags),
         source=source,
         features=tuple(features),
+        joggles=joggles,
         _ctx=ctx,
     )
     if isinstance(model, StepModel):  # the file's PMI on this sheet; a file without PMI changes nothing
