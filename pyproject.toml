@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8", "hypothesis>=6.100"]
+docs = ["matplotlib>=3.8"]  # tests/render_parts.py: the pictures of docs/test-results.md
 dev = ["flatmat[test]", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]

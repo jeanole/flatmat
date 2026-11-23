@@ -60,14 +60,14 @@ def part_names() -> set[str]:
     return {n for folder, _, _ in FOLDERS for n in _names(folder)}
 
 
-def _descriptions(folder: str) -> dict[str, str]:
-    """``| `name` | description | ...`` rows of the folder's README."""
+def _readme(folder: str) -> dict[str, list[str]]:
+    """``| `name` | cell | cell |`` rows of the folder's README: what the part is, and the flat by hand."""
     out = {}
-    with open(os.path.join(HERE, "data", folder, "README.md")) as fh:
+    with open(os.path.join(HERE, "data", folder, "README.md"), encoding="utf-8") as fh:
         for line in fh:
-            m = re.match(r"\|\s*`([^`]+)`\s*\|\s*([^|]+)\|", line)
+            m = re.match(r"\|\s*`([^`]+)`\s*\|(.*)\|\s*$", line)
             if m:
-                out[m.group(1)] = m.group(2).strip()
+                out[m.group(1)] = [c.strip() for c in m.group(2).split("|")]
     return out
 
 
@@ -111,11 +111,39 @@ def _git(*args: str) -> str:
         return ""
 
 
-def _status(row: dict, tests: dict[str, int]) -> str:
-    bad = tests.get("failed", 0) or "error" in row
-    if not bad:
-        bad = row["area"][2] > TOL_AREA or row["size"][2] > TOL_SIZE or row["holes"][0] != row["holes"][1]
-    return "❌" if bad else "✅"
+def _passed(row: dict, tests: dict[str, int]) -> bool:
+    if tests.get("failed", 0) or "error" in row:
+        return False
+    return row["area"][2] <= TOL_AREA and row["size"][2] <= TOL_SIZE and row["holes"][0] == row["holes"][1]
+
+
+def _source(folder: str, want: dict) -> str:
+    m = re.search(r"tests/oracle/(\S+)", want.get("source", ""))
+    if folder == "solidcraft_oracle" and m:
+        case = m.group(1)
+        url = f"https://github.com/tangency-labs/solidcraft/tree/main/tests/oracle/{case}"
+        return f"[SolidCraft {case.split('-')[0]}]({url}) (analytic); flat by hand"
+    return "by hand"
+
+
+INTRO = f"""Each sheet metal test part is a STEP file with its flat pattern worked out by hand
+(`<name>.json` beside it). flatmat unfolds the part at the K the JSON gives and is compared
+with that flat: flat area (relative tolerance {TOL_AREA:g}), flat size ({TOL_SIZE:g} mm) and the
+number of holes. The tests that name a part check more: thickness, bends, each bend's
+allowance θ·(R + K·t), hole positions, features, other K-factors and, where it holds,
+flat area × t = volume at K 0.5.
+
+Where the expected values come from (the **Source** column):
+
+- **SolidCraft (analytic)**: a part of SolidCraft's reference tests
+  ([`tests/oracle/`](https://github.com/tangency-labs/solidcraft/tree/main/tests/oracle)),
+  rebuilt here. Its folded volume and area match SolidCraft's hand-worked values to 1e-9, so it
+  is the same part; its flat is worked out by hand here (SolidCraft checks only the folded part).
+- **by hand**: closed-form geometry, the formula in the **Method** column (BA = θ·(R + K·t)).
+
+No expected value comes from a commercial CAD product. The pictures show each part in 3D and
+flatmat's flat pattern (bend lines: up red, down blue, joggle orange); they are drawn by
+`python tests/render_parts.py`, not by the test run."""
 
 
 def render(outcomes: Outcomes) -> str:
@@ -125,16 +153,62 @@ def render(outcomes: Outcomes) -> str:
     for counts in outcomes.files.values():
         for k, v in counts.items():
             totals[k] += v
+    sections, n_pass, n_parts, sources = [], 0, 0, []
+    for folder, title, test_file in FOLDERS:
+        readme = _readme(folder)
+        rows = []
+        for name in _names(folder):
+            row = _row(folder, name)
+            tests = outcomes.parts.get(name, {})
+            run = sum(tests.values())
+            ok = _passed(row, tests)
+            n_parts += 1
+            n_pass += ok
+            cells = readme.get(name, [])
+            what = cells[0] if cells else ""
+            method = cells[1] if len(cells) > 1 else ""
+            pic = f'<img src="parts/{name}.png" width="360" alt="{name}">' if os.path.exists(
+                os.path.join(HERE, "..", "docs", "parts", f"{name}.png")) else ""  # fmt: skip
+            part = f"{pic}<br>`{name}`" if pic else f"`{name}`"
+            result = "✅ pass" if ok else "❌ **fail**"
+            test_cell = f"{tests.get('passed', 0)} / {run}" if run else "–"
+            if "error" in row:
+                rows.append(f"| {part} | {result} | {_source(folder, row['want'])} | {row['error']} | | {test_cell} | "
+                            f"{method} | {what} |")  # fmt: skip
+                continue
+            (_, ga, ea), (_, gs, es), (wh, gh) = row["area"], row["size"], row["holes"]
+            flat = f"{gs[0]:.3f} × {gs[1]:.3f} mm<br>area {ga:.3f} mm²<br>t {row['t']:g}, K {row['want']['k']:g}, "
+            flat += f"{row['bends']} bend{'' if row['bends'] == 1 else 's'}, {gh} hole{'' if gh == 1 else 's'}" + (
+                "" if gh == wh else f" (hand: {wh})"
+            )
+            err = f"area {ea:.1e}<br>size {es:.1e} mm"
+            rows.append(f"| {part} | {result} | {_source(folder, row['want'])} | {flat} | {err} | {test_cell} | "
+                        f"{method} | {what} |")  # fmt: skip
+        sources.append(f"{len(rows)} {title.split(':')[0].lower()}")
+        sections += [
+            "",
+            f"## {title}",
+            "",
+            f"Files: [`tests/data/{folder}`](../tests/data/{folder}/README.md); tests: `tests/{test_file}`.",
+            "",
+            "| Part | Result | Source | Flat (flatmat) | Error vs hand | Tests | Method: flat by hand | What it is |",
+            "|---|---|---|---|---|---:|---|---|",
+            *rows,
+        ]
     lines = [
         "# Test results",
         "",
-        "Written by `pytest tests --results-page docs/test-results.md` (in CI on every push to `main`).",
+        "Generated by `pytest tests --results-page docs/test-results.md` (in CI on every push to `main`).",
         "Do not edit by hand.",
         "",
-        f"- **Run:** {now}, commit `{sha[:10] or 'unknown'}`",
-        f"- **Environment:** Python {platform.python_version()}, OCP {fm.io.ocp_version()}, "
-        f"{platform.system()} {platform.machine()}",
-        f"- **Tests:** {totals['passed']} passed, {totals['failed']} failed, {totals['skipped']} skipped",
+        INTRO,
+        "",
+        f"**{n_pass} / {n_parts} parts pass**; sources: {', '.join(sources)}. "
+        f"All tests: {totals['passed']} passed, {totals['failed']} failed, {totals['skipped']} skipped.",
+        "",
+        f"Run {now}, commit `{sha[:10] or 'unknown'}`, Python {platform.python_version()}, "
+        f"OCP {fm.io.ocp_version()}, {platform.system()} {platform.machine()}.",
+        *sections,
         "",
         "## Test files",
         "",
@@ -145,39 +219,7 @@ def render(outcomes: Outcomes) -> str:
         c = outcomes.files[f]
         lines.append(f"| `{f}` | {c['passed']} | {c['failed']} | {c['skipped']} |")
     if outcomes.failed:
-        lines += ["", "**Failed:**", ""] + [f"- `{n}`" for n in outcomes.failed[:50]]
-    for folder, title, test_file in FOLDERS:
-        desc = _descriptions(folder)
-        names = _names(folder)
-        lines += [
-            "",
-            f"## {title}",
-            "",
-            f"STEP files and hand-worked flats in [`tests/data/{folder}`](../tests/data/{folder}/README.md), "
-            f"checked by `tests/{test_file}`. Each part unfolded at its K: flat area and size against the "
-            f"hand-worked flat (tolerance {TOL_AREA:g} relative, {TOL_SIZE:g} mm). *Tests*: the session's tests "
-            "that name the part, passed / run.",
-            "",
-            "| | Part | What it is | t | Bends | K | Flat area: hand-worked | flatmat | Rel. error | "
-            "Flat size (mm) | Size error (mm) | Holes | Tests |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|",
-        ]
-        for name in names:
-            row = _row(folder, name)
-            tests = outcomes.parts.get(name, {})
-            run = sum(tests.values())
-            t_col = f"{tests.get('passed', 0)} / {run}" if run else "–"
-            what = desc.get(name, "").replace("|", "/")
-            if "error" in row:
-                k = row["want"]["k"]
-                lines.append(f"| ❌ | `{name}` | {what} | | | {k:g} | | {row['error']} | | | | | {t_col} |")
-                continue
-            (wa, ga, ea), (_, gs, es), (wh, gh) = row["area"], row["size"], row["holes"]
-            lines.append(
-                f"| {_status(row, tests)} | `{name}` | {what} | {row['t']:g} | {row['bends']} | {row['want']['k']:g} | "
-                f"{wa:.4f} | {ga:.4f} | {ea:.1e} | {gs[0]:.3f} × {gs[1]:.3f} | {es:.1e} | "
-                f"{gh}" + ("" if gh == wh else f" (want {wh})") + f" | {t_col} |"
-            )
+        lines += ["", "**Failed tests:**", ""] + [f"- `{n}`" for n in outcomes.failed[:50]]
     return "\n".join(lines) + "\n"
 
 

@@ -154,7 +154,9 @@ DXF. `load_step(path, pmi=False)` skips the XCAF read.
 
 The latest results, with every sheet metal test part, are in
 [`docs/test-results.md`](docs/test-results.md): CI writes it on every push to `main`
-(`pytest tests --results-page docs/test-results.md` writes it locally).
+(`pytest tests --results-page docs/test-results.md` writes it locally). Its pictures of the
+parts are drawn by `pip install -e ".[docs]" && python tests/render_parts.py` when a part
+changes.
 
 ```sh
 pip install -e ".[test]" && pytest
