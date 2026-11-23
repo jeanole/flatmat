@@ -3,8 +3,8 @@
 Written by `pytest tests --results-page docs/test-results.md` (in CI on every push to `main`).
 Do not edit by hand.
 
-- **Run:** 2026-11-23 16:07 UTC, commit `83802aef9b`
-- **Environment:** Python 3.11.18, OCP 8.0.1.1, Linux x86_64
+- **Run:** 2026-11-23 16:12 UTC, commit `421234cb92`
+- **Environment:** Python 3.13.18, OCP 8.0.1.1, Linux x86_64
 - **Tests:** 723 passed, 0 failed, 2 skipped
 
 ## Test files
@@ -52,7 +52,7 @@ STEP files and hand-worked flats in [`tests/data/solidcraft_oracle`](../tests/da
 | ✅ | `sc72_contour_flange` | Z profile, two bends turning opposite ways | 2.5 | 2 | 0.44 | 4815.4867 | 4815.4867 | 7.7e-15 | 50.000 × 96.310 | 7.4e-13 | 0 | 7 / 7 |
 | ✅ | `sc73_hem` | flange with a flat hem: 180°, inner radius 0.005, leg 0.01 mm from the flange | 2.5 | 2 | 0.44 | 8462.1327 | 8462.1327 | 7.1e-15 | 84.621 × 100.000 | 6.0e-13 | 0 | 7 / 7 |
 | ✅ | `sc74_unfold_refold` | U channel with a 10 × 22 slot cut across a bend in the flat | 2.5 | 2 | 0.44 | 6284.7787 | 6284.7787 | 9.3e-15 | 80.000 × 81.310 | 7.4e-13 | 1 | 7 / 7 |
-| ✅ | `sc75_bracket_holes` | two flanges meeting at a mitred corner, two Ø6 holes | 2.5 | 2 | 0.44 | 5441.1148 | 5441.1148 | 5.3e-15 | 65.655 × 90.655 | 3.7e-13 | 2 | 7 / 7 |
+| ✅ | `sc75_bracket_holes` | two flanges meeting at a mitred corner, two Ø6 holes | 2.5 | 2 | 0.44 | 5441.1148 | 5441.1148 | 5.2e-15 | 65.655 × 90.655 | 3.7e-13 | 2 | 7 / 7 |
 | ✅ | `sc76_thickness_variant` | one flange, t 3, R 3 | 3 | 1 | 0.44 | 7478.5840 | 7478.5840 | 5.8e-15 | 74.786 × 100.000 | 4.4e-13 | 0 | 7 / 7 |
 
 ## Hand-worked parts: holes across bends, boxes, hems, joggles, countersinks
@@ -67,7 +67,7 @@ STEP files and hand-worked flats in [`tests/data/handworked`](../tests/data/hand
 | ✅ | `box_relief` | `box_open` with 5 × 5 corner reliefs in the base | 2 | 4 | 0.44 | 14050.4990 | 14050.4990 | 4.1e-15 | 129.048 × 149.048 | 6.0e-13 | 0 | 6 / 6 |
 | ✅ | `box_thin` | box 120 × 70 × 25, t 1.5, R 1, gap 1, reliefs 3 | 1.5 | 4 | 0.44 | 18732.4282 | 18732.4282 | 2.7e-15 | 125.215 × 175.215 | 3.7e-13 | 0 | 6 / 6 |
 | ✅ | `box_window` | `box_relief` with a 20 wide window across a long bend, 10 into the wall, 15 into the base | 2 | 4 | 0.44 | 13460.0211 | 13460.0211 | 3.9e-15 | 129.048 × 149.048 | 6.0e-13 | 1 | 6 / 6 |
-| ✅ | `cbore_Z` | Z, t 5: counterbores Ø6.6 / Ø11, 3 deep, on the outer flats on opposite sides; a countersink in the web | 5 | 2 | 0.44 | 7487.9947 | 7487.9947 | 8.5e-15 | 60.000 × 126.336 | 1.1e-12 | 3 | 9 / 9 |
+| ✅ | `cbore_Z` | Z, t 5: counterbores Ø6.6 / Ø11, 3 deep, on the outer flats on opposite sides; a countersink in the web | 5 | 2 | 0.44 | 7487.9947 | 7487.9947 | 8.6e-15 | 60.000 × 126.336 | 1.1e-12 | 3 | 9 / 9 |
 | ✅ | `csk_U` | U channel, t 3: 90° countersinks on the base and both flanges, both sides | 3 | 2 | 0.44 | 10630.1675 | 10630.1675 | 6.8e-15 | 80.000 × 133.572 | 9.1e-13 | 3 | 9 / 9 |
 | ✅ | `csk_angles` | L, t 3: 82°, 100° and 120° countersinks | 3 | 1 | 0.44 | 7558.2986 | 7558.2986 | 3.6e-15 | 80.000 × 95.215 | 3.6e-13 | 3 | 9 / 9 |
 | ✅ | `hb_notch` | the same L, a 12 deep notch cut in from the edge across the bend | 2 | 1 | 0.44 | 6270.4389 | 6270.4389 | 4.2e-15 | 80.000 × 81.095 | 4.0e-13 | 0 | 6 / 6 |
