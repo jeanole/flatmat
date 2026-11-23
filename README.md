@@ -29,7 +29,7 @@ diagnostic that names the faces involved, never silently unfolded wrong.
 
 ## Status
 
-**v0.1 in development.** The package works end to end for planes and
+**0.2.0, the first release** ([PyPI](https://pypi.org/project/flatmat/)). The package works end to end for planes and
 cylindrical bends, joggles (with a shop's joggle table), embosses, extruded holes,
 louvres, bridges and lances.
 Tested on (latest results, part by part: [`docs/test-results.md`](https://github.com/jeanole/flatmat/blob/main/docs/test-results.md)):
@@ -57,7 +57,8 @@ Needs OCP 8.0 (`cadquery-ocp-novtk` 8.0.x).
 ### Usage
 
 ```sh
-pip install -e .            # needs Python >= 3.11; pulls cadquery-ocp-novtk
+pip install flatmat         # needs Python >= 3.11; pulls cadquery-ocp-novtk
+pip install -e .            # or from a checkout of this repository
 flatmat unfold part.step -k 0.44 -o part.dxf --table part.json --svg part.svg
 flatmat unfold part.step --din  # K per bend from DIN 6935
 flatmat unfold part.step --sharp-radius 1.6   # radius the die gives on sharp (r = 0) bends
@@ -205,10 +206,10 @@ today:
 
 ## Planned scope
 
-- **v0.1 (implemented, not released yet):** flat faces and cylindrical bends;
+- **v0.1 (released in 0.2.0):** flat faces and cylindrical bends;
   one solid of constant thickness; holes and cut-outs across bends; hems; K as
   a scalar, an r/t table or DIN 6935; exact DXF and bend table.
-- **v0.2 (in progress):** sharp bends (r = 0, inside or both sides, with an
+- **v0.2 (released as 0.2.0):** sharp bends (r = 0, inside or both sides, with an
   optional tooling radius) — done; countersinks and counterbores — done;
   B-spline faces and edges that are really planes, cylinders, cones, lines
   or circles — done; manufacturability checks (flange, radius, holes, reliefs,
